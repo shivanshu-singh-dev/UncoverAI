@@ -1,9 +1,4 @@
-"""Future-facing OSINT interface placeholder.
-
-NOTE: This interface defines the contract for future OSINT discovery and investigation
-modules. Actual search queries, source catalogs, scraping, and LLM triage will be
-plugged into this abstraction in Phase 2 without altering the criticality engine.
-"""
+"""OSINT assessment interface and placeholder."""
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
@@ -15,24 +10,24 @@ from meridian_assessment.models.vendor import Vendor
 
 
 class OSINTFindingPlaceholder(BaseModel):
-    """Placeholder model representing future OSINT investigation output."""
+    """Represents pending OSINT investigation output."""
 
     model_config = ConfigDict(frozen=True)
 
     vendor_id: str
     status: str = Field(
-        default="NOT_IMPLEMENTED_PHASE_1",
-        description="Status indicator indicating OSINT stage is pending implementation",
+        default="PENDING",
+        description="Status of the OSINT investigation",
     )
     message: str = Field(
-        default="OSINT discovery module is scheduled for implementation in Phase 2.",
+        default="OSINT discovery module is not yet available.",
         description="Informational note",
     )
     raw_findings: Dict[str, Any] = Field(default_factory=dict)
 
 
 class BaseOSINTAssessment(ABC):
-    """Abstract base class establishing the contract for OSINT assessment engines."""
+    """Abstract base class for OSINT assessment engines."""
 
     @abstractmethod
     def assess(
@@ -50,15 +45,12 @@ class BaseOSINTAssessment(ABC):
 
         Returns:
             OSINT findings structure.
-
-        Raises:
-            NotImplementedError: In Phase 1 placeholder implementations.
         """
-        raise NotImplementedError("OSINT assessment will be implemented in Phase 2.")
+        raise NotImplementedError("OSINT assessment is not yet implemented.")
 
 
 class OSINTAssessmentPlaceholder(BaseOSINTAssessment):
-    """Concrete Phase 1 placeholder implementation that preserves pipeline compatibility."""
+    """Placeholder implementation that preserves pipeline compatibility."""
 
     def assess(
         self,
@@ -66,9 +58,8 @@ class OSINTAssessmentPlaceholder(BaseOSINTAssessment):
         criticality_tier: CriticalityTier,
         assessment_scope: AssessmentScope,
     ) -> OSINTFindingPlaceholder:
-        """Return explicit Phase 1 placeholder record without executing actual queries."""
         return OSINTFindingPlaceholder(
             vendor_id=vendor.vendor_id,
-            status="NOT_IMPLEMENTED_PHASE_1",
-            message=f"OSINT execution deferred to Phase 2 for {vendor.vendor_name} ({criticality_tier.value} / {assessment_scope.assessment_depth.value}).",
+            status="PENDING",
+            message=f"OSINT investigation pending for {vendor.vendor_name} ({criticality_tier.value} / {assessment_scope.assessment_depth.value}).",
         )

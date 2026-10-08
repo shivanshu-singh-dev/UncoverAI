@@ -1,9 +1,16 @@
-# Meridian Vendor Assessment - Criticality & Scoping Rules
-# Phase 1: Foundational Configuration
+# Meridian Vendor Assessment — Criticality & Scoping Rules
+#
+# BOUNDARY RULE:
+#   Tier assignment uses inclusive lower bounds, evaluated highest-first.
+#   score >= TIER_1.min_score  → TIER_1  (Comprehensive)
+#   score >= TIER_2.min_score  → TIER_2  (Targeted)
+#   score >= TIER_3.min_score  → TIER_3  (Lightweight)
+#
+#   Example — score == 3.5 → TIER_1.  score == 2.0 → TIER_2.
 
 version: "1.0"
 
-# Scoring weights per criterion (must sum to 1.0)
+# Criterion weights — must sum exactly to 1.0
 criterion_weights:
   data_sensitivity: 0.25
   payment_flows: 0.20
@@ -11,7 +18,15 @@ criterion_weights:
   operational_dependency: 0.20
   customer_data_volume: 0.15
 
-# Numerical score mapping for qualitative severity ratings
+# Severity score mapping — qualitative rating → numeric value
+#
+# Verified scoring example (Apex Core Banking Cloud):
+#   data_sensitivity:       critical (5.0) × 0.25 = 1.25
+#   payment_flows:          critical (5.0) × 0.20 = 1.00
+#   regulatory_exposure:    high     (4.0) × 0.20 = 0.80
+#   operational_dependency: critical (5.0) × 0.20 = 1.00
+#   customer_data_volume:   high     (4.0) × 0.15 = 0.60
+#                                             Total = 4.65 → TIER_1
 severity_scores:
   critical: 5.0
   high: 4.0
@@ -19,8 +34,7 @@ severity_scores:
   low: 1.0
   none: 0.0
 
-# Tier classification thresholds (evaluated from highest to lowest)
-# Score = sum(weight_i * severity_score_i)
+# Tier thresholds — score >= min_score places vendor in that tier
 tier_thresholds:
   TIER_1:
     min_score: 3.5
@@ -35,11 +49,11 @@ tier_thresholds:
     label: "Tier 3 — Low"
     description: "Low-risk vendor with minimal exposure, non-critical operations, or public/non-sensitive data."
 
-# Assessment depth mapping by criticality tier
+# Assessment depth mapping — tier → investigation scope
 assessment_depth_mapping:
   TIER_1:
     depth: "COMPREHENSIVE"
-    description: "Comprehensive assessment covering extensive OSINT sources, dark web monitoring, supply chain, and regulatory filings."
+    description: "Comprehensive assessment covering extensive sources, dark web monitoring, supply chain, and regulatory filings."
   TIER_2:
     depth: "TARGETED"
     description: "Targeted assessment focusing on key exposure vectors, core domains, and primary compliance certifications."
@@ -47,7 +61,7 @@ assessment_depth_mapping:
     depth: "LIGHTWEIGHT"
     description: "Lightweight baseline assessment verifying basic domain security posture and standard hygiene."
 
-# Explainable reasoning templates for elevated criteria
+# Explainability reasoning rules
 reasoning_rules:
   threshold_score_for_mention: 2.5
   descriptions:

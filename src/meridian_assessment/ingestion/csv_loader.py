@@ -19,12 +19,11 @@ class CSVVendorLoader(BaseVendorLoader):
         "vendor_name",
         "domain",
         "data_sensitivity",
+        "payment_flows",
         "regulatory_exposure",
         "operational_dependency",
         "customer_data_volume",
     }
-    # payment column can be either 'payment_flows' or 'payment_involvement'
-    PAYMENT_COLUMN_VARIANTS = {"payment_flows", "payment_involvement"}
 
     def load(self, source: Union[str, Path]) -> list[Vendor]:
         """Load, validate, and return all vendors from a CSV file.
@@ -59,10 +58,6 @@ class CSVVendorLoader(BaseVendorLoader):
                 missing_cols = [
                     col for col in self.REQUIRED_COLUMNS if col not in normalized_fields
                 ]
-                # Check for payment column variant
-                has_payment_col = any(p in normalized_fields for p in self.PAYMENT_COLUMN_VARIANTS)
-                if not has_payment_col:
-                    missing_cols.append("payment_flows (or payment_involvement)")
 
                 if missing_cols:
                     raise IngestionError(
@@ -95,10 +90,6 @@ class CSVVendorLoader(BaseVendorLoader):
                             f"Line {row_idx}: Duplicate vendor_id '{vendor_id}' detected."
                         )
                         continue
-
-                    # Map payment_flows / payment_involvement if needed
-                    if "payment_involvement" in cleaned_row and "payment_flows" not in cleaned_row:
-                        cleaned_row["payment_flows"] = cleaned_row["payment_involvement"]
 
                     try:
                         vendor = Vendor.model_validate(cleaned_row)

@@ -21,7 +21,7 @@ class TestVendorModel:
             vendor_name="Example Corp",
             domain="example.com",
             data_sensitivity=SeverityLevel.HIGH,
-            payment_involvement=SeverityLevel.MEDIUM,
+            payment_flows=SeverityLevel.MEDIUM,
             regulatory_exposure=SeverityLevel.HIGH,
             operational_dependency=SeverityLevel.HIGH,
             customer_data_volume=SeverityLevel.HIGH,

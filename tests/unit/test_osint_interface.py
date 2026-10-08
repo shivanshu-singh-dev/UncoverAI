@@ -53,7 +53,7 @@ class TestOSINTInterface:
         instance = CallingSuperOSINT()
         with pytest.raises(NotImplementedError) as exc_info:
             instance.assess(sample_vendor, CriticalityTier.TIER_1, sample_scope)
-        assert "Phase 2" in str(exc_info.value)
+        assert "not yet implemented" in str(exc_info.value).lower()
 
     def test_placeholder_returns_structured_pending_record(
         self, sample_vendor: Vendor, sample_scope: AssessmentScope
@@ -61,5 +61,5 @@ class TestOSINTInterface:
         placeholder = OSINTAssessmentPlaceholder()
         finding = placeholder.assess(sample_vendor, CriticalityTier.TIER_1, sample_scope)
         assert finding.vendor_id == "V_TEST"
-        assert finding.status == "NOT_IMPLEMENTED_PHASE_1"
-        assert "Phase 2" in finding.message
+        assert finding.status == "PENDING"
+        assert "pending" in finding.message.lower()

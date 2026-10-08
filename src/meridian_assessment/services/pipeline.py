@@ -16,7 +16,7 @@ from meridian_assessment.utils.logger import logger
 
 
 class AssessmentPipeline:
-    """Orchestrator for the vendor assessment foundation pipeline."""
+    """Orchestrator for the vendor assessment pipeline."""
 
     def __init__(
         self,
@@ -24,40 +24,19 @@ class AssessmentPipeline:
         config_path: Union[str, Path] = "config/criticality.yaml",
         loader: Optional[BaseVendorLoader] = None,
     ) -> None:
-        """Initialize the assessment pipeline.
-
-        Args:
-            config: Optional pre-loaded CriticalityConfig.
-            config_path: Path to configuration YAML if config is not provided.
-            loader: Optional vendor loader (defaults to CSVVendorLoader).
-        """
         self.config = config or load_criticality_config(config_path)
         self.loader = loader or CSVVendorLoader()
         self.criticality_engine = CriticalityEngine(self.config)
         self.scoping_engine = ScopingEngine(self.config)
 
     def run_from_source(self, source_path: Union[str, Path]) -> List[CriticalityAssessment]:
-        """Run the assessment pipeline on a file source.
-
-        Args:
-            source_path: Path to input vendor data (e.g. CSV).
-
-        Returns:
-            List of CriticalityAssessment results.
-        """
+        """Run the assessment pipeline on a file source."""
         logger.info("Starting vendor assessment pipeline for source: %s", source_path)
         vendors = self.loader.load(source_path)
         return self.run_on_vendors(vendors)
 
     def run_on_vendors(self, vendors: List[Vendor]) -> List[CriticalityAssessment]:
-        """Run assessment directly on a collection of Vendor instances.
-
-        Args:
-            vendors: List of validated Vendor objects.
-
-        Returns:
-            List of CriticalityAssessment results.
-        """
+        """Run assessment directly on a collection of Vendor instances."""
         logger.info("Processing %d vendor(s)...", len(vendors))
         results: List[CriticalityAssessment] = []
 
@@ -73,19 +52,10 @@ class AssessmentPipeline:
         assessments: List[CriticalityAssessment],
         output_path: Union[str, Path] = "data/output/criticality_results.json",
     ) -> Path:
-        """Export assessment results to a formatted, machine-readable JSON file.
-
-        Args:
-            assessments: List of CriticalityAssessment instances.
-            output_path: Target JSON output file path.
-
-        Returns:
-            Resolved Path of the written JSON file.
-        """
+        """Export assessment results to a JSON file."""
         dest = Path(output_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        # Serialize using Pydantic model_dump
         payload = [assessment.model_dump(mode="json") for assessment in assessments]
 
         with open(dest, "w", encoding="utf-8") as f:

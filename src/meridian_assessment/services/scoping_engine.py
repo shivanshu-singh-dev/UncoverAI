@@ -9,10 +9,9 @@ from meridian_assessment.models.criticality import CriticalityTier
 class ScopingEngine:
     """Generates structured assessment scope specifications based on criticality tier."""
 
-    # Default focus area suggestions per tier
     FOCUS_AREAS: Dict[AssessmentDepth, List[str]] = {
         AssessmentDepth.COMPREHENSIVE: [
-            "Extensive OSINT footprint across corporate and technical surface",
+            "Extensive footprint across corporate and technical surface",
             "Executive and developer credential leak monitoring",
             "Cloud infrastructure and public attack surface scan",
             "Regulatory enforcement actions and litigation records",
@@ -33,22 +32,10 @@ class ScopingEngine:
     }
 
     def __init__(self, config: CriticalityConfig) -> None:
-        """Initialize the scoping engine with configuration.
-
-        Args:
-            config: Validated CriticalityConfig instance.
-        """
         self.config = config
 
     def create_scope(self, tier: CriticalityTier) -> AssessmentScope:
-        """Create an assessment scope specification for a given criticality tier.
-
-        Args:
-            tier: Determined CriticalityTier.
-
-        Returns:
-            AssessmentScope containing depth, description, and focus areas.
-        """
+        """Create an assessment scope specification for a given criticality tier."""
         tier_key = tier.value
         depth_cfg = self.config.assessment_depth_mapping.get(tier_key)
 

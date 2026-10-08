@@ -1,4 +1,4 @@
-vendor_id,vendor_name,domain,data_sensitivity,payment_involvement,regulatory_exposure,operational_dependency,customer_data_volume
+vendor_id,vendor_name,domain,data_sensitivity,payment_flows,regulatory_exposure,operational_dependency,customer_data_volume
 V001,Apex Core Banking Cloud,apexbanking.com,critical,critical,high,critical,high
 V002,PayStream Global,paystream.io,high,critical,high,high,high
 V003,VaultSec Identity Services,vaultsec.net,critical,low,high,high,medium

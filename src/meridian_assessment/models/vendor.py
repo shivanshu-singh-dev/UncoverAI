@@ -33,18 +33,17 @@ class Vendor(BaseModel):
         frozen=True,
     )
 
-    vendor_id: str = Field(..., description="Unique alphanumeric identifier for the vendor", min_length=1)
+    vendor_id: str = Field(..., description="Unique identifier for the vendor", min_length=1)
     vendor_name: str = Field(..., description="Official trading or corporate name of the vendor", min_length=1)
     domain: str = Field(..., description="Primary website domain of the vendor", min_length=3)
 
     # 5 Core Criticality Criteria
     data_sensitivity: SeverityLevel = Field(
         ...,
-        description="Sensitivity of accessed data (Regulated financial records, PII, IP, Auth/Security systems)",
+        description="Sensitivity of accessed data (regulated financial records, PII, IP, auth/security systems)",
     )
     payment_flows: SeverityLevel = Field(
         ...,
-        alias="payment_involvement",
         description="Involvement in payment processing, routing, reconciliation, or monetary transactions",
     )
     regulatory_exposure: SeverityLevel = Field(
@@ -65,9 +64,8 @@ class Vendor(BaseModel):
     def validate_domain(cls, v: str) -> str:
         domain = v.strip().lower()
         if domain.startswith("http://") or domain.startswith("https://"):
-            # Strip protocol if accidentally included
             domain = domain.split("://", 1)[1]
-        domain = domain.split("/")[0]  # strip path if included
+        domain = domain.split("/")[0]
         if "." not in domain or len(domain) < 3:
             raise ValueError(f"Invalid domain format: '{v}'")
         return domain

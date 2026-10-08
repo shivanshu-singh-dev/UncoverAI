@@ -17,25 +17,10 @@ class CriticalityEngine:
     """Calculates deterministic, explainable criticality assessments based on configuration."""
 
     def __init__(self, config: CriticalityConfig) -> None:
-        """Initialize the engine with validated configuration.
-
-        Args:
-            config: Validated CriticalityConfig instance.
-        """
         self.config = config
 
     def evaluate(self, vendor: Vendor) -> CriticalityAssessment:
-        """Perform a deterministic criticality assessment on a single vendor.
-
-        Args:
-            vendor: Validated Vendor instance.
-
-        Returns:
-            Structured, explainable CriticalityAssessment.
-
-        Raises:
-            CriticalityEvaluationError: If configuration rules are incomplete for vendor data.
-        """
+        """Perform a deterministic criticality assessment on a single vendor."""
         logger.debug("Evaluating criticality for vendor %s (%s)", vendor.vendor_id, vendor.vendor_name)
 
         criteria_inputs = {
@@ -96,30 +81,24 @@ class CriticalityEngine:
         )
 
     def _determine_tier(self, score: float) -> CriticalityTier:
-        """Determine criticality tier based on configured thresholds sorted by min_score descending."""
         sorted_thresholds = sorted(
             self.config.tier_thresholds.items(),
             key=lambda item: item[1].min_score,
             reverse=True,
         )
-
         for tier_name, threshold in sorted_thresholds:
             if score >= threshold.min_score:
                 try:
                     return CriticalityTier(tier_name)
                 except ValueError:
                     return CriticalityTier[tier_name]
-
         return CriticalityTier.TIER_3
 
     def _determine_depth(self, tier: CriticalityTier) -> AssessmentDepth:
-        """Map criticality tier to assessment depth from configuration."""
         tier_key = tier.value
         depth_cfg = self.config.assessment_depth_mapping.get(tier_key)
         if depth_cfg:
             return AssessmentDepth(depth_cfg.depth)
-        
-        # Fallback defaults
         match tier:
             case CriticalityTier.TIER_1:
                 return AssessmentDepth.COMPREHENSIVE
@@ -129,7 +108,6 @@ class CriticalityEngine:
                 return AssessmentDepth.LIGHTWEIGHT
 
     def _generate_reasoning(self, criteria_results: Dict[str, CriterionResult]) -> List[str]:
-        """Generate human-readable explainability reasoning based on configured threshold."""
         reasoning: List[str] = []
         threshold = self.config.reasoning_rules.threshold_score_for_mention
         descriptions = self.config.reasoning_rules.descriptions

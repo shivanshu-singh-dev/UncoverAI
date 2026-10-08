@@ -1,3 +1,3 @@
-"""Meridian Financial - Vendor Risk Assessment Pipeline (Phase 1 Foundation)."""
+"""Meridian Financial — Vendor AI Security Assessment."""
 
 __version__ = "0.1.0"

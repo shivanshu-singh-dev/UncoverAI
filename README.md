@@ -6,21 +6,24 @@ Evidence-driven, deterministic third-party vendor risk assessment for Meridian F
 
 ## Overview
 
-Classifies third-party vendors into risk tiers using five structured criteria. Every tier assignment traces back to specific weights, scores, and configuration values — no black-box scoring.
+A vendor criticality classification system evaluating third-party vendors for risk. Criticality scoring is deterministic, explainable, and configuration-driven — without generative LLM scoring.
 
-**Five scoring dimensions:**
-- `data_sensitivity` — access to regulated financial records, PII, IP, auth/security systems
-- `payment_flows` — payment processing, routing, reconciliation, monetary transactions
-- `regulatory_exposure` — SEC, FINRA, GDPR, NYDFS, PCI-DSS exposure
-- `operational_dependency` — business criticality and disruption potential
-- `customer_data_volume` — scale of customer identity records processed
+### Supported Criticality Methodologies
 
-**Tiers (inclusive lower bounds):**
-| Tier | Min Score | Assessment Depth |
-|---|---|---|
-| Tier 1 — High | ≥ 3.5 | Comprehensive |
-| Tier 2 — Medium | ≥ 2.0 | Targeted |
-| Tier 3 — Low | < 2.0 | Lightweight |
+1. **Meridian D/P/R/O/V Methodology** (Primary):
+   - Evaluates 5 factors on a **0 to 3 scale**:
+     - **D (Data Sensitivity)** (30%): Classified strictly from data classification accessed; uses highest applicable level.
+     - **P (Payment Flow Exposure)** (20%): Derived from actual service scope and business process; distinguishes direct actions (initiate, transmit, authorize, clear, settle) from payment reporting and transaction handling; supports deterministic negation.
+     - **R (Regulatory Exposure)** (20%): Evaluates direct material regulatory obligations (notices, reporting, filings) vs indirect compliance or critical infrastructure.
+     - **O (Operational Dependency)** (20%): Direct structured mapping (`Low`=0, `Moderate`=1, `High`=2, `Critical`=3).
+     - **V (Annual Data Volume)** (10%): Count parser with unit scaling; isolates frequency indicators (e.g. monthly cycles) and population counts as `UNKNOWN` rather than misinterpreting them.
+   - **Formula**:
+     $$C = 0.30D + 0.20P + 0.20R + 0.20O + 0.10V$$
+   - **Deterministic Overrides (O1–O5)**: Rule-based floor evaluations (e.g. privileged service credentials, direct payment clearing/settlement, critical financial infrastructure) that elevate vendors to Tier 1 when conditions are met.
+   - **Provenance Tracking**: Every factor records its raw input, normalized input, determination method (`DIRECT`, `DETERMINISTIC_RULE`, `SEMANTIC_MATCH`, `HUMAN_REVIEW`, or `UNKNOWN`), matched concepts, and audit rationale.
+
+2. **Standard Qualitative Assessment Mode** (Legacy):
+   - 5 qualitative dimensions (`data_sensitivity`, `payment_flows`, `regulatory_exposure`, `operational_dependency`, `customer_data_volume`) on qualitative levels (`critical`, `high`, `medium`, `low`, `none`).
 
 ---
 
@@ -55,12 +58,12 @@ pip install -r requirements.txt
 
 ## Usage
 
-### CLI
+### CLI Execution
 ```bash
 python main.py --input data/input/vendors.csv
 ```
 
-Options:
+**CLI Options**:
 ```
   --input   PATH   Vendor CSV path (default: data/input/vendors.csv)
   --config  PATH   Scoring config YAML (default: config/criticality.yaml)
@@ -68,66 +71,27 @@ Options:
   --log-level      DEBUG | INFO | WARNING | ERROR
 ```
 
-### Web UI
+### Streamlit Web Dashboard
 ```bash
 streamlit run app.py
 ```
+Opens in your browser at `http://localhost:8501`. Allows switching between the **Meridian D/P/R/O/V Methodology** (with full factor provenance breakdown, override detection, and review flags) and the legacy assessment mode.
 
-Opens at `http://localhost:8501`. Upload a vendor CSV or use the built-in sample dataset.
+### Diagnostic Script (Meridian Dataset)
+```bash
+python scripts/generate_diagnostic.py
+```
+Runs the D/P/R/O/V engine against the case study vendor inventory (`data/input/meridian_vendors.csv`) and exports factor provenance details to `data/output/meridian_diagnostic.json`.
 
 ---
 
 ## Running Tests
 ```bash
 pytest
+```
+Run with coverage:
+```bash
 pytest --cov=src/meridian_assessment
-```
-
----
-
-## CSV Input Format
-
-| Column | Required values |
-|---|---|
-| `vendor_id` | Unique string |
-| `vendor_name` | Display name |
-| `domain` | e.g. `example.com` |
-| `data_sensitivity` | `critical` / `high` / `medium` / `low` / `none` |
-| `payment_flows` | `critical` / `high` / `medium` / `low` / `none` |
-| `regulatory_exposure` | `critical` / `high` / `medium` / `low` / `none` |
-| `operational_dependency` | `critical` / `high` / `medium` / `low` / `none` |
-| `customer_data_volume` | `critical` / `high` / `medium` / `low` / `none` |
-
----
-
-## Scoring Configuration
-
-All weights, severity scales, and tier thresholds are in [`config/criticality.yaml`](config/criticality.yaml). Modify without touching Python:
-
-```yaml
-criterion_weights:
-  data_sensitivity: 0.25
-  payment_flows: 0.20
-  regulatory_exposure: 0.20
-  operational_dependency: 0.20
-  customer_data_volume: 0.15
-
-severity_scores:
-  critical: 5.0
-  high: 4.0
-  medium: 2.5
-  low: 1.0
-  none: 0.0
-```
-
-**Verified example:**
-```
-data_sensitivity:       critical (5.0) × 0.25 = 1.25
-payment_flows:          critical (5.0) × 0.20 = 1.00
-regulatory_exposure:    high     (4.0) × 0.20 = 0.80
-operational_dependency: critical (5.0) × 0.20 = 1.00
-customer_data_volume:   high     (4.0) × 0.15 = 0.60
-                                          Total = 4.65 → Tier 1
 ```
 
 ---
@@ -136,21 +100,39 @@ customer_data_volume:   high     (4.0) × 0.15 = 0.60
 
 ```
 .
+├── AGENTS.md                  # Workspace rules (hygiene, gitignore, requirements, README accuracy)
 ├── config/
-│   └── criticality.yaml
+│   ├── factor_weights.yaml                 # D/P/R/O/V formula weights
+│   ├── data_sensitivity_taxonomy.yaml      # D factor concept taxonomy
+│   ├── operational_dependency_mapping.yaml # O factor structured mapping
+│   ├── volume_thresholds.yaml              # V factor threshold parameters & unit definitions
+│   ├── payment_ontology.yaml               # P factor ontology, verbs & negation rules
+│   ├── regulatory_taxonomy.yaml            # R factor taxonomy & reference statements
+│   ├── semantic_config.yaml                # Semantic embedding fallback configuration
+│   └── criticality.yaml                    # Thresholds & legacy scoring configuration
 ├── data/
-│   ├── input/vendors.csv
-│   └── sample/sample_vendors.csv
+│   ├── input/
+│   │   ├── meridian_vendors.csv            # Meridian case study vendor inventory (6 vendors)
+│   │   └── vendors.csv                     # Standard vendor dataset
+│   ├── sample/
+│   │   └── sample_vendors.csv              # Minimal sample dataset
+│   └── output/                             # Generated output files (gitignored)
 ├── src/meridian_assessment/
-│   ├── config/       # Config loader
-│   ├── ingestion/    # CSV loader
-│   ├── models/       # Pydantic schemas
-│   ├── osint/        # OSINT interface contract
-│   ├── services/     # Criticality engine, scoping, pipeline
-│   └── utils/        # Logger, exceptions
+│   ├── config/                # YAML configuration loaders
+│   ├── ingestion/             # CSV loaders (Meridian & Standard formats)
+│   ├── models/                # Pydantic schemas (MeridianVendor, FactorResult, Vendor)
+│   ├── osint/                 # OSINT contract interface
+│   ├── services/              # Criticality engines, scoping, factor classifiers
+│   │   └── factors/           # D, P, R, O, V modular factor classifiers & text utils
+│   └── utils/                 # Logging and exception hierarchy
 ├── tests/
-│   ├── unit/
-│   └── integration/
-├── app.py            # Streamlit UI
-└── main.py           # CLI
+│   ├── unit/                  # Factor unit tests (D, P, R, O, V), config, models, engine
+│   └── integration/           # Pipeline & CLI integration tests
+├── scripts/
+│   └── generate_diagnostic.py # Full diagnostic evaluation runner
+├── app.py                     # Streamlit application dashboard
+├── main.py                    # Command-line interface
+├── pyproject.toml             # Project metadata & pytest configuration
+├── requirements.txt           # Project dependencies
+└── README.md                  # Project documentation
 ```

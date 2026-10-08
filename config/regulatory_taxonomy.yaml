@@ -1,0 +1,61 @@
+# Regulatory Exposure Taxonomy — R factor
+
+levels:
+  r0:
+    label: "No regulatory dependency"
+    concepts:
+      - name: no_regulatory
+        aliases: ["no regulatory", "no compliance", "no regulatory role", "non-regulated", "no regulatory exposure"]
+        rationale: "No regulatory dependency identified."
+
+  r1:
+    label: "Indirect compliance support"
+    concepts:
+      - name: indirect_compliance
+        aliases: ["indirect compliance", "compliance assistance", "general compliance support", "supporting control", "internal controls support", "risk management support", "audit support"]
+        rationale: "Provides indirect or general compliance assistance."
+      - name: operational_reporting
+        aliases: ["management reporting", "internal reporting", "performance reporting", "analytics", "business intelligence", "business analytics"]
+        rationale: "Internal or management reporting — indirect regulatory support."
+
+  r2:
+    label: "Direct regulatory support"
+    concepts:
+      - name: regulatory_notices
+        aliases: ["regulatory notices", "regulatory notice", "required notices", "compliance notices", "regulatory communications", "regulatory statements"]
+        rationale: "Produces regulatory notices — direct support for regulatory obligation."
+      - name: regulatory_reporting
+        aliases: ["regulatory reporting", "regulatory report", "regulatory filings", "required regulatory reporting", "compliance reporting", "tax reporting"]
+        rationale: "Supports direct regulatory reporting obligation."
+      - name: regulatory_records
+        aliases: ["regulatory records", "required records", "compliance records", "record retention", "document retention", "recordkeeping"]
+        rationale: "Maintains required regulatory records."
+      - name: material_compliance
+        aliases: ["material compliance", "material compliance function", "key compliance control", "critical compliance control"]
+        rationale: "Provides material compliance function."
+
+  r3:
+    label: "Critical outsourced / regulated function"
+    concepts:
+      - name: critical_regulated_function
+        aliases: ["critical regulated function", "critical outsourced function", "regulated outsourcing", "critical financial function", "systemically important", "critical payment infrastructure", "designated clearing organization", "financial market utility"]
+        rationale: "Performs a critical outsourced or regulated function."
+      - name: critical_network
+        aliases: ["critical financial network", "national payment network", "payment network operator", "designated financial market utility", "fmu", "dco"]
+        rationale: "Operates critical financial market infrastructure."
+
+# Important: generic terms alone are NOT sufficient for any level
+non_determinative_alone:
+  - compliance
+  - financial
+  - regulated
+  - regulatory
+  - bank
+  - financial services
+
+# Reference statements for semantic fallback
+semantic_references:
+  r0: "The vendor's service has no regulatory or compliance dependency for the organization."
+  r1: "The vendor provides general operational or management support that indirectly contributes to compliance processes."
+  r2: "The vendor directly supports a specific regulatory obligation through notices, reporting, records, or material compliance controls."
+  r3: "The vendor performs a critical outsourced or regulated function whose failure could directly threaten the organization's regulatory obligations."

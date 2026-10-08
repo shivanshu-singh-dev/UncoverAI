@@ -1,0 +1,14 @@
+# Semantic Embedding Configuration
+# Used only as fallback when deterministic concept matching is ambiguous.
+
+embedding:
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  top_k: 3
+
+# Review thresholds — PROVISIONAL, to be calibrated on Meridian vendor population.
+# If similarity < low_confidence_threshold → UNKNOWN / REQUIRES_REVIEW
+# If similarity >= high_confidence_threshold → use semantic candidate
+# In between → surface for review
+thresholds:
+  high_confidence: 0.70
+  low_confidence: 0.45

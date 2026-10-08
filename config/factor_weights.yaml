@@ -1,0 +1,10 @@
+# Meridian Criticality Factor Weights
+# C = 0.30D + 0.20P + 0.20R + 0.20O + 0.10V
+# All weights must sum to 1.0
+
+weights:
+  D: 0.30  # Data Sensitivity
+  P: 0.20  # Payment Flow Exposure
+  R: 0.20  # Regulatory Exposure
+  O: 0.20  # Operational Dependency
+  V: 0.10  # Annual Data Volume

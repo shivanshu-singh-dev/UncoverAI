@@ -1,0 +1,62 @@
+# Volume Factor — V thresholds
+# PROVISIONAL TESTING PARAMETERS — not final calibrated thresholds.
+# These must be updated after empirical calibration on the full vendor population.
+
+# Annual item count bands:
+#   V=0: no data / N/A
+#   V=1: limited/bounded (< small_upper)
+#   V=2: material (small_upper <= x < material_upper)
+#   V=3: enterprise-scale (>= material_upper)
+
+thresholds:
+  small_upper: 1000000      # < 1 million = V1
+  material_upper: 10000000  # 1M to 10M = V2; >= 10M = V3
+
+# Units recognized by parser (count-like):
+count_units:
+  - transactions
+  - messages
+  - documents
+  - records
+  - accounts
+  - customers
+  - clients
+  - cases
+  - items
+  - files
+  - entries
+  - events
+  - payments
+
+# Scale multipliers:
+scale_multipliers:
+  thousand: 1000
+  k: 1000
+  million: 1000000
+  m: 1000000
+  billion: 1000000000
+  b: 1000000000
+
+# Frequency indicators — these are NOT annual volume counts
+frequency_indicators:
+  - monthly cycles
+  - monthly cycle
+  - monthly reporting
+  - monthly reports
+  - monthly batches
+  - monthly batch
+  - quarterly
+  - weekly
+  - daily
+  - cycles per year
+  - times per year
+  - runs per year
+
+# Population indicators — not annual transaction counts
+population_indicators:
+  - clients
+  - customers
+  - wealth clients
+  - members
+  - accounts
+  - users

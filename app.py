@@ -1,4 +1,9 @@
-"""Meridian Vendor Assessment — Streamlit Dashboard."""
+"""Meridian Vendor Assessment — Streamlit Dashboard.
+
+Supports both:
+  1. Meridian D/P/R/O/V Methodology (Case study dataset with full provenance tracking)
+  2. Standard Assessment Mode (legacy 5-dimension qualitative model)
+"""
 
 import sys
 from pathlib import Path
@@ -9,13 +14,16 @@ if str(_SRC) not in sys.path:
 
 import json
 import tempfile
-from typing import Optional
+from typing import Optional, Union
 
 import streamlit as st
 
 from meridian_assessment.models.criticality import CriticalityAssessment, CriticalityTier
 from meridian_assessment.models.assessment import AssessmentDepth
+from meridian_assessment.models.factor_result import CriticalityResult
 from meridian_assessment.services.pipeline import AssessmentPipeline
+from meridian_assessment.services.meridian_criticality_engine import MeridianCriticalityEngine
+from meridian_assessment.ingestion.meridian_csv_loader import MeridianCSVVendorLoader
 from meridian_assessment.utils.exceptions import MeridianAssessmentError
 
 # ─── Page config ──────────────────────────────────────────────────────────────
@@ -121,28 +129,45 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     padding: 0.2rem 0.55rem;
 }
 
-/* ── Criterion cards ── */
-.crit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.65rem; }
-.crit-card {
+/* ── Factor Cards ── */
+.factor-card {
     background: #ffffff;
     border: 1px solid #e5e7eb;
     border-radius: 8px;
-    padding: 0.8rem 1rem;
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.65rem;
 }
-.crit-name  { font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: #6b7280; margin-bottom: 0.35rem; }
-.crit-badge {
-    display: inline-block;
-    font-size: 0.7rem; font-weight: 700;
-    padding: 0.15rem 0.45rem; border-radius: 4px;
+.factor-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.35rem;
+}
+.factor-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #111827;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.factor-score-badge {
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    background: #f3f4f6;
+    color: #111827;
+}
+.factor-rationale {
+    font-size: 0.78rem;
+    color: #4b5563;
+    line-height: 1.4;
     margin-bottom: 0.4rem;
 }
-.crit-badge.critical { background:#fef2f2; color:#b91c1c; }
-.crit-badge.high     { background:#fff7ed; color:#c2410c; }
-.crit-badge.medium   { background:#fffbeb; color:#92400e; }
-.crit-badge.low      { background:#f0fdf4; color:#166534; }
-.crit-badge.none     { background:#f9fafb; color:#6b7280; }
-.crit-stats { font-size: 0.72rem; color: #9ca3af; }
-.crit-stats strong { color: #374151; }
+.factor-meta {
+    font-size: 0.68rem;
+    color: #9ca3af;
+}
 
 /* ── Bar chart ── */
 .bar-row { display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.55rem; }
@@ -150,29 +175,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .bar-track { flex: 1; background: #f3f4f6; border-radius: 4px; height: 7px; }
 .bar-fill  { border-radius: 4px; height: 7px; transition: width 0.3s ease; }
 .bar-num   { font-size: 0.72rem; font-weight: 600; color: #374151; width: 32px; text-align: right; }
-
-/* ── Reasoning ── */
-.reason-item {
-    display: flex; align-items: flex-start; gap: 0.55rem;
-    padding: 0.5rem 0; border-bottom: 1px solid #f3f4f6;
-    font-size: 0.8rem; color: #374151; line-height: 1.45;
-}
-.reason-chevron { color: #6366f1; font-size: 0.65rem; margin-top: 0.1rem; flex-shrink: 0; }
-
-/* ── OSINT pending ── */
-.osint-box {
-    background: #f9fafb;
-    border: 1px dashed #d1d5db;
-    border-radius: 8px;
-    padding: 1rem 1.25rem;
-}
-.osint-tag {
-    display: inline-block;
-    font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em;
-    background: #f3f4f6; color: #6b7280;
-    border-radius: 4px; padding: 0.15rem 0.45rem; margin-bottom: 0.6rem;
-}
-.osint-text { font-size: 0.78rem; color: #6b7280; line-height: 1.6; }
 
 /* ── Empty state ── */
 .empty-state {
@@ -187,65 +189,57 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 /* ── Sidebar ── */
 section[data-testid="stSidebar"] { background: #f9fafb; border-right: 1px solid #e5e7eb; }
 section[data-testid="stSidebar"] .block-container { padding: 1.5rem 1rem; }
-
-/* ── Upload area ── */
-[data-testid="stFileUploaderDropzone"] {
-    border: 1.5px dashed #d1d5db !important;
-    border-radius: 8px !important;
-    background: #ffffff !important;
-}
 </style>
 """, unsafe_allow_html=True)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-SAMPLE_CSV = Path("data/sample/sample_vendors.csv")
+MERIDIAN_DATASET_CSV = Path("data/input/meridian_vendors.csv")
+LEGACY_SAMPLE_CSV = Path("data/sample/sample_vendors.csv")
 CONFIG_PATH = Path("config/criticality.yaml")
 
 TIER_LABEL = {
+    "TIER_1": "Tier 1 — High",
+    "TIER_2": "Tier 2 — Medium",
+    "TIER_3": "Tier 3 — Low",
     CriticalityTier.TIER_1: "Tier 1 — High",
     CriticalityTier.TIER_2: "Tier 2 — Medium",
     CriticalityTier.TIER_3: "Tier 3 — Low",
 }
 TIER_CSS = {
+    "TIER_1": "t1",
+    "TIER_2": "t2",
+    "TIER_3": "t3",
     CriticalityTier.TIER_1: "t1",
     CriticalityTier.TIER_2: "t2",
     CriticalityTier.TIER_3: "t3",
 }
 DEPTH_LABEL = {
+    "COMPREHENSIVE": "Comprehensive",
+    "TARGETED": "Targeted",
+    "LIGHTWEIGHT": "Lightweight",
     AssessmentDepth.COMPREHENSIVE: "Comprehensive",
     AssessmentDepth.TARGETED: "Targeted",
     AssessmentDepth.LIGHTWEIGHT: "Lightweight",
 }
-CRIT_DISPLAY = {
-    "data_sensitivity":      "Data Sensitivity",
-    "payment_flows":         "Payment Flows",
-    "regulatory_exposure":   "Regulatory Exposure",
-    "operational_dependency":"Operational Dependency",
-    "customer_data_volume":  "Customer Data Volume",
-}
-BAR_COLOR = {
-    CriticalityTier.TIER_1: "#ef4444",
-    CriticalityTier.TIER_2: "#f59e0b",
-    CriticalityTier.TIER_3: "#10b981",
-}
-MAX_SCORE = 5.0  # max weighted score ceiling for bar scaling (all-critical)
 
 
-def pill(tier: CriticalityTier) -> str:
-    c = TIER_CSS[tier]
-    return (
-        f'<span class="pill {c}">'
-        f'<span class="pill-dot"></span>'
-        f'{TIER_LABEL[tier]}'
-        f'</span>'
-    )
+def pill(tier_val: str) -> str:
+    c = TIER_CSS.get(tier_val, "t3")
+    lbl = TIER_LABEL.get(tier_val, str(tier_val))
+    return f'<span class="pill {c}"><span class="pill-dot"></span>{lbl}</span>'
 
 
-def crit_badge(val: str) -> str:
-    return f'<span class="crit-badge {val}">{val.upper()}</span>'
+def run_meridian_methodology(csv_bytes: bytes) -> list[CriticalityResult]:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb") as tmp:
+        tmp.write(csv_bytes)
+        tmp_path = Path(tmp.name)
+    loader = MeridianCSVVendorLoader()
+    engine = MeridianCriticalityEngine()
+    vendors = loader.load(tmp_path)
+    return [engine.evaluate(v) for v in vendors]
 
 
-def run_pipeline(csv_bytes: bytes) -> list[CriticalityAssessment]:
+def run_legacy_pipeline(csv_bytes: bytes) -> list[CriticalityAssessment]:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb") as tmp:
         tmp.write(csv_bytes)
         tmp_path = Path(tmp.name)
@@ -259,114 +253,116 @@ st.markdown("""
     <div class="topbar-brand">
         <div class="topbar-logo">M</div>
         <div>
-            <div class="topbar-name">Meridian &nbsp; Vendor Risk</div>
-            <div class="topbar-sub">Evidence-driven third-party security assessment</div>
+            <div class="topbar-name">Meridian &nbsp; Vendor Risk Assessment</div>
+            <div class="topbar-sub">Deterministic Criticality Engine — D/P/R/O/V Methodology</div>
         </div>
     </div>
-    <div class="topbar-right">Criticality Assessment · v1.0</div>
+    <div class="topbar-right">Evidence-Driven · Zero-LLM Scoring</div>
 </div>
 """, unsafe_allow_html=True)
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown("#### Methodology Mode")
+    engine_mode = st.radio(
+        "Engine Selection",
+        ["Meridian D/P/R/O/V (New)", "Standard Qualitative (Legacy)"],
+        label_visibility="collapsed",
+    )
+
     st.markdown("#### Vendor Input")
-    mode = st.radio("Source", ["Upload CSV", "Use sample dataset"], label_visibility="collapsed")
-
-    uploaded_file = None
-    use_sample = False
-
-    if mode == "Upload CSV":
-        uploaded_file = st.file_uploader(
-            "Drop vendor CSV",
-            type=["csv"],
+    if engine_mode == "Meridian D/P/R/O/V (New)":
+        data_source = st.radio(
+            "Source",
+            ["Meridian Case Study (6 Vendors)", "Upload Meridian CSV"],
             label_visibility="collapsed",
-            help=(
-                "Required columns: vendor_id, vendor_name, domain, "
-                "data_sensitivity, payment_flows, regulatory_exposure, "
-                "operational_dependency, customer_data_volume\n\n"
-                "Accepted values: critical / high / medium / low / none"
-            ),
         )
     else:
-        use_sample = True
+        data_source = st.radio(
+            "Source",
+            ["Sample Dataset", "Upload CSV"],
+            label_visibility="collapsed",
+        )
 
-    run_btn = st.button(
-        "Run Assessment",
-        type="primary",
-        use_container_width=True,
-        disabled=(not use_sample and uploaded_file is None),
-    )
+    uploaded_file = None
+    if "Upload" in data_source:
+        uploaded_file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
+
+    run_btn = st.button("Run Assessment", type="primary", use_container_width=True)
 
     st.divider()
     st.markdown("""
-    <div style="font-size:0.72rem;color:#9ca3af;line-height:1.65">
-    <strong style="color:#374151">Five scoring dimensions</strong><br>
-    Data Sensitivity · Payment Flows<br>
-    Regulatory Exposure<br>
-    Operational Dependency<br>
-    Customer Data Volume<br><br>
-    <strong style="color:#374151">Tiers</strong><br>
-    Tier 1 (≥ 3.5) → Comprehensive<br>
-    Tier 2 (≥ 2.0) → Targeted<br>
-    Tier 3 (&lt; 2.0) → Lightweight
+    <div style="font-size:0.72rem;color:#6b7280;line-height:1.65">
+    <strong style="color:#111827">D/P/R/O/V Formula</strong><br>
+    C = 0.30D + 0.20P + 0.20R + 0.20O + 0.10V<br><br>
+    <strong style="color:#111827">Factor Scale</strong><br>
+    0 to 3 per factor with explicit provenance.<br><br>
+    <strong style="color:#111827">Overrides</strong><br>
+    O1–O5 deterministic floor triggers.
     </div>
     """, unsafe_allow_html=True)
 
 # ─── Session state ────────────────────────────────────────────────────────────
-if "assessments" not in st.session_state:
-    st.session_state.assessments: list[CriticalityAssessment] = []
-if "error" not in st.session_state:
-    st.session_state.error: Optional[str] = None
-if "selected" not in st.session_state:
-    st.session_state.selected: Optional[str] = None
+if "results" not in st.session_state:
+    st.session_state.results = []
+if "mode_used" not in st.session_state:
+    st.session_state.mode_used = ""
+if "selected_id" not in st.session_state:
+    st.session_state.selected_id = None
+if "error_msg" not in st.session_state:
+    st.session_state.error_msg = None
 
-# ─── Run pipeline ─────────────────────────────────────────────────────────────
 if run_btn:
-    st.session_state.error = None
-    st.session_state.selected = None
+    st.session_state.error_msg = None
+    st.session_state.selected_id = None
     try:
-        if use_sample:
-            if not SAMPLE_CSV.is_file():
-                st.session_state.error = f"Sample file not found: {SAMPLE_CSV}"
+        if engine_mode == "Meridian D/P/R/O/V (New)":
+            st.session_state.mode_used = "meridian"
+            if data_source == "Meridian Case Study (6 Vendors)":
+                st.session_state.results = run_meridian_methodology(MERIDIAN_DATASET_CSV.read_bytes())
+            elif uploaded_file:
+                st.session_state.results = run_meridian_methodology(uploaded_file.read())
             else:
-                st.session_state.assessments = run_pipeline(SAMPLE_CSV.read_bytes())
-        elif uploaded_file:
-            st.session_state.assessments = run_pipeline(uploaded_file.read())
-    except MeridianAssessmentError as exc:
-        st.session_state.error = str(exc)
-    except Exception as exc:
-        st.session_state.error = f"Unexpected error — check your input file.\n\n{exc}"
+                st.session_state.error_msg = "Please upload a CSV file."
+        else:
+            st.session_state.mode_used = "legacy"
+            if data_source == "Sample Dataset":
+                st.session_state.results = run_legacy_pipeline(LEGACY_SAMPLE_CSV.read_bytes())
+            elif uploaded_file:
+                st.session_state.results = run_legacy_pipeline(uploaded_file.read())
+            else:
+                st.session_state.error_msg = "Please upload a CSV file."
+    except Exception as e:
+        st.session_state.error_msg = str(e)
 
-# ─── Error ────────────────────────────────────────────────────────────────────
-if st.session_state.error:
-    st.error(st.session_state.error)
+if st.session_state.error_msg:
+    st.error(st.session_state.error_msg)
     st.stop()
 
-assessments = st.session_state.assessments
+results = st.session_state.results
 
-# ─── Empty state ──────────────────────────────────────────────────────────────
-if not assessments:
+if not results:
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
         st.markdown("""
         <div class="empty-state">
             <div class="empty-icon">🛡</div>
             <div class="empty-title">No assessment loaded</div>
-            <div class="empty-hint">Upload a vendor CSV or choose the sample dataset,<br>then click <strong>Run Assessment</strong>.</div>
+            <div class="empty-hint">Select a dataset in the sidebar and click <strong>Run Assessment</strong>.</div>
         </div>
         """, unsafe_allow_html=True)
     st.stop()
 
 # ─── Stat cards ───────────────────────────────────────────────────────────────
-t1 = sum(1 for a in assessments if a.criticality_tier == CriticalityTier.TIER_1)
-t2 = sum(1 for a in assessments if a.criticality_tier == CriticalityTier.TIER_2)
-t3 = sum(1 for a in assessments if a.criticality_tier == CriticalityTier.TIER_3)
+t1 = sum(1 for r in results if getattr(r, "criticality_tier", "") == "TIER_1" or getattr(r, "criticality_tier", None) == CriticalityTier.TIER_1)
+t2 = sum(1 for r in results if getattr(r, "criticality_tier", "") == "TIER_2" or getattr(r, "criticality_tier", None) == CriticalityTier.TIER_2)
+t3 = sum(1 for r in results if getattr(r, "criticality_tier", "") == "TIER_3" or getattr(r, "criticality_tier", None) == CriticalityTier.TIER_3)
 
 st.markdown(f"""
 <div class="stat-grid">
     <div class="stat-card all">
         <div class="stat-label">Total Assessed</div>
-        <div class="stat-value">{len(assessments)}</div>
+        <div class="stat-value">{len(results)}</div>
         <div class="stat-sub">vendors</div>
     </div>
     <div class="stat-card t1">
@@ -388,144 +384,134 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ─── Two-column layout ────────────────────────────────────────────────────────
-col_left, col_right = st.columns([5, 4], gap="large")
+col_left, col_right = st.columns([5, 5], gap="large")
 
-# ── Left: results table ──
 with col_left:
     st.markdown('<div class="sec-header">Assessment Results</div>', unsafe_allow_html=True)
-
     import pandas as pd
 
     rows = []
-    for a in assessments:
-        rows.append({
-            "ID": a.vendor_id,
-            "Vendor": a.vendor_name,
-            "Tier": TIER_LABEL[a.criticality_tier],
-            "Score": a.criticality_score,
-            "Depth": DEPTH_LABEL[a.assessment_depth],
-        })
+    is_meridian = st.session_state.mode_used == "meridian"
+
+    for r in results:
+        if is_meridian:
+            rows.append({
+                "ID": r.vendor_id,
+                "Vendor": r.vendor_name,
+                "Tier": TIER_LABEL.get(r.criticality_tier, str(r.criticality_tier)),
+                "Score": f"{r.base_score:.2f}" if r.base_score is not None else "UNKNOWN",
+                "Status": r.score_status.value,
+                "D": r.D.score if r.D.score is not None else "?",
+                "P": r.P.score if r.P.score is not None else "?",
+                "R": r.R.score if r.R.score is not None else "?",
+                "O": r.O.score if r.O.score is not None else "?",
+                "V": r.V.score if r.V.score is not None else "?",
+            })
+        else:
+            rows.append({
+                "ID": r.vendor_id,
+                "Vendor": r.vendor_name,
+                "Tier": TIER_LABEL.get(r.criticality_tier, str(r.criticality_tier)),
+                "Score": f"{r.criticality_score:.2f}",
+                "Depth": DEPTH_LABEL.get(r.assessment_depth, str(r.assessment_depth)),
+            })
+
     df = pd.DataFrame(rows)
 
-    # pandas 2.x uses .map() not .applymap()
     def _tier_style(val: str) -> str:
-        if "Tier 1" in val:
+        if "Tier 1" in str(val):
             return "background-color:#fef2f2;color:#b91c1c;font-weight:600;"
-        if "Tier 2" in val:
+        if "Tier 2" in str(val):
             return "background-color:#fffbeb;color:#92400e;font-weight:600;"
         return "background-color:#ecfdf5;color:#065f46;font-weight:600;"
 
     styled = df.style.map(_tier_style, subset=["Tier"])
-
-    ev = st.dataframe(
-        styled,
-        use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-    )
+    ev = st.dataframe(styled, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row")
 
     if ev.selection and ev.selection.rows:
-        st.session_state.selected = assessments[ev.selection.rows[0]].vendor_id
+        st.session_state.selected_id = results[ev.selection.rows[0]].vendor_id
 
     # JSON export
-    json_out = json.dumps([a.model_dump(mode="json") for a in assessments], indent=2)
-    st.download_button(
-        "⬇  Download JSON",
-        data=json_out,
-        file_name="assessment_results.json",
-        mime="application/json",
-        use_container_width=True,
-    )
+    json_out = json.dumps([r.model_dump(mode="json") for r in results], indent=2)
+    st.download_button("⬇ Download Results JSON", data=json_out, file_name="criticality_results.json", mime="application/json", use_container_width=True)
 
-# ── Right: detail panel ──
 with col_right:
-    sel_id = st.session_state.selected
-    sel: Optional[CriticalityAssessment] = next((a for a in assessments if a.vendor_id == sel_id), None)
+    sel_id = st.session_state.selected_id
+    sel = next((r for r in results if r.vendor_id == sel_id), None)
 
     if sel is None:
-        st.markdown('<div class="sec-header">Vendor Detail</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-header">Vendor Factor Detail</div>', unsafe_allow_html=True)
         st.markdown("""
         <div class="empty-state" style="padding:2.5rem 1rem">
             <div class="empty-icon" style="font-size:1.4rem">←</div>
             <div class="empty-title">Select a vendor</div>
-            <div class="empty-hint">Click any row in the results table<br>to see the full assessment breakdown.</div>
+            <div class="empty-hint">Click any row in the results table to view its full factor breakdown and provenance audit trail.</div>
         </div>
         """, unsafe_allow_html=True)
     else:
-        a = sel
-        tier_css = TIER_CSS[a.criticality_tier]
-        bar_color = BAR_COLOR[a.criticality_tier]
-
-        # ── Vendor header ──
-        st.markdown(f"""
-        <div class="detail-header">
-            <div class="detail-vendor-name">{a.vendor_name}</div>
-            <div class="detail-domain">{a.domain}</div>
-            <div class="detail-meta">
-                {pill(a.criticality_tier)}
-                <span class="detail-score">Score {a.criticality_score}</span>
-                <span class="detail-score">{DEPTH_LABEL[a.assessment_depth]}</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # ── Criterion grid ──
-        st.markdown('<div class="sec-header">Dimension Scores</div>', unsafe_allow_html=True)
-
-        cards_html = '<div class="crit-grid">'
-        for k, res in a.criteria.items():
-            name = CRIT_DISPLAY.get(k, k)
-            val = res.value.value
-            cards_html += f"""
-            <div class="crit-card">
-                <div class="crit-name">{name}</div>
-                {crit_badge(val)}
-                <div class="crit-stats">
-                    Score <strong>{res.score}</strong> &nbsp;·&nbsp;
-                    Weight <strong>{int(res.weight * 100)}%</strong> &nbsp;·&nbsp;
-                    Contribution <strong>{res.weighted_score:.2f}</strong>
+        # Render Selected Vendor
+        if is_meridian:
+            # ── MERIDIAN D/P/R/O/V VIEW ──
+            r: CriticalityResult = sel
+            st.markdown(f"""
+            <div class="detail-header">
+                <div class="detail-vendor-name">{r.vendor_name} ({r.vendor_id})</div>
+                <div class="detail-meta">
+                    {pill(r.criticality_tier or 'TIER_3')}
+                    <span class="detail-score">Base Score: <strong>{r.base_score}</strong></span>
+                    <span class="detail-score">Status: <strong>{r.score_status.value}</strong></span>
+                    <span class="detail-score">Depth: <strong>{r.assessment_depth}</strong></span>
                 </div>
-            </div>"""
-        cards_html += '</div>'
-        st.markdown(cards_html, unsafe_allow_html=True)
-
-        # ── Contribution bars ──
-        st.markdown('<div class="sec-header">Weighted Contributions</div>', unsafe_allow_html=True)
-        bars_html = ""
-        for k, res in a.criteria.items():
-            name = CRIT_DISPLAY.get(k, k)
-            pct = min(res.weighted_score / (MAX_SCORE * res.weight) * 100, 100)
-            bars_html += f"""
-            <div class="bar-row">
-                <div class="bar-lbl">{name}</div>
-                <div class="bar-track">
-                    <div class="bar-fill" style="width:{pct:.1f}%;background:{bar_color}"></div>
-                </div>
-                <div class="bar-num">{res.weighted_score:.2f}</div>
-            </div>"""
-        st.markdown(bars_html, unsafe_allow_html=True)
-
-        # ── Reasoning ──
-        st.markdown('<div class="sec-header">Assessment Reasoning</div>', unsafe_allow_html=True)
-        reasons_html = ""
-        for r in a.reasoning:
-            reasons_html += f'<div class="reason-item"><span class="reason-chevron">▸</span><span>{r}</span></div>'
-        st.markdown(reasons_html, unsafe_allow_html=True)
-
-        # ── OSINT placeholder ──
-        st.markdown('<div class="sec-header">External Investigation</div>', unsafe_allow_html=True)
-        st.markdown("""
-        <div class="osint-box">
-            <div class="osint-tag">Pending</div>
-            <div class="osint-text">
-                Automated discovery is not yet active for this vendor.<br><br>
-                Planned capabilities:<br>
-                &nbsp;· Public source footprint analysis<br>
-                &nbsp;· Domain security posture (DNS, TLS, MX)<br>
-                &nbsp;· Credential exposure monitoring<br>
-                &nbsp;· Regulatory enforcement search<br>
-                &nbsp;· Evidence collection &amp; AI-assisted triage
             </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
+
+            if r.override_applied:
+                triggered_ids = [o.override_id for o in r.overrides_evaluated if o.triggered]
+                st.warning(f"**Override Triggered:** Floor applied via {triggered_ids} -> Tier 1 (Comprehensive)")
+
+            if r.requires_review:
+                st.info(f"**Review Notes:** {', '.join(r.review_notes)}")
+
+            st.markdown('<div class="sec-header">Factor Provenance Breakdown</div>', unsafe_allow_html=True)
+
+            factors_to_show = [
+                ("D — Data Sensitivity", r.D),
+                ("P — Payment Flow Exposure", r.P),
+                ("R — Regulatory Exposure", r.R),
+                ("O — Operational Dependency", r.O),
+                ("V — Annual Data Volume", r.V),
+            ]
+
+            for label, f in factors_to_show:
+                score_str = str(f.score) if f.score is not None else "UNKNOWN"
+                contrib_str = f"{f.weighted_contribution:.2f}" if f.weighted_contribution is not None else "N/A"
+                st.markdown(f"""
+                <div class="factor-card">
+                    <div class="factor-header">
+                        <span class="factor-title">{label}</span>
+                        <span class="factor-score-badge">Score: {score_str} (Contrib: {contrib_str})</span>
+                    </div>
+                    <div class="factor-rationale"><strong>Rationale:</strong> {f.rationale}</div>
+                    <div class="factor-meta">
+                        Method: <code>{f.determination_method.value}</code> &nbsp;·&nbsp; Source: {', '.join(f.source_fields)} &nbsp;·&nbsp; Input: "{f.raw_input or 'None'}"
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        else:
+            # ── LEGACY 5-DIMENSION VIEW ──
+            a: CriticalityAssessment = sel
+            st.markdown(f"""
+            <div class="detail-header">
+                <div class="detail-vendor-name">{a.vendor_name}</div>
+                <div class="detail-domain">{a.domain}</div>
+                <div class="detail-meta">
+                    {pill(a.criticality_tier)}
+                    <span class="detail-score">Score: {a.criticality_score}</span>
+                    <span class="detail-score">{DEPTH_LABEL[a.assessment_depth]}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown('<div class="sec-header">Assessment Reasoning</div>', unsafe_allow_html=True)
+            for reason in a.reasoning:
+                st.markdown(f"• {reason}")

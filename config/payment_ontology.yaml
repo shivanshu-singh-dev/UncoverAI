@@ -1,0 +1,102 @@
+# Payment Flow Ontology — P factor
+
+levels:
+  p0:
+    label: "No payment involvement"
+    concepts:
+      - name: no_payment
+        aliases: ["no payment", "no payments", "does not process payments", "no payment processing", "without handling payment transactions", "non-payment", "not payment related"]
+        rationale: "No payment involvement identified."
+
+  p1:
+    label: "Payment-adjacent support"
+    concepts:
+      - name: payment_reporting
+        aliases: ["payment reporting", "payment statements", "payment statement", "account statements", "statement production", "payment analytics", "payment analysis"]
+        rationale: "Payment-adjacent reporting or statement function."
+      - name: payment_records
+        aliases: ["payment records", "payment history", "payment data management", "payment information management"]
+        rationale: "Payment records management without processing."
+      - name: administrative_payment
+        aliases: ["payment administration", "payment support", "payment-related administrative", "payment documentation"]
+        rationale: "Administrative payment support only."
+
+  p2:
+    label: "Material payment processing / handling"
+    concepts:
+      - name: transaction_processing
+        aliases: ["transaction processing", "payment processing", "process payments", "processes payments", "payment handling", "payment management"]
+        rationale: "Material payment processing or handling established."
+      - name: payment_reconciliation
+        aliases: ["reconciliation", "payment reconciliation", "transaction reconciliation", "account reconciliation"]
+        rationale: "Payment reconciliation function."
+      - name: payment_control
+        aliases: ["payment control", "payment controls", "payment instruction handling", "payment instructions"]
+        rationale: "Payment control or instruction handling."
+
+  p3:
+    label: "Direct payment flow — initiate/transmit/authorize/clear/settle"
+    # These are the P3 action verbs from the methodology rulebook
+    direct_actions:
+      - initiate
+      - initiates
+      - initiation
+      - transmit
+      - transmits
+      - transmission
+      - authorize
+      - authorizes
+      - authorization
+      - authorisation
+      - clear
+      - clears
+      - clearing
+      - settle
+      - settles
+      - settlement
+      - settlements
+      - funds transfer
+      - wire transfer
+      - wire transfers
+    payment_keywords:
+      - payment
+      - payments
+      - funds
+      - ach
+      - rtp
+      - fedwire
+      - swift
+      - wire
+      - transaction
+      - transactions
+      - remittance
+    concepts:
+      - name: direct_payment_flow
+        aliases: ["direct payment", "direct payment flow", "payment network", "payment infrastructure"]
+        rationale: "Direct payment flow activity."
+      - name: clearing_settlement
+        aliases: ["clearing and settlement", "ach clearing", "rtp clearing", "payment clearing", "payment settlement", "net settlement"]
+        rationale: "Clearing and settlement of payment transactions."
+      - name: payment_transmission
+        aliases: ["rtp transmission", "ach transmission", "payment transmission", "payment file transmission", "transmit payments", "transmit funds", "transmit payment files"]
+        rationale: "Direct payment transmission established."
+
+# Negation patterns — if matched, do NOT trigger P2/P3 for surrounding payment concepts
+negation_patterns:
+  - "does not process"
+  - "do not process"
+  - "not process"
+  - "no payment processing"
+  - "without processing"
+  - "without handling"
+  - "does not handle"
+  - "do not handle"
+  - "not involved in payment"
+  - "not a payment processor"
+
+# Reference statements for semantic embedding fallback
+semantic_references:
+  p0: "The vendor has no involvement in payment activities."
+  p1: "The vendor provides payment reporting, analytics, or statement production but does not process payment transactions."
+  p2: "The vendor materially processes, handles, controls, or reconciles payment transactions on behalf of the organization."
+  p3: "The vendor directly initiates, transmits, authorizes, clears, or settles payment or funds transactions."

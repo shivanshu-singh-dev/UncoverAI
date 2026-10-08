@@ -1,0 +1,11 @@
+# Operational Dependency — O factor direct structured mapping
+# Input is a structured field with known allowed values.
+
+mapping:
+  low: 0
+  moderate: 1
+  high: 2
+  critical: 3
+
+# Normalization: case-insensitive, strip whitespace.
+# Unrecognized values → UNKNOWN (NOT silently 0)

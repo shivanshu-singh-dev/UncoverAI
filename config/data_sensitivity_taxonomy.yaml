@@ -1,0 +1,64 @@
+# Data Sensitivity Taxonomy — Concept dictionary for D factor
+# Score is determined by HIGHEST applicable sensitivity found.
+
+rubric:
+  score_0:
+    label: "No data / Public"
+    concepts:
+      - name: no_data
+        aliases: ["no data", "no direct customer data", "no customer data", "no meridian data", "no sensitive data", "none", "n/a", "public information", "publicly available"]
+        rationale: "No Meridian data or only public information."
+      - name: public_data
+        aliases: ["public data", "open data", "published data"]
+        rationale: "Data is publicly available."
+
+  score_1:
+    label: "Internal / Operational"
+    concepts:
+      - name: internal_data
+        aliases: ["internal", "internal data", "internal business", "internal operational", "non-public internal"]
+        rationale: "Internal business information."
+      - name: operational_data
+        aliases: ["operational data", "operational records", "system metrics", "log data", "audit logs"]
+        rationale: "Internal operational data."
+      - name: low_sensitivity
+        aliases: ["low sensitivity", "low-sensitivity", "limited sensitivity"]
+        rationale: "Low-sensitivity information."
+
+  score_2:
+    label: "Confidential / PII"
+    concepts:
+      - name: pii
+        aliases: ["pii", "personally identifiable information", "personal information", "customer names", "names", "addresses", "customer addresses", "customer information", "customer data", "client information", "client data"]
+        rationale: "Contains personally identifiable information."
+      - name: customer_financial
+        aliases: ["account numbers", "account balances", "balances", "financial records", "financial data", "account records", "transaction records", "transaction data", "account information"]
+        rationale: "Ordinary financial records or account information."
+      - name: confidential_business
+        aliases: ["confidential", "confidential information", "business confidential", "proprietary", "proprietary data", "internal confidential"]
+        rationale: "Confidential business information."
+      - name: portfolio_data
+        aliases: ["portfolio holdings", "portfolio data", "holdings", "investment data", "advisor compensation", "commission", "revenue figures", "performance data"]
+        rationale: "Confidential financial/investment data."
+
+  score_3:
+    label: "Highly Sensitive / Regulated"
+    concepts:
+      - name: credentials
+        aliases: ["credentials", "service credentials", "production credentials", "system credentials", "access tokens", "api keys", "secrets", "passwords", "authentication credentials", "system access tokens"]
+        rationale: "Credentials or secrets represent highly sensitive security-critical data."
+      - name: customer_master
+        aliases: ["customer master", "customer master data", "full customer record", "complete customer data", "entire customer base", "all customers"]
+        rationale: "Customer master data represents the highest sensitivity."
+      - name: tax_identifiers
+        aliases: ["ssn", "social security", "tax identifiers", "tax id", "ein", "tin", "tax identification"]
+        rationale: "Tax identifiers are regulated highly sensitive data."
+      - name: payment_instructions
+        aliases: ["payment instructions", "payment orders", "wire instructions", "ach instructions", "rtp instructions", "funds transfer instructions"]
+        rationale: "Payment instructions are highly sensitive financial data."
+      - name: health_data
+        aliases: ["health", "medical", "health information", "health records", "phi", "protected health information", "vulnerability information"]
+        rationale: "Health/medical information is regulated sensitive data."
+      - name: highly_sensitive_financial
+        aliases: ["highly sensitive financial", "regulated financial", "payment information", "payment data", "account identifiers", "routing information"]
+        rationale: "Highly sensitive or regulated financial information."

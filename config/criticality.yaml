@@ -1,0 +1,58 @@
+# Meridian Vendor Assessment - Criticality & Scoping Rules
+# Phase 1: Foundational Configuration
+
+version: "1.0"
+
+# Scoring weights per criterion (must sum to 1.0)
+criterion_weights:
+  data_sensitivity: 0.25
+  payment_flows: 0.20
+  regulatory_exposure: 0.20
+  operational_dependency: 0.20
+  customer_data_volume: 0.15
+
+# Numerical score mapping for qualitative severity ratings
+severity_scores:
+  critical: 5.0
+  high: 4.0
+  medium: 2.5
+  low: 1.0
+  none: 0.0
+
+# Tier classification thresholds (evaluated from highest to lowest)
+# Score = sum(weight_i * severity_score_i)
+tier_thresholds:
+  TIER_1:
+    min_score: 3.5
+    label: "Tier 1 — High"
+    description: "High-risk vendor with access to sensitive data, payment flows, or critical operational infrastructure."
+  TIER_2:
+    min_score: 2.0
+    label: "Tier 2 — Medium"
+    description: "Medium-risk vendor with moderate exposure, operational impact, or limited regulated data access."
+  TIER_3:
+    min_score: 0.0
+    label: "Tier 3 — Low"
+    description: "Low-risk vendor with minimal exposure, non-critical operations, or public/non-sensitive data."
+
+# Assessment depth mapping by criticality tier
+assessment_depth_mapping:
+  TIER_1:
+    depth: "COMPREHENSIVE"
+    description: "Comprehensive assessment covering extensive OSINT sources, dark web monitoring, supply chain, and regulatory filings."
+  TIER_2:
+    depth: "TARGETED"
+    description: "Targeted assessment focusing on key exposure vectors, core domains, and primary compliance certifications."
+  TIER_3:
+    depth: "LIGHTWEIGHT"
+    description: "Lightweight baseline assessment verifying basic domain security posture and standard hygiene."
+
+# Explainable reasoning templates for elevated criteria
+reasoning_rules:
+  threshold_score_for_mention: 2.5
+  descriptions:
+    data_sensitivity: "Accesses sensitive financial, PII, or security-critical data"
+    payment_flows: "Directly involved in payment processing, routing, or monetary transactions"
+    regulatory_exposure: "Significant regulatory compliance exposure (SEC, FINRA, GDPR, NYDFS, PCI-DSS)"
+    operational_dependency: "Critical operational dependency on critical business paths"
+    customer_data_volume: "Processes large volume or high scale of customer identity records"

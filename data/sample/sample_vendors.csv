@@ -1,0 +1,5 @@
+vendor_id,vendor_name,domain,data_sensitivity,payment_flows,regulatory_exposure,operational_dependency,customer_data_volume
+V001,Example Corp,example.com,high,medium,high,high,high
+V002,Example Ltd,example.org,low,none,low,medium,low
+V003,FinSecure Gateway,finsecure.com,critical,critical,critical,critical,critical
+V004,DevTools Cloud,devtools.io,low,none,none,low,none

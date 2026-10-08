@@ -1,0 +1,11 @@
+vendor_id,vendor_name,domain,data_sensitivity,payment_involvement,regulatory_exposure,operational_dependency,customer_data_volume
+V001,Apex Core Banking Cloud,apexbanking.com,critical,critical,high,critical,high
+V002,PayStream Global,paystream.io,high,critical,high,high,high
+V003,VaultSec Identity Services,vaultsec.net,critical,low,high,high,medium
+V004,InsightHR Portal,insighthr.com,medium,none,medium,medium,medium
+V005,LexiCompliance RegTech,lexicompliance.io,high,none,high,low,low
+V006,AgileSprint Jira Hosting,agilesprint.org,low,none,low,medium,low
+V007,OfficeCoffee Supplies,officebrew.co,none,none,none,none,none
+V008,GlobalMarket Data Feeds,globalmktdata.com,medium,low,medium,high,low
+V009,CustomerDesk CRM,customerdesk.io,high,medium,medium,medium,high
+V010,FacilityClean Services,facilityclean.local,none,none,none,low,none

@@ -1,0 +1,149 @@
+# Meridian OSINT Assessment Depth Profiles
+# Governs investigation scope, review requirements, timeboxes, and stopping conditions.
+
+profiles:
+  Critical:
+    name: "Critical"
+    tier_label: "Critical / Tier 1"
+    description: "Deep, exhaustive OSINT investigation across all source classes with secondary validation."
+    required_sources:
+      - "S1"
+      - "S2"
+      - "S3"
+      - "S4"
+      - "S5"
+      - "S6"
+      - "S7"
+      - "S8"
+      - "S9"
+      - "S10"
+      - "S11"
+      - "S12"
+    source_coverage_notes:
+      - "Full S1-S12 source class coverage"
+      - "Historical job postings analysis"
+      - "Historical page versions & archive inspection"
+      - "Executive and investor-relations material review"
+      - "Statutory and regulatory filings check"
+      - "Marketplace and partner listings inspection"
+      - "Passive technical fingerprinting"
+    review_requirements:
+      analyst_validation: true
+      second_reviewer: true
+      description: "Primary analyst validation plus independent second reviewer sign-off."
+    timebox:
+      planning_target: "6–8 hours"
+      min_hours: 6.0
+      max_hours: 8.0
+      is_provisional: true
+    stopping_condition:
+      rule_id: "STOP_CRITICAL_GATES"
+      description: "Stop when G1–G4 gates have been answered with qualifying evidence or relevant negative findings have been logged."
+      requirements:
+        - "All four G1-G4 gates must be resolved with qualifying positive evidence OR qualifying negative evidence logged."
+        - "Unresolved gates prevent completion."
+
+  High:
+    name: "High"
+    tier_label: "High / Tier 2"
+    description: "Thorough multi-source investigation focusing on primary disclosures, documentation, and hiring signals."
+    required_sources:
+      - "S1"
+      - "S2"
+      - "S3"
+      - "S5"
+      - "S6"
+      - "S7"
+      - "S8"
+    conditional_sources:
+      - source_id: "S4"
+        condition: "Where public technical information/blogs are available"
+    corroborative_sources:
+      - "S9"
+      - "S10"
+      - "S11"
+      - "S12"
+    source_coverage_notes:
+      - "Mandatory: S1, S2, S3, S5, S6, S7, S8"
+      - "S4 included where public technical blogs exist"
+      - "S9-S12 utilized for corroborating identified signals"
+    review_requirements:
+      analyst_validation: true
+      second_reviewer: false
+      description: "Primary analyst validation required."
+    timebox:
+      planning_target: "3–4 hours"
+      min_hours: 3.0
+      max_hours: 4.0
+      is_provisional: true
+    stopping_condition:
+      rule_id: "STOP_HIGH_NOVELTY"
+      description: "Stop after two consecutive completed source classes add no new information (evidence-level novelty)."
+      requirements:
+        - "Track evidence-level novelty (new AI provider, new product feature, new training disclosure, or resolved gate)."
+        - "Two consecutive non-novel source classes trigger stopping condition."
+
+  Medium:
+    name: "Medium"
+    tier_label: "Medium / Tier 3"
+    description: "Targeted investigation covering trust centers, product docs, privacy terms, and hiring."
+    required_sources:
+      - "S1"
+      - "S2"
+      - "S3"
+      - "S6"
+    conditional_sources:
+      - source_id: "S12"
+        condition: "Automated keyword scan"
+    corroborative_sources: []
+    source_coverage_notes:
+      - "Mandatory: S1, S2, S3, S6"
+      - "S12 marketing keyword scan"
+      - "Analyst spot-check"
+    review_requirements:
+      analyst_validation: false
+      analyst_spot_check: true
+      second_reviewer: false
+      description: "Analyst spot-check of key findings."
+    timebox:
+      planning_target: "1–2 hours"
+      min_hours: 1.0
+      max_hours: 2.0
+      is_provisional: true
+    stopping_condition:
+      rule_id: "STOP_MEDIUM_CONFIRMED"
+      description: "Stop after obtaining one CONFIRMED signal or exhausting the applicable source classes."
+      requirements:
+        - "One confirmed AI signal triggers stop condition."
+        - "Otherwise, stop upon exhausting all 4 planned source classes."
+        - "Outstanding gates are logged as unresolved."
+
+  Low:
+    name: "Low"
+    tier_label: "Low / Tier 4"
+    description: "Lightweight automated pass across baseline disclosures and terms."
+    required_sources:
+      - "S1"
+      - "S3"
+      - "S12"
+    conditional_sources: []
+    corroborative_sources: []
+    source_coverage_notes:
+      - "Mandatory: S1, S3, S12"
+      - "Automated keyword scan"
+      - "Reassess annually or upon relevant contract/service trigger"
+    review_requirements:
+      analyst_validation: false
+      second_reviewer: false
+      description: "Automated keyword pass; exception-based review only."
+    timebox:
+      planning_target: "Under 30 minutes"
+      min_hours: 0.25
+      max_hours: 0.5
+      is_provisional: true
+    stopping_condition:
+      rule_id: "STOP_LOW_PASS"
+      description: "Complete the configured lightweight source pass (S1, S3, S12)."
+      requirements:
+        - "Complete lightweight keyword scans on S1, S3, S12."
+        - "Log annual/trigger reassessment schedule."

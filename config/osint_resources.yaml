@@ -1,0 +1,323 @@
+# Discovery Resource Inventory & Catalog
+# Maps external research tools to official S1-S12 source classes
+
+resources:
+  # Search and discovery
+  google_search:
+    id: "google_search"
+    name: "Google Search Operators"
+    category: "Search and discovery"
+    associated_sources: ["S1", "S2", "S3", "S4", "S8", "S11", "S12"]
+    purpose: "Targeted dorking for trust centers, subprocessor pages, terms, and technical documentation."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Rate limits and CAPTCHA enforcement on automated scrapers."
+
+  google_advanced_search:
+    id: "google_advanced_search"
+    name: "Google Advanced Search"
+    category: "Search and discovery"
+    associated_sources: ["S1", "S3", "S5"]
+    purpose: "Filetype and date-constrained document discovery (DPAs, PDFs, formal policies)."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Manual analyst interface; query length limits."
+
+  bing_search:
+    id: "bing_search"
+    name: "Bing Web Search API / Search"
+    category: "Search and discovery"
+    associated_sources: ["S1", "S2", "S11", "S12"]
+    purpose: "Secondary search provider for corroborating indexed technical assets."
+    access_mode: "API_BASED"
+    limitations: "Requires cognitive services API key quota."
+
+  duckduckgo:
+    id: "duckduckgo"
+    name: "DuckDuckGo"
+    category: "Search and discovery"
+    associated_sources: ["S11", "S12"]
+    purpose: "Unbiased, non-personalized search indexing for marketing and press releases."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Less comprehensive operator syntax compared to Google."
+
+  osint_framework:
+    id: "osint_framework"
+    name: "OSINT Framework"
+    category: "Search and discovery"
+    associated_sources: ["S9"]
+    purpose: "Taxonomy of passive entity discovery tools."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Directory of tools rather than automated data source."
+
+  bellingcat_toolkit:
+    id: "bellingcat_toolkit"
+    name: "Bellingcat Online Investigation Toolkit"
+    category: "Search and discovery"
+    associated_sources: ["S9", "S11"]
+    purpose: "Methodological toolkit for open-source corroboration."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Manual investigative procedures."
+
+  # Code and technical evidence
+  github:
+    id: "github"
+    name: "GitHub"
+    category: "Code and technical evidence"
+    associated_sources: ["S2", "S4", "S9"]
+    purpose: "Public repositories, open-source SDKs, samples, and architectural guides."
+    access_mode: "API_BASED"
+    limitations: "Public repositories only; rate limits on unauthenticated API calls."
+
+  gitlab:
+    id: "gitlab"
+    name: "GitLab"
+    category: "Code and technical evidence"
+    associated_sources: ["S2", "S4", "S9"]
+    purpose: "Secondary open-source repository search for vendor technical assets."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Requires authenticated tokens for deep code indexing."
+
+  github_code_search:
+    id: "github_code_search"
+    name: "GitHub Code Search"
+    category: "Code and technical evidence"
+    associated_sources: ["S9"]
+    purpose: "Regex and symbol searches for AI SDK imports (openai, anthropic, bedrock, langchain)."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Requires GitHub user login for deep regex code search."
+
+  npm:
+    id: "npm"
+    name: "npm Registry"
+    category: "Code and technical evidence"
+    associated_sources: ["S9"]
+    purpose: "Public JavaScript/TypeScript SDKs published under vendor entity scope."
+    access_mode: "AUTOMATED"
+    limitations: "Only covers client/node packages; internal logic usually minified."
+
+  pypi:
+    id: "pypi"
+    name: "PyPI"
+    category: "Code and technical evidence"
+    associated_sources: ["S9"]
+    purpose: "Public Python AI client packages and integration connectors."
+    access_mode: "AUTOMATED"
+    limitations: "Only covers public distributions."
+
+  maven_central:
+    id: "maven_central"
+    name: "Maven Central"
+    category: "Code and technical evidence"
+    associated_sources: ["S9"]
+    purpose: "Java/JVM client packages for enterprise financial systems."
+    access_mode: "AUTOMATED"
+    limitations: "Covers public releases only."
+
+  docker_hub:
+    id: "docker_hub"
+    name: "Docker Hub"
+    category: "Code and technical evidence"
+    associated_sources: ["S9"]
+    purpose: "Container image manifests indicating AI inference frameworks or CUDA runtimes."
+    access_mode: "AUTOMATED"
+    limitations: "Many enterprise vendors publish to private registries."
+
+  hugging_face:
+    id: "hugging_face"
+    name: "Hugging Face"
+    category: "Code and technical evidence"
+    associated_sources: ["S4", "S9"]
+    purpose: "Published model cards, fine-tuned checkpoints, and dataset repositories."
+    access_mode: "AUTOMATED"
+    limitations: "Vendor organization must be officially registered and public."
+
+  # People, hiring and discussion
+  linkedin:
+    id: "linkedin"
+    name: "LinkedIn"
+    category: "People, hiring and discussion"
+    associated_sources: ["S6", "S7"]
+    purpose: "Executive background, leadership statements, and engineering team skill profiles."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Strict anti-scraping controls and login walls."
+
+  linkedin_jobs:
+    id: "linkedin_jobs"
+    name: "LinkedIn Jobs"
+    category: "People, hiring and discussion"
+    associated_sources: ["S6"]
+    purpose: "Technical job postings for Machine Learning Engineers, LLM Specialists, and MLOps."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Postings expire quickly; anti-bot protections."
+
+  indeed:
+    id: "indeed"
+    name: "Indeed"
+    category: "People, hiring and discussion"
+    associated_sources: ["S6"]
+    purpose: "Job requisitions specifying production AI/ML framework experience."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Commercial scraping restrictions."
+
+  greenhouse:
+    id: "greenhouse"
+    name: "Greenhouse"
+    category: "People, hiring and discussion"
+    associated_sources: ["S6"]
+    purpose: "Direct vendor applicant tracking job descriptions with engineering stack details."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Vendor-specific board URLs."
+
+  lever:
+    id: "lever"
+    name: "Lever"
+    category: "People, hiring and discussion"
+    associated_sources: ["S6"]
+    purpose: "Direct vendor ATS listings detailing technical responsibilities and AI tooling."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Vendor-specific board URLs."
+
+  reddit:
+    id: "reddit"
+    name: "Reddit"
+    category: "People, hiring and discussion"
+    associated_sources: ["S4", "S11"]
+    purpose: "Technical practitioner discussions, customer issues, and architecture comments."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Unverified anonymous commentary (Evidence Grade C)."
+
+  stack_overflow:
+    id: "stack_overflow"
+    name: "Stack Overflow"
+    category: "People, hiring and discussion"
+    associated_sources: ["S4", "S11"]
+    purpose: "Developer troubleshooting queries mentioning vendor APIs with AI libraries."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Fragmented community questions."
+
+  youtube:
+    id: "youtube"
+    name: "YouTube"
+    category: "People, hiring and discussion"
+    associated_sources: ["S4", "S7"]
+    purpose: "Conference recordings, tech talks, product demos, and executive keynote speeches."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Requires transcription or manual listening."
+
+  # News, filings and research
+  google_news:
+    id: "google_news"
+    name: "Google News"
+    category: "News, filings and research"
+    associated_sources: ["S5", "S7", "S11"]
+    purpose: "Recent press releases, investigative tech journalism, and partner announcements."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Heavy PR syndication requires deduplication."
+
+  sec_edgar:
+    id: "sec_edgar"
+    name: "SEC EDGAR"
+    category: "News, filings and research"
+    associated_sources: ["S5"]
+    purpose: "Mandatory corporate disclosures (10-K, 10-Q, 8-K) regarding AI strategies and risks."
+    access_mode: "API_BASED"
+    limitations: "Only covers US publicly traded firms."
+
+  companies_house:
+    id: "companies_house"
+    name: "UK Companies House"
+    category: "News, filings and research"
+    associated_sources: ["S5"]
+    purpose: "Official corporate filings and strategic director reports for UK entities."
+    access_mode: "API_BASED"
+    limitations: "UK registered entities only."
+
+  mca_india:
+    id: "mca_india"
+    name: "India MCA Company Search"
+    category: "News, filings and research"
+    associated_sources: ["S5"]
+    purpose: "Corporate statutory filings for Indian entities and offshore development centers."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Requires portal access."
+
+  google_patents:
+    id: "google_patents"
+    name: "Google Patents"
+    category: "News, filings and research"
+    associated_sources: ["S10"]
+    purpose: "Patent applications and granted IP for machine learning techniques."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Patents indicate capability, not production deployment."
+
+  google_scholar:
+    id: "google_scholar"
+    name: "Google Scholar"
+    category: "News, filings and research"
+    associated_sources: ["S10"]
+    purpose: "Peer-reviewed papers by vendor research scientists."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Academic research may not reflect commercial product offerings."
+
+  arxiv:
+    id: "arxiv"
+    name: "arXiv"
+    category: "News, filings and research"
+    associated_sources: ["S10"]
+    purpose: "Pre-print machine learning papers authored by vendor staff."
+    access_mode: "AUTOMATED"
+    limitations: "Pre-prints are not peer-reviewed."
+
+  crunchbase:
+    id: "crunchbase"
+    name: "Crunchbase"
+    category: "News, filings and research"
+    associated_sources: ["S7", "S8"]
+    purpose: "Funding announcements, acquisitions, technology stack tags, and leadership changes."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Paywalled for advanced query filters."
+
+  # Archiving and evidence preservation
+  wayback_machine:
+    id: "wayback_machine"
+    name: "Wayback Machine"
+    category: "Archiving and evidence preservation"
+    associated_sources: ["S1", "S3", "S12"]
+    purpose: "Historical page versions to detect policy changes, added AI terms, or deleted clauses."
+    access_mode: "API_BASED"
+    limitations: "Snapshots may be incomplete or intermittent."
+
+  archive_today:
+    id: "archive_today"
+    name: "archive.today"
+    category: "Archiving and evidence preservation"
+    associated_sources: ["S1", "S3", "S11"]
+    purpose: "Secondary on-demand web snapshot service bypassing paywalls."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Requires manual submission."
+
+  perma_cc:
+    id: "perma_cc"
+    name: "Perma.cc"
+    category: "Archiving and evidence preservation"
+    associated_sources: ["S1", "S3"]
+    purpose: "Cryptographically verified, immutable evidentiary link archiving."
+    access_mode: "UNIMPLEMENTED"
+    limitations: "Subscription account required."
+
+  hunchly:
+    id: "hunchly"
+    name: "Hunchly"
+    category: "Archiving and evidence preservation"
+    associated_sources: ["S1", "S2", "S3"]
+    purpose: "Analyst browser extension for automatic evidentiary case logging."
+    access_mode: "UNIMPLEMENTED"
+    limitations: "Desktop client application."
+
+  singlefile:
+    id: "singlefile"
+    name: "SingleFile"
+    category: "Archiving and evidence preservation"
+    associated_sources: ["S1", "S2", "S3", "S6"]
+    purpose: "Full-page standalone HTML/CSS snapshot utility for audit files."
+    access_mode: "MANUALLY_ASSISTED"
+    limitations: "Analyst-triggered local capture."

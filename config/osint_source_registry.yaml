@@ -1,0 +1,268 @@
+# Official S1-S12 Source Registry Configuration
+# Meridian Financial Third-Party AI Risk Assessment
+
+sources:
+  S1:
+    source_id: "S1"
+    name: "Trust centers and contractual disclosures"
+    description: "Trust centers, subprocessor registers, Data Processing Agreements (DPAs), and AI policies/addenda."
+    default_evidence_grade: "A"
+    reliability_rating: 5
+    is_corroborative: false
+    evidence_targets:
+      - "Named AI and model providers"
+      - "Customer data usage rights and restrictions"
+      - "Retention and deletion policies for prompts/embeddings"
+      - "Third-party and subprocessor processing disclosures"
+      - "Hosting regions and data transfer safeguards"
+    discovery_resources:
+      - "vendor_trust_center"
+      - "vendor_dpa"
+      - "subprocessor_register"
+      - "google_search"
+    query_template_ids:
+      - "q_subprocessors"
+      - "q_dpa"
+      - "q_not_used_to_train"
+      - "q_site_subprocessors"
+      - "q_site_privacy_ai"
+      - "q_site_training_data"
+
+  S2:
+    source_id: "S2"
+    name: "Product and technical documentation"
+    description: "Product documentation, API references, admin guides, release notes, SDKs, and public repos."
+    default_evidence_grade: "A"
+    reliability_rating: 5
+    is_corroborative: false
+    evidence_targets:
+      - "Direct AI feature specifications"
+      - "Underlying model family and API endpoint references"
+      - "Input payload formats and generated output types"
+      - "Admin opt-in/opt-out configuration toggles"
+      - "Product-specific AI pipeline implementations"
+    discovery_resources:
+      - "developer_portal"
+      - "api_reference"
+      - "github"
+      - "google_search"
+    query_template_ids:
+      - "q_general_ai"
+      - "q_general_llm"
+      - "q_site_ai"
+      - "q_site_llm"
+      - "q_site_embeddings"
+      - "q_site_rag"
+
+  S3:
+    source_id: "S3"
+    name: "Terms, privacy and security documents"
+    description: "Terms of service, privacy statements, master subscription agreements, and security whitepapers."
+    default_evidence_grade: "A/B"
+    reliability_rating: 4
+    is_corroborative: false
+    evidence_targets:
+      - "Customer data training and fine-tuning rights"
+      - "Prompt and output ownership terms"
+      - "Data retention windows for telemetry/inference"
+      - "Contractual security commitments"
+    discovery_resources:
+      - "terms_portal"
+      - "privacy_portal"
+      - "google_search"
+      - "wayback_machine"
+    query_template_ids:
+      - "q_not_used_to_train"
+      - "q_site_privacy_ai"
+      - "q_site_training_data"
+
+  S4:
+    source_id: "S4"
+    name: "Engineering and technical publications"
+    description: "Engineering blogs, technical conference talks, open-source architectures, and model cards."
+    default_evidence_grade: "A/B"
+    reliability_rating: 4
+    is_corroborative: false
+    evidence_targets:
+      - "Technical architecture and AI tech stack"
+      - "Model frameworks (PyTorch, TensorFlow, vLLM)"
+      - "RAG pipeline implementation and vector databases"
+      - "Embedding generation and token lifecycle"
+    discovery_resources:
+      - "engineering_blog"
+      - "youtube_tech_talks"
+      - "hugging_face"
+      - "google_search"
+    query_template_ids:
+      - "q_fine_tuning"
+      - "q_embeddings"
+      - "q_rag"
+      - "q_gh_langchain"
+      - "q_reddit_ai"
+
+  S5:
+    source_id: "S5"
+    name: "Filings and formal disclosures"
+    description: "SEC annual/quarterly reports (10-K, 10-Q), statutory regulatory filings, certifications (SOC 2, ISO 42001)."
+    default_evidence_grade: "B"
+    reliability_rating: 4
+    is_corroborative: false
+    evidence_targets:
+      - "Publicly disclosed material AI investment and deployment"
+      - "AI governance and risk management disclosures"
+      - "Material third-party AI provider dependencies"
+    discovery_resources:
+      - "sec_edgar"
+      - "companies_house"
+      - "mca_india"
+      - "google_news"
+    query_template_ids:
+      - "q_general_ai"
+      - "q_general_llm"
+      - "q_general_genai"
+
+  S6:
+    source_id: "S6"
+    name: "Technical hiring signals"
+    description: "Technical job postings, careers portals, LinkedIn Jobs, Greenhouse, Lever, and Indeed postings."
+    default_evidence_grade: "B"
+    reliability_rating: 3
+    is_corroborative: false
+    evidence_targets:
+      - "Production AI/ML and LLM engineering roles"
+      - "Model provider SDK experience requirements (OpenAI, Anthropic, Bedrock)"
+      - "Vector DB and RAG pipeline engineering responsibilities"
+      - "Product-specific AI development timelines"
+    discovery_resources:
+      - "linkedin_jobs"
+      - "indeed"
+      - "greenhouse"
+      - "lever"
+    query_template_ids:
+      - "q_jobs_mle"
+      - "q_jobs_llm"
+      - "q_jobs_prompt_eng"
+      - "q_jobs_pytorch"
+      - "q_jobs_mlops"
+
+  S7:
+    source_id: "S7"
+    name: "Executive and investor-relations sources"
+    description: "Earnings call transcripts, investor presentations, executive interviews, and official press briefings."
+    default_evidence_grade: "B"
+    reliability_rating: 3
+    is_corroborative: false
+    evidence_targets:
+      - "Executive-level claims of AI deployment scale"
+      - "Named workflow and product-line AI implementations"
+      - "Strategic enterprise partnerships with AI hyperscalers"
+    discovery_resources:
+      - "crunchbase"
+      - "google_news"
+      - "youtube"
+    query_template_ids:
+      - "q_general_genai"
+      - "q_openai"
+      - "q_anthropic"
+      - "q_bedrock"
+
+  S8:
+    source_id: "S8"
+    name: "Marketplace and partner listings"
+    description: "AWS/Azure/GCP cloud marketplaces, technology partner networks, and integration catalogs."
+    default_evidence_grade: "B/C"
+    reliability_rating: 3
+    is_corroborative: false
+    evidence_targets:
+      - "Third-party AI ecosystem integrations"
+      - "Hyperscaler marketplace offerings"
+      - "Partner announcements with implementation detail"
+    discovery_resources:
+      - "cloud_marketplaces"
+      - "google_search"
+    query_template_ids:
+      - "q_bedrock"
+      - "q_vertex"
+      - "q_azure_openai"
+
+  S9:
+    source_id: "S9"
+    name: "Passive technical fingerprints"
+    description: "Publicly observable technical hints, package manifests, DNS, subdomains, and frontend bundles."
+    default_evidence_grade: "C"
+    reliability_rating: 2
+    is_corroborative: true
+    evidence_targets:
+      - "Public client-side AI SDK bundle inclusions"
+      - "Public AI API endpoint DNS / CNAME references"
+      - "Public repository package dependencies"
+    discovery_resources:
+      - "github_code_search"
+      - "npm"
+      - "pypi"
+      - "docker_hub"
+    query_template_ids:
+      - "q_gh_openai"
+      - "q_gh_anthropic"
+      - "q_gh_bedrock"
+
+  S10:
+    source_id: "S10"
+    name: "Patents and research papers"
+    description: "Google Patents, Google Scholar, arXiv, and institutional research publications."
+    default_evidence_grade: "C"
+    reliability_rating: 2
+    is_corroborative: true
+    evidence_targets:
+      - "Patented AI algorithmic architectures"
+      - "Author affiliations indicating vendor R&D capabilities"
+      - "Exploratory AI research (distinguished from production)"
+    discovery_resources:
+      - "google_patents"
+      - "google_scholar"
+      - "arxiv"
+    query_template_ids:
+      - "q_general_ai"
+      - "q_fine_tuning"
+      - "q_embeddings"
+
+  S11:
+    source_id: "S11"
+    name: "Third-party reporting"
+    description: "Industry news reporting, technical journalism, and independent security research analysis."
+    default_evidence_grade: "C"
+    reliability_rating: 2
+    is_corroborative: true
+    evidence_targets:
+      - "Investigative reporting on vendor AI integrations"
+      - "Corroboration of primary-source findings"
+      - "Customer case studies published by AI providers"
+    discovery_resources:
+      - "google_news"
+      - "reddit"
+      - "stack_overflow"
+    query_template_ids:
+      - "q_general_ai"
+      - "q_openai"
+      - "q_anthropic"
+      - "q_reddit_ai"
+
+  S12:
+    source_id: "S12"
+    name: "Marketing and press material"
+    description: "Marketing landing pages, high-level product announcement press releases, and promotional blogs."
+    default_evidence_grade: "D"
+    reliability_rating: 1
+    is_corroborative: false
+    evidence_targets:
+      - "Top-level claims of AI features and capabilities"
+      - "Product marketing names that guide targeted technical search"
+      - "Hyperscaler partnership press statements"
+    discovery_resources:
+      - "google_search"
+      - "duckduckgo"
+      - "wayback_machine"
+    query_template_ids:
+      - "q_general_ai"
+      - "q_general_genai"
+      - "q_site_ai"

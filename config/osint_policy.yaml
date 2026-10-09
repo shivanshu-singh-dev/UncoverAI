@@ -1,0 +1,41 @@
+# Meridian OSINT Policy & Conflict Settings
+# Governs fixed vs vendor-specific source rules and methodology alignment.
+
+source_classification:
+  fixed_mandatory:
+    description: "Team policy designation: Sources considered fixed/mandatory across all vendor investigations."
+    sources:
+      - id: "github_gitlab"
+        name: "GitHub / GitLab"
+        maps_to_classes: ["S2", "S4", "S9"]
+      - id: "job_boards"
+        name: "Job boards (LinkedIn Jobs, Indeed, Greenhouse, Lever)"
+        maps_to_classes: ["S6"]
+      - id: "developer_forums"
+        name: "Developer forums (Reddit, Stack Overflow)"
+        maps_to_classes: ["S4", "S11"]
+      - id: "news_tech_outlets"
+        name: "News and technology outlets (Google News, Tech journalism)"
+        maps_to_classes: ["S5", "S7", "S11"]
+
+  dynamic_vendor_specific:
+    description: "Team policy designation: Sources that depend on specific vendor assets."
+    sources:
+      - id: "developer_docs"
+        name: "Developer documentation & API portals"
+        maps_to_classes: ["S2"]
+      - id: "subprocessor_trust"
+        name: "Subprocessor lists & trust centers"
+        maps_to_classes: ["S1"]
+      - id: "privacy_terms"
+        name: "Privacy policies & terms of service"
+        maps_to_classes: ["S3"]
+      - id: "engineering_blogs"
+        name: "Engineering blogs & architecture whitepapers"
+        maps_to_classes: ["S4"]
+
+policy_enforcement:
+  # When true, the planner flags conflicts between team fixed-source policy and depth-specific profiles
+  surface_conflicts: true
+  conflict_resolution_mode: "RULEBOOK_AUTHORITATIVE" # Preserves rulebook depth profile as the authority
+  enforce_fixed_on_all_profiles: false # Do not silently inflate Low/Medium profile timeboxes without review

@@ -1,0 +1,331 @@
+# Meridian OSINT Query Templates Library
+# Placeholders: {VENDOR}, {DOMAIN}, {PRODUCT}, {PROVIDER}, {DATE_RANGE}
+
+templates:
+  # General vendor queries
+  q_general_ai:
+    id: "q_general_ai"
+    category: "General vendor queries"
+    template: '"{VENDOR}" AI'
+    source_class: "S12"
+    discovery_resource: "google_search"
+    investigative_objective: "Detect high-level artificial intelligence mentions and marketing claims."
+    expected_evidence_targets: ["High-level AI claims", "Product marketing feature names"]
+
+  q_general_ml:
+    id: "q_general_ml"
+    category: "General vendor queries"
+    template: '"{VENDOR}" "machine learning"'
+    source_class: "S12"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify machine learning applications and data science initiatives."
+    expected_evidence_targets: ["Machine learning product features", "Data science initiatives"]
+
+  q_general_llm:
+    id: "q_general_llm"
+    category: "General vendor queries"
+    template: '"{VENDOR}" LLM'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Discover large language model implementations and product capabilities."
+    expected_evidence_targets: ["LLM integration", "Conversational AI capabilities"]
+
+  q_general_genai:
+    id: "q_general_genai"
+    category: "General vendor queries"
+    template: '"{VENDOR}" "generative AI"'
+    source_class: "S7"
+    discovery_resource: "google_search"
+    investigative_objective: "Discover generative AI product announcements and leadership claims."
+    expected_evidence_targets: ["Generative AI deployments", "Executive strategy"]
+
+  q_openai:
+    id: "q_openai"
+    category: "General vendor queries"
+    template: '"{VENDOR}" OpenAI'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Detect integration with OpenAI models (GPT-4, embeddings)."
+    expected_evidence_targets: ["OpenAI model usage", "API dependency"]
+
+  q_anthropic:
+    id: "q_anthropic"
+    category: "General vendor queries"
+    template: '"{VENDOR}" Anthropic'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Detect integration with Anthropic Claude models."
+    expected_evidence_targets: ["Claude model integration", "Anthropic partnership"]
+
+  q_claude:
+    id: "q_claude"
+    category: "General vendor queries"
+    template: '"{VENDOR}" Claude'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Detect specific mentions of Claude models in product capabilities."
+    expected_evidence_targets: ["Claude model mentions"]
+
+  q_bedrock:
+    id: "q_bedrock"
+    category: "General vendor queries"
+    template: '"{VENDOR}" "AWS Bedrock"'
+    source_class: "S8"
+    discovery_resource: "google_search"
+    investigative_objective: "Detect Amazon Bedrock model orchestration or marketplace integrations."
+    expected_evidence_targets: ["AWS Bedrock hosting", "Cloud deployment"]
+
+  q_vertex:
+    id: "q_vertex"
+    category: "General vendor queries"
+    template: '"{VENDOR}" "Vertex AI"'
+    source_class: "S8"
+    discovery_resource: "google_search"
+    investigative_objective: "Detect Google Cloud Vertex AI deployment."
+    expected_evidence_targets: ["Google Vertex AI model usage"]
+
+  q_azure_openai:
+    id: "q_azure_openai"
+    category: "General vendor queries"
+    template: '"{VENDOR}" "Azure OpenAI"'
+    source_class: "S8"
+    discovery_resource: "google_search"
+    investigative_objective: "Detect enterprise Azure OpenAI service hosting."
+    expected_evidence_targets: ["Azure OpenAI enterprise hosting", "Data boundaries"]
+
+  q_subprocessors:
+    id: "q_subprocessors"
+    category: "General vendor queries"
+    template: '"{VENDOR}" subprocessors'
+    source_class: "S1"
+    discovery_resource: "google_search"
+    investigative_objective: "Locate formal subprocessor registers listing AI hyperscalers."
+    expected_evidence_targets: ["Third-party subprocessor lists", "Hosting locations"]
+
+  q_dpa:
+    id: "q_dpa"
+    category: "General vendor queries"
+    template: '"{VENDOR}" "data processing addendum"'
+    source_class: "S1"
+    discovery_resource: "google_search"
+    investigative_objective: "Locate Data Processing Addenda with AI customer data commitments."
+    expected_evidence_targets: ["DPA terms", "Data ownership"]
+
+  q_not_used_to_train:
+    id: "q_not_used_to_train"
+    category: "General vendor queries"
+    template: '"{VENDOR}" "not used to train"'
+    source_class: "S3"
+    discovery_resource: "google_search"
+    investigative_objective: "Determine whether customer data is excluded from model fine-tuning/training."
+    expected_evidence_targets: ["Training data exclusion clauses", "Fine-tuning policies"]
+
+  q_fine_tuning:
+    id: "q_fine_tuning"
+    category: "General vendor queries"
+    template: '"{VENDOR}" fine-tuning'
+    source_class: "S4"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify fine-tuning methodologies or customer model customization."
+    expected_evidence_targets: ["Model customization", "Proprietary adapters"]
+
+  q_embeddings:
+    id: "q_embeddings"
+    category: "General vendor queries"
+    template: '"{VENDOR}" embeddings'
+    source_class: "S4"
+    discovery_resource: "google_search"
+    investigative_objective: "Locate vector embeddings generation and storage details."
+    expected_evidence_targets: ["Vector embeddings", "Search index storage"]
+
+  q_rag:
+    id: "q_rag"
+    category: "General vendor queries"
+    template: '"{VENDOR}" RAG'
+    source_class: "S4"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify Retrieval-Augmented Generation architectural patterns."
+    expected_evidence_targets: ["RAG architecture", "Context retrieval mechanisms"]
+
+  # Domain-restricted queries
+  q_site_ai:
+    id: "q_site_ai"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} AI'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Locate direct official website product references to AI."
+    expected_evidence_targets: ["Official website AI references", "Documentation"]
+
+  q_site_llm:
+    id: "q_site_llm"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} LLM'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Locate official documentation on LLM features."
+    expected_evidence_targets: ["Official LLM features"]
+
+  q_site_openai:
+    id: "q_site_openai"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} OpenAI'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify direct OpenAI integrations on official domain."
+    expected_evidence_targets: ["OpenAI API usage", "Model disclosures"]
+
+  q_site_anthropic:
+    id: "q_site_anthropic"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} Anthropic'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify direct Anthropic integrations on official domain."
+    expected_evidence_targets: ["Anthropic API disclosures"]
+
+  q_site_bedrock:
+    id: "q_site_bedrock"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} Bedrock'
+    source_class: "S8"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify AWS Bedrock mentions on official vendor domain."
+    expected_evidence_targets: ["AWS Bedrock integration"]
+
+  q_site_subprocessors:
+    id: "q_site_subprocessors"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} subprocessors'
+    source_class: "S1"
+    discovery_resource: "google_search"
+    investigative_objective: "Locate official subprocessor directory on vendor domain."
+    expected_evidence_targets: ["Official subprocessor listings"]
+
+  q_site_privacy_ai:
+    id: "q_site_privacy_ai"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} "AI" privacy'
+    source_class: "S3"
+    discovery_resource: "google_search"
+    investigative_objective: "Locate vendor privacy policy sections explicitly addressing AI."
+    expected_evidence_targets: ["Privacy policy AI provisions"]
+
+  q_site_training_data:
+    id: "q_site_training_data"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} "training data"'
+    source_class: "S3"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify vendor terms specifying training data rights."
+    expected_evidence_targets: ["Customer data training rights"]
+
+  q_site_embeddings:
+    id: "q_site_embeddings"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} embeddings'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify documentation on vector embeddings."
+    expected_evidence_targets: ["Embedding architecture documentation"]
+
+  q_site_rag:
+    id: "q_site_rag"
+    category: "Domain-restricted queries"
+    template: 'site:{DOMAIN} "retrieval augmented"'
+    source_class: "S2"
+    discovery_resource: "google_search"
+    investigative_objective: "Identify RAG documentation on official domain."
+    expected_evidence_targets: ["Retrieval-augmented generation implementation"]
+
+  # Code and repository queries
+  q_gh_openai:
+    id: "q_gh_openai"
+    category: "Code and repository queries"
+    template: 'site:github.com "{VENDOR}" OpenAI'
+    source_class: "S9"
+    discovery_resource: "github"
+    investigative_objective: "Find open-source public repositories connecting vendor with OpenAI."
+    expected_evidence_targets: ["Public code integrations", "OpenAI client calls"]
+
+  q_gh_anthropic:
+    id: "q_gh_anthropic"
+    category: "Code and repository queries"
+    template: 'site:github.com "{VENDOR}" Anthropic'
+    source_class: "S9"
+    discovery_resource: "github"
+    investigative_objective: "Find open-source public repositories connecting vendor with Anthropic."
+    expected_evidence_targets: ["Public Anthropic integrations"]
+
+  q_gh_bedrock:
+    id: "q_gh_bedrock"
+    category: "Code and repository queries"
+    template: 'site:github.com "{VENDOR}" Bedrock'
+    source_class: "S9"
+    discovery_resource: "github"
+    investigative_objective: "Find open-source repositories connecting vendor with AWS Bedrock."
+    expected_evidence_targets: ["Public Bedrock integrations"]
+
+  q_gh_langchain:
+    id: "q_gh_langchain"
+    category: "Code and repository queries"
+    template: 'site:github.com "{VENDOR}" langchain'
+    source_class: "S4"
+    discovery_resource: "github"
+    investigative_objective: "Find repository use of LangChain, LlamaIndex, or agentic frameworks."
+    expected_evidence_targets: ["Framework dependencies (LangChain, LlamaIndex)"]
+
+  # Job and discussion queries
+  q_jobs_mle:
+    id: "q_jobs_mle"
+    category: "Job and discussion queries"
+    template: 'site:linkedin.com/jobs "{VENDOR}" "Machine Learning Engineer"'
+    source_class: "S6"
+    discovery_resource: "linkedin_jobs"
+    investigative_objective: "Detect engineering requisitions for ML engineers."
+    expected_evidence_targets: ["Engineering hiring requirements", "Skill stack"]
+
+  q_jobs_llm:
+    id: "q_jobs_llm"
+    category: "Job and discussion queries"
+    template: 'site:linkedin.com/jobs "{VENDOR}" "LLM"'
+    source_class: "S6"
+    discovery_resource: "linkedin_jobs"
+    investigative_objective: "Detect active recruitment for LLM specialists and infrastructure."
+    expected_evidence_targets: ["LLM engineer job requisitions"]
+
+  q_jobs_prompt_eng:
+    id: "q_jobs_prompt_eng"
+    category: "Job and discussion queries"
+    template: 'site:linkedin.com/jobs "{VENDOR}" "Prompt Engineering"'
+    source_class: "S6"
+    discovery_resource: "linkedin_jobs"
+    investigative_objective: "Detect prompt engineering roles."
+    expected_evidence_targets: ["Prompt engineering job requisitions"]
+
+  q_jobs_pytorch:
+    id: "q_jobs_pytorch"
+    category: "Job and discussion queries"
+    template: 'site:linkedin.com/jobs "{VENDOR}" "PyTorch"'
+    source_class: "S6"
+    discovery_resource: "linkedin_jobs"
+    investigative_objective: "Detect deep learning framework competencies (PyTorch, TensorFlow)."
+    expected_evidence_targets: ["Deep learning frameworks in production"]
+
+  q_jobs_mlops:
+    id: "q_jobs_mlops"
+    category: "Job and discussion queries"
+    template: 'site:linkedin.com/jobs "{VENDOR}" "MLOps"'
+    source_class: "S6"
+    discovery_resource: "linkedin_jobs"
+    investigative_objective: "Detect production ML deployment and monitoring tooling."
+    expected_evidence_targets: ["Production MLOps infrastructure"]
+
+  q_reddit_ai:
+    id: "q_reddit_ai"
+    category: "Job and discussion queries"
+    template: 'site:reddit.com "{VENDOR}" AI'
+    source_class: "S11"
+    discovery_resource: "reddit"
+    investigative_objective: "Identify developer discussions or customer feedback regarding vendor AI features."
+    expected_evidence_targets: ["Community feedback", "Third-party practitioner experiences"]

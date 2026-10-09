@@ -38,10 +38,28 @@ levels:
     label: "Critical outsourced / regulated function"
     concepts:
       - name: critical_regulated_function
-        aliases: ["critical regulated function", "critical outsourced function", "regulated outsourcing", "critical financial function", "systemically important", "critical payment infrastructure", "designated clearing organization", "financial market utility"]
-        rationale: "Performs a critical outsourced or regulated function."
+        aliases:
+          - "critical regulated function"
+          - "critical outsourced function"
+          - "regulated outsourcing"
+          - "critical financial function"
+          - "systemically important"
+          - "critical payment infrastructure"
+          - "designated clearing organization"
+          - "financial market utility"
+          - "clearing and settlement"
+          - "payment clearing and settlement"
+          - "ach and rtp clearing and settlement"
+        rationale: "Performs a critical outsourced or regulated function / clearing and settlement operation."
       - name: critical_network
-        aliases: ["critical financial network", "national payment network", "payment network operator", "designated financial market utility", "fmu", "dco"]
+        aliases:
+          - "critical financial network"
+          - "national payment network"
+          - "payment network operator"
+          - "payment network infrastructure"
+          - "designated financial market utility"
+          - "fmu"
+          - "dco"
         rationale: "Operates critical financial market infrastructure."
 
 # Important: generic terms alone are NOT sufficient for any level

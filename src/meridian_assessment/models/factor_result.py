@@ -1,4 +1,4 @@
-"""Factor result models with full provenance tracking."""
+"""Factor result models with full provenance tracking and human-governance overrides."""
 
 from enum import StrEnum
 from typing import Any, Optional
@@ -18,6 +18,13 @@ class ScoreStatus(StrEnum):
     PARTIAL = "PARTIAL"            # Some factors resolved, some UNKNOWN
     REQUIRES_REVIEW = "REQUIRES_REVIEW"  # Ambiguous — needs human review
     UNKNOWN = "UNKNOWN"            # Cannot score
+
+
+class CriticalityLevel(StrEnum):
+    CRITICAL = "Critical"
+    HIGH = "High"
+    MEDIUM = "Medium"
+    LOW = "Low"
 
 
 class SemanticMatchInfo(BaseModel):
@@ -101,15 +108,27 @@ class FactorResult(BaseModel):
 
 
 class OverrideRecord(BaseModel):
-    """Records whether an O1-O5 override was evaluated and triggered."""
+    """Records whether an O1-O4 override or O5 review was evaluated and triggered."""
     model_config = ConfigDict(frozen=True)
 
     override_id: str
     description: str
     condition_evaluated: str
     triggered: bool
-    resulting_tier: Optional[str] = None
+    resulting_floor: Optional[str] = None
+    evidence: Optional[str] = None
     rationale: str = ""
+
+
+class HumanReviewRecord(BaseModel):
+    """Records O5 user governance decision."""
+    model_config = ConfigDict(frozen=True)
+
+    user_decision: str = "KEEP_PROPOSED"  # KEEP_PROPOSED or CHANGE_CRITICALITY
+    original_criticality: str
+    final_criticality: str
+    rationale: str = ""
+    timestamp: Optional[str] = None
 
 
 class CriticalityResult(BaseModel):
@@ -130,14 +149,19 @@ class CriticalityResult(BaseModel):
     base_score: Optional[float] = None
     score_status: ScoreStatus = ScoreStatus.UNKNOWN
 
-    # Overrides (O1-O5)
+    # Criticality Classification Progression
+    provisional_criticality: Optional[str] = None  # From threshold table: Critical / High / Medium / Low
     overrides_evaluated: list[OverrideRecord] = Field(default_factory=list)
-    override_applied: bool = False
-    override_tier: Optional[str] = None
+    automatic_override_applied: bool = False
+    proposed_criticality: Optional[str] = None     # After O1-O4 safeguards
 
-    # Final classification
-    criticality_tier: Optional[str] = None   # TIER_1 / TIER_2 / TIER_3 or None
-    assessment_depth: Optional[str] = None    # COMPREHENSIVE / TARGETED / LIGHTWEIGHT
+    # O5 Governance Layer
+    human_review: Optional[HumanReviewRecord] = None
+    final_criticality: Optional[str] = None        # Final resulting criticality (Critical / High / Medium / Low)
+
+    # Downstream / Backwards-compat
+    criticality_tier: Optional[str] = None         # Alias to final_criticality for backwards compat
+    assessment_depth: Optional[str] = None         # Comprehensive / Targeted / Lightweight
 
     # Flags
     requires_review: bool = False

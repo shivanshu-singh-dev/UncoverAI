@@ -97,10 +97,18 @@ def classify_data_sensitivity(
                     matched_phrases_list.append(alias)
 
     if matched_score is not None:
-        # Recalculate to ensure highest score is used
-        # (we already iterate from highest, so first match is highest)
-        # But also collect ALL concepts found for the highest matching score
         final_score = matched_score
+        
+        # Check if the input specifically notes absence of customer data while having credentials/secrets
+        final_rationale = matched_rationale
+        if final_score == 3 and ("credentials" in matched_concepts_list or "secrets" in matched_concepts_list):
+            if any(p in norm for p in ["no direct customer data", "no customer data", "no direct client data"]):
+                final_rationale = (
+                    "No direct customer data identified; however, production/service "
+                    "credentials are identified, which qualify as highly sensitive "
+                    "data under the D3 taxonomy."
+                )
+
         return FactorResult(
             factor="D",
             factor_name="Data Sensitivity",
@@ -111,7 +119,7 @@ def classify_data_sensitivity(
             matched_concepts=list(set(matched_concepts_list)),
             matched_phrases=list(set(matched_phrases_list)),
             determination_method=DeterminationMethod.DETERMINISTIC_RULE,
-            rationale=matched_rationale,
+            rationale=final_rationale,
             certainty="HIGH",
         )
 

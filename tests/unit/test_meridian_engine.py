@@ -3,6 +3,7 @@ import pytest
 from pathlib import Path
 from meridian_assessment.ingestion.meridian_csv_loader import MeridianCSVVendorLoader
 from meridian_assessment.services.meridian_criticality_engine import MeridianCriticalityEngine
+from meridian_assessment.models.factor_result import CriticalityLevel
 
 
 class TestMeridianEngine:
@@ -27,22 +28,33 @@ class TestMeridianEngine:
         assert res.O.score == 2
         # D = 3 (production service credentials)
         assert res.D.score == 3
-        # V = 0 (N/A)
+        # V = 0 (Not applicable)
         assert res.V.score == 0
         # P = 0 (Batch scheduling is NOT payment)
         assert res.P.score == 0
+        # O1 Safeguard triggered (privileged access to production)
+        o1 = next(o for o in res.overrides_evaluated if o.override_id == "O1")
+        assert o1.triggered is True
+        assert res.proposed_criticality == CriticalityLevel.HIGH
+        # Rationale consistency: clearly explains credentials while acknowledging no direct customer data
+        assert "No direct customer data identified" in res.D.rationale
+        assert "credentials" in res.D.rationale
 
     def test_fiserv_sanity(self, engine, vendors):
         v = next(x for x in vendors if x.vendor_id == "V-002")
         res = engine.evaluate(v)
         # O = 3 (Critical)
         assert res.O.score == 3
-        # D = 3 (customer master, balances, PII)
+        # D = 3 (customer master, balances, transactions)
         assert res.D.score == 3
         # V = 3 (240 million transactions)
         assert res.V.score == 3
         # P = 2 (material transaction processing, not direct P3 clearing/settlement)
         assert res.P.score == 2
+        # O3 triggered: D=3 and V=3
+        o3 = next(o for o in res.overrides_evaluated if o.override_id == "O3")
+        assert o3.triggered is True
+        assert res.proposed_criticality == CriticalityLevel.HIGH
 
     def test_fssi_sanity(self, engine, vendors):
         v = next(x for x in vendors if x.vendor_id == "V-003")
@@ -57,6 +69,10 @@ class TestMeridianEngine:
         assert res.R.score == 2
         # P = 1 (statement production without transaction processing)
         assert res.P.score == 1
+        # O3 triggered (D=3 and V=3) -> High floor
+        o3 = next(o for o in res.overrides_evaluated if o.override_id == "O3")
+        assert o3.triggered is True
+        assert res.proposed_criticality == CriticalityLevel.HIGH
 
     def test_terrapin_sanity(self, engine, vendors):
         v = next(x for x in vendors if x.vendor_id == "V-004")
@@ -70,6 +86,8 @@ class TestMeridianEngine:
         assert res.V.is_unknown is True
         # R should not be R3
         assert res.R.score <= 1
+        # Proposed criticality remains Low (provisional based on known contributions)
+        assert res.proposed_criticality == CriticalityLevel.LOW
 
     def test_bny_sanity(self, engine, vendors):
         v = next(x for x in vendors if x.vendor_id == "V-005")
@@ -82,6 +100,13 @@ class TestMeridianEngine:
         assert res.P.score == 3
         # V = 2 (2.1 million messages)
         assert res.V.score == 2
+        # O4 Safeguard triggered: P=3 and O=2 -> High floor
+        o4 = next(o for o in res.overrides_evaluated if o.override_id == "O4")
+        assert o4.triggered is True
+        # O2 must NOT trigger (O is not 3, no sole source)
+        o2 = next(o for o in res.overrides_evaluated if o.override_id == "O2")
+        assert o2.triggered is False
+        assert res.proposed_criticality == CriticalityLevel.HIGH
 
     def test_clearing_house_sanity(self, engine, vendors):
         v = next(x for x in vendors if x.vendor_id == "V-006")
@@ -92,3 +117,11 @@ class TestMeridianEngine:
         assert res.P.score == 3
         # V = 3 (14 million messages)
         assert res.V.score == 3
+        # R = 3 (Performs critical regulated function / clearing and settlement operation)
+        assert res.R.score == 3
+        assert "critical_regulated_function" in res.R.matched_concepts
+        # O4 Safeguard triggered: P=3 and O=3
+        o4 = next(o for o in res.overrides_evaluated if o.override_id == "O4")
+        assert o4.triggered is True
+        # Proposed criticality is High
+        assert res.proposed_criticality == CriticalityLevel.HIGH

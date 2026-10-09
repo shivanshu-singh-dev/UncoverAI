@@ -1,14 +1,18 @@
-"""Meridian Criticality Engine — implements deterministic D/P/R/O/V methodology."""
+"""Meridian Criticality Engine — implements deterministic D/P/R/O/V methodology with O1-O4 safeguards and O5 human governance."""
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 import yaml
 
 from meridian_assessment.models.factor_result import (
+    CriticalityLevel,
     CriticalityResult,
     FactorResult,
+    HumanReviewRecord,
     OverrideRecord,
     ScoreStatus,
 )
@@ -24,6 +28,21 @@ logger = logging.getLogger(__name__)
 _DEFAULT_WEIGHTS_PATH = Path("config/factor_weights.yaml")
 _DEFAULT_CRITICALITY_PATH = Path("config/criticality.yaml")
 _DEFAULT_SEMANTIC_PATH = Path("config/semantic_config.yaml")
+
+# Hierarchy order for floors
+_CRITICALITY_ORDER = {
+    CriticalityLevel.LOW: 0,
+    CriticalityLevel.MEDIUM: 1,
+    CriticalityLevel.HIGH: 2,
+    CriticalityLevel.CRITICAL: 3,
+}
+
+_DEPTH_MAPPING = {
+    CriticalityLevel.CRITICAL: "Comprehensive",
+    CriticalityLevel.HIGH: "Comprehensive",
+    CriticalityLevel.MEDIUM: "Targeted",
+    CriticalityLevel.LOW: "Lightweight",
+}
 
 
 class MeridianCriticalityEngine:
@@ -59,7 +78,7 @@ class MeridianCriticalityEngine:
 
     def _load_thresholds(self) -> tuple[dict[str, float], dict[str, str]]:
         thresholds = {"TIER_1": 3.5, "TIER_2": 2.0, "TIER_3": 0.0}
-        depths = {"TIER_1": "COMPREHENSIVE", "TIER_2": "TARGETED", "TIER_3": "LIGHTWEIGHT"}
+        depths = {"TIER_1": "Comprehensive", "TIER_2": "Targeted", "TIER_3": "Lightweight"}
         if self.criticality_config_path.is_file():
             with open(self.criticality_config_path, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f)
@@ -70,7 +89,7 @@ class MeridianCriticalityEngine:
                 dm = cfg.get("assessment_depth_mapping", {})
                 for k, v in dm.items():
                     if isinstance(v, dict) and "depth" in v:
-                        depths[k] = str(v["depth"])
+                        depths[k] = str(v["depth"]).capitalize()
         return thresholds, depths
 
     def _load_semantic_config(self) -> dict:
@@ -93,8 +112,12 @@ class MeridianCriticalityEngine:
                 self._semantic_model = None
         return self._semantic_model
 
-    def evaluate(self, vendor: MeridianVendor) -> CriticalityResult:
-        """Evaluate a vendor under the D/P/R/O/V methodology with provenance tracking."""
+    def evaluate(
+        self,
+        vendor: MeridianVendor,
+        human_review: Optional[HumanReviewRecord] = None,
+    ) -> CriticalityResult:
+        """Evaluate a vendor under the D/P/R/O/V methodology with provenance tracking and O1-O5 overrides."""
         # 1. D Factor
         d_res = classify_data_sensitivity(
             vendor.data_classification_accessed,
@@ -134,7 +157,6 @@ class MeridianCriticalityEngine:
         for factor_code, f_res in factors_map.items():
             w = self.weights.get(factor_code, 0.0)
             contrib = round(f_res.score * w, 4) if f_res.score is not None else None
-            # Recreate immutable model with weight information
             f_dict = f_res.model_dump()
             f_dict["weight"] = w
             f_dict["weighted_contribution"] = contrib
@@ -159,10 +181,9 @@ class MeridianCriticalityEngine:
         if requires_review_factors:
             review_notes.append(f"Factors requiring review: {[f.factor for f in requires_review_factors]}")
 
-        # Determine Score Status
+        # Determine Score Status & Base Score
         if len(unknown_factors) == 0:
             score_status = ScoreStatus.COMPLETE
-            # Calculate base score
             base_score = (
                 d_final.weighted_contribution +
                 p_final.weighted_contribution +
@@ -173,7 +194,6 @@ class MeridianCriticalityEngine:
             base_score = round(base_score, 2)
         elif len(unknown_factors) <= 2:
             score_status = ScoreStatus.PARTIAL
-            # Calculate available partial score
             known_contribs = [f.weighted_contribution for f in [d_final, p_final, r_final, o_final, v_final] if f.weighted_contribution is not None]
             base_score = round(sum(known_contribs), 2)
         else:
@@ -183,15 +203,27 @@ class MeridianCriticalityEngine:
         if requires_review_factors and score_status == ScoreStatus.COMPLETE:
             score_status = ScoreStatus.REQUIRES_REVIEW
 
-        # Determine base tier from provisional thresholds
-        # Note: In the new 0-3 scale, max theoretical score is 3.0.
-        # Provisional thresholds are kept configurable and evaluated dynamically.
-        tier, depth = self._determine_tier_and_depth(base_score)
+        # Step 3: Determine provisional criticality from threshold configuration
+        provisional_criticality = self._determine_provisional_criticality(base_score)
 
-        # Overrides evaluation (O1-O5)
-        overrides, final_tier, final_depth, override_applied = self._evaluate_overrides(
-            d_final, p_final, r_final, o_final, v_final, tier, depth
+        # Step 4: Apply automatic overrides O1-O4
+        overrides_evaluated, proposed_criticality, automatic_override_applied = self._evaluate_automatic_overrides(
+            vendor=vendor,
+            D=d_final,
+            P=p_final,
+            R=r_final,
+            O=o_final,
+            V=v_final,
+            provisional=provisional_criticality,
         )
+
+        # Step 5: O5 User Review / Manual Governance
+        final_criticality = proposed_criticality
+        final_depth = _DEPTH_MAPPING.get(final_criticality, "Lightweight")
+
+        if human_review is not None and human_review.user_decision == "CHANGE_CRITICALITY":
+            final_criticality = human_review.final_criticality
+            final_depth = _DEPTH_MAPPING.get(final_criticality, "Lightweight")
 
         return CriticalityResult(
             vendor_id=vendor.vendor_id,
@@ -203,135 +235,210 @@ class MeridianCriticalityEngine:
             V=v_final,
             base_score=base_score,
             score_status=score_status,
-            overrides_evaluated=overrides,
-            override_applied=override_applied,
-            override_tier=final_tier if override_applied else None,
-            criticality_tier=final_tier,
+            provisional_criticality=provisional_criticality,
+            overrides_evaluated=overrides_evaluated,
+            automatic_override_applied=automatic_override_applied,
+            proposed_criticality=proposed_criticality,
+            human_review=human_review,
+            final_criticality=final_criticality,
+            criticality_tier=final_criticality,  # backwards compatibility alias
             assessment_depth=final_depth,
             requires_review=bool(review_notes or score_status in (ScoreStatus.PARTIAL, ScoreStatus.REQUIRES_REVIEW, ScoreStatus.UNKNOWN)),
             review_notes=review_notes,
         )
 
-    def _determine_tier_and_depth(self, score: Optional[float]) -> tuple[Optional[str], Optional[str]]:
+    def _determine_provisional_criticality(self, score: Optional[float]) -> str:
+        """Map base score to provisional criticality using configured thresholds."""
         if score is None:
-            return None, None
-        
-        # In the 0-3 scale:
-        # Tier 1: >= 2.25 (or configured threshold)
-        # For compatibility with provisional threshold checking:
-        # We sort descending:
-        sorted_tiers = sorted(self.tier_thresholds.items(), key=lambda x: x[1], reverse=True)
-        for t_name, min_s in sorted_tiers:
-            # Scale adjustment if thresholds are on 0-5 scale vs 0-3 scale:
-            # If threshold is >= 3.0 on 0-3 scale, adjust provisionally:
-            # 3.5 / 5.0 = 70% of max -> in 0-3 scale 70% is 2.10
-            adj_min = min_s if min_s <= 3.0 else (min_s / 5.0) * 3.0
-            if score >= adj_min:
-                return t_name, self.depth_mapping.get(t_name, "LIGHTWEIGHT")
-        return "TIER_3", self.depth_mapping.get("TIER_3", "LIGHTWEIGHT")
+            return CriticalityLevel.LOW
 
-    def _evaluate_overrides(
+        # Scale 0-3 adjustment:
+        # Tier 1 (min 3.5 on 0-5 scale -> 2.10 on 0-3 scale) -> High
+        # Tier 2 (min 2.0 on 0-5 scale -> 1.20 on 0-3 scale) -> Medium
+        # Tier 3 -> Low
+        t1_thresh = self.tier_thresholds.get("TIER_1", 3.5)
+        t2_thresh = self.tier_thresholds.get("TIER_2", 2.0)
+
+        adj_t1 = t1_thresh if t1_thresh <= 3.0 else (t1_thresh / 5.0) * 3.0
+        adj_t2 = t2_thresh if t2_thresh <= 3.0 else (t2_thresh / 5.0) * 3.0
+
+        if score >= adj_t1:
+            return CriticalityLevel.HIGH
+        elif score >= adj_t2:
+            return CriticalityLevel.MEDIUM
+        return CriticalityLevel.LOW
+
+    def _evaluate_automatic_overrides(
         self,
+        vendor: MeridianVendor,
         D: FactorResult,
         P: FactorResult,
         R: FactorResult,
         O: FactorResult,
         V: FactorResult,
-        current_tier: Optional[str],
-        current_depth: Optional[str],
-    ) -> tuple[list[OverrideRecord], Optional[str], Optional[str], bool]:
-        """Evaluate O1-O5 overrides framework."""
+        provisional: str,
+    ) -> tuple[list[OverrideRecord], str, bool]:
+        """Evaluate automatic safeguards O1-O4 and compute the maximum floor."""
         overrides: list[OverrideRecord] = []
-        tier = current_tier
-        depth = current_depth
-        override_applied = False
+        floors: list[str] = [provisional]
 
-        # O1: Critical Operational Dependency (O=3) with significant volume/data
-        o1_triggered = (O.score == 3 and D.score is not None and D.score >= 2)
+        # Combine text fields to inspect for explicit wording
+        text_corpus = " ".join([
+            vendor.vendor_description or "",
+            vendor.service_product_provided or "",
+            vendor.business_process_supported or "",
+            vendor.data_classification_accessed or "",
+        ]).lower()
+
+        # ----------------------------------------------------
+        # O1: Privileged Access -> Minimum HIGH floor
+        # Explicit evidence of privileged/elevated/administrative access to production
+        # ----------------------------------------------------
+        privileged_patterns = [
+            "privileged access",
+            "administrative access",
+            "production administrator access",
+            "production administrator",
+            "elevated privileges",
+            "privileged production access",
+            "privileged user access",
+        ]
+        o1_evidence = None
+        for pat in privileged_patterns:
+            if pat in text_corpus:
+                o1_evidence = pat
+                break
+
+        o1_triggered = bool(o1_evidence)
         overrides.append(
             OverrideRecord(
                 override_id="O1",
-                description="Critical Operational Dependency with high data sensitivity",
-                condition_evaluated="O == 3 and D >= 2",
+                description="Privileged / administrative access to production systems",
+                condition_evaluated="Explicit evidence of privileged/elevated/administrative access",
                 triggered=o1_triggered,
-                resulting_tier="TIER_1" if o1_triggered else None,
-                rationale="Critical infrastructure dependency directly handling sensitive core assets." if o1_triggered else "Condition not met.",
+                resulting_floor=CriticalityLevel.HIGH if o1_triggered else None,
+                evidence=f"Matched phrase '{o1_evidence}'" if o1_evidence else "None identified",
+                rationale="Vendor holds confirmed privileged/administrative access to production systems; imposes minimum High floor."
+                if o1_triggered else "Condition not met.",
             )
         )
-        if o1_triggered and tier != "TIER_1":
-            tier = "TIER_1"
-            depth = "COMPREHENSIVE"
-            override_applied = True
+        if o1_triggered:
+            floors.append(CriticalityLevel.HIGH)
 
-        # O2: Direct Payment Flow Execution (P=3)
-        o2_triggered = (P.score == 3)
+        # ----------------------------------------------------
+        # O2: Sole-Source + Critical/Total Dependency (O=3) -> Critical floor
+        # Requires BOTH: explicit sole-source confirmation AND O == 3
+        # ----------------------------------------------------
+        sole_source_patterns = [
+            "sole-source",
+            "sole source",
+            "only provider",
+            "single supplier",
+            "no alternative provider",
+            "no available substitute",
+            "sole supplier",
+        ]
+        o2_evidence = None
+        for pat in sole_source_patterns:
+            if pat in text_corpus:
+                o2_evidence = pat
+                break
+
+        o2_triggered = bool(o2_evidence and O.score == 3)
         overrides.append(
             OverrideRecord(
                 override_id="O2",
-                description="Direct Payment Flow execution (clearing/settlement/transmission)",
-                condition_evaluated="P == 3",
+                description="Sole-source supplier with Critical operational dependency (O=3)",
+                condition_evaluated="SoleSourceConfirmed == TRUE and O == 3",
                 triggered=o2_triggered,
-                resulting_tier="TIER_1" if o2_triggered else None,
-                rationale="Direct transmission/clearing/settlement of payment transactions." if o2_triggered else "Condition not met.",
+                resulting_floor=CriticalityLevel.CRITICAL if o2_triggered else None,
+                evidence=f"Sole-source phrase '{o2_evidence}', O={O.score}" if o2_evidence else f"O={O.score}, no sole-source evidence",
+                rationale="Confirmed sole-source dependency combined with Critical operational path (O=3); imposes Critical floor."
+                if o2_triggered else "Condition not met.",
             )
         )
-        if o2_triggered and tier != "TIER_1":
-            tier = "TIER_1"
-            depth = "COMPREHENSIVE"
-            override_applied = True
+        if o2_triggered:
+            floors.append(CriticalityLevel.CRITICAL)
 
-        # O3: Critical Regulated Function (R=3)
-        o3_triggered = (R.score == 3)
+        # ----------------------------------------------------
+        # O3: D3 + V3 -> Minimum HIGH floor
+        # Maximum sensitivity + enterprise-scale volume
+        # ----------------------------------------------------
+        o3_triggered = bool(D.score == 3 and V.score == 3)
         overrides.append(
             OverrideRecord(
                 override_id="O3",
-                description="Critical outsourced or regulated infrastructure",
-                condition_evaluated="R == 3",
+                description="Maximum data sensitivity (D=3) with enterprise-scale volume (V=3)",
+                condition_evaluated="D == 3 and V == 3",
                 triggered=o3_triggered,
-                resulting_tier="TIER_1" if o3_triggered else None,
-                rationale="Critical designated financial market utility or regulated function." if o3_triggered else "Condition not met.",
+                resulting_floor=CriticalityLevel.HIGH if o3_triggered else None,
+                evidence=f"D={D.score}, V={V.score}",
+                rationale="Simultaneous maximum data sensitivity (D3) and enterprise-scale volume (V3); imposes minimum High floor."
+                if o3_triggered else "Condition not met.",
             )
         )
-        if o3_triggered and tier != "TIER_1":
-            tier = "TIER_1"
-            depth = "COMPREHENSIVE"
-            override_applied = True
+        if o3_triggered:
+            floors.append(CriticalityLevel.HIGH)
 
-        # O4: Privileged Access / Credentials (D=3 via credentials)
-        o4_triggered = (D.score == 3 and "credentials" in D.matched_concepts and O.score is not None and O.score >= 2)
+        # ----------------------------------------------------
+        # O4: P3 + High-or-Greater Operational Dependency (O >= 2) -> Minimum HIGH floor
+        # ----------------------------------------------------
+        o4_triggered = bool(P.score == 3 and O.score is not None and O.score >= 2)
         overrides.append(
             OverrideRecord(
                 override_id="O4",
-                description="Privileged production access / credentials with High+ operational dependency",
-                condition_evaluated="D == 3 (credentials) and O >= 2",
+                description="Direct payment-flow execution (P=3) with High+ operational dependency (O >= 2)",
+                condition_evaluated="P == 3 and O >= 2",
                 triggered=o4_triggered,
-                resulting_tier="TIER_1" if o4_triggered else None,
-                rationale="Direct access to production credentials across core execution environments." if o4_triggered else "Condition not met.",
+                resulting_floor=CriticalityLevel.HIGH if o4_triggered else None,
+                evidence=f"P={P.score}, O={O.score}",
+                rationale="Direct payment-flow activity (P3) combined with operational dependency O >= 2; imposes minimum High floor."
+                if o4_triggered else "Condition not met.",
             )
         )
-        if o4_triggered and tier != "TIER_1":
-            tier = "TIER_1"
-            depth = "COMPREHENSIVE"
-            override_applied = True
+        if o4_triggered:
+            floors.append(CriticalityLevel.HIGH)
 
-        # O5: Enterprise Scale Customer Population (V=3 and D >= 2)
-        o5_triggered = (V.score == 3 and D.score is not None and D.score >= 2)
-        overrides.append(
-            OverrideRecord(
-                override_id="O5",
-                description="Enterprise-scale volume with sensitive customer data",
-                condition_evaluated="V == 3 and D >= 2",
-                triggered=o5_triggered,
-                resulting_tier="TIER_1" if o5_triggered else None,
-                rationale="Full-population scale customer data access." if o5_triggered else "Condition not met.",
-            )
+        # Compute proposed criticality as maximum floor
+        highest_order = max(_CRITICALITY_ORDER.get(f, 0) for f in floors)
+        proposed_criticality = next(lvl for lvl, order in _CRITICALITY_ORDER.items() if order == highest_order)
+        automatic_override_applied = proposed_criticality != provisional
+
+        return overrides, proposed_criticality, automatic_override_applied
+
+    def apply_human_override(
+        self,
+        current_result: CriticalityResult,
+        decision: str,  # KEEP_PROPOSED or CHANGE_CRITICALITY
+        new_criticality: Optional[str] = None,
+        rationale: str = "",
+    ) -> CriticalityResult:
+        """Apply O5 human governance step to an existing result."""
+        if decision == "CHANGE_CRITICALITY":
+            if new_criticality not in _CRITICALITY_ORDER:
+                raise ValueError(f"Invalid criticality selection: '{new_criticality}'. Must be one of {list(_CRITICALITY_ORDER.keys())}")
+            if not rationale.strip():
+                raise ValueError("A written rationale is required when changing the proposed criticality.")
+            final_crit = new_criticality
+        else:
+            final_crit = current_result.proposed_criticality or current_result.provisional_criticality or CriticalityLevel.LOW
+
+        review_rec = HumanReviewRecord(
+            user_decision=decision,
+            original_criticality=current_result.proposed_criticality or current_result.provisional_criticality or CriticalityLevel.LOW,
+            final_criticality=final_crit,
+            rationale=rationale.strip(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
         )
-        if o5_triggered and tier != "TIER_1":
-            tier = "TIER_1"
-            depth = "COMPREHENSIVE"
-            override_applied = True
 
-        return overrides, tier, depth, override_applied
+        final_depth = _DEPTH_MAPPING.get(final_crit, "Lightweight")
+
+        res_dict = current_result.model_dump()
+        res_dict["human_review"] = review_rec
+        res_dict["final_criticality"] = final_crit
+        res_dict["criticality_tier"] = final_crit
+        res_dict["assessment_depth"] = final_depth
+        return CriticalityResult(**res_dict)
 
     def generate_audit_trail(self, result: CriticalityResult) -> dict[str, Any]:
         """Generate full factor-level audit trail dictionary for a vendor."""
@@ -340,9 +447,12 @@ class MeridianCriticalityEngine:
             "vendor_name": result.vendor_name,
             "base_score": result.base_score,
             "score_status": result.score_status.value,
-            "criticality_tier": result.criticality_tier,
+            "provisional_criticality": result.provisional_criticality,
+            "automatic_override_applied": result.automatic_override_applied,
+            "proposed_criticality": result.proposed_criticality,
+            "final_criticality": result.final_criticality,
             "assessment_depth": result.assessment_depth,
-            "override_applied": result.override_applied,
+            "human_review": result.human_review.model_dump() if result.human_review else None,
             "requires_review": result.requires_review,
             "review_notes": result.review_notes,
             "factors": {

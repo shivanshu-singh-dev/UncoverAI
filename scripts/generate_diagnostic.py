@@ -36,8 +36,16 @@ def main():
         print(f"  Regulatory Exposure:   R={res.R.score if res.R.score is not None else 'UNKNOWN'} ({res.R.determination_method.value}) | Rationale: {res.R.rationale}")
         print(f"  -- Contributions: D={res.D.weighted_contribution} (w={res.D.weight}), P={res.P.weighted_contribution} (w={res.P.weight}), R={res.R.weighted_contribution} (w={res.R.weight}), O={res.O.weighted_contribution} (w={res.O.weight}), V={res.V.weighted_contribution} (w={res.V.weight})")
         print(f"  -- Base Score: {res.base_score} | Score Status: {res.score_status.value}")
-        print(f"  -- Overrides: Applied={res.override_applied} (Triggered: {[o.override_id for o in res.overrides_evaluated if o.triggered]})")
-        print(f"  -- Final Criticality: {res.criticality_tier} | Depth: {res.assessment_depth}")
+        print(f"  -- Provisional Criticality: {res.provisional_criticality}")
+        
+        # Overrides detail
+        for o in res.overrides_evaluated:
+            status = "TRIGGERED" if o.triggered else "NOT TRIGGERED"
+            floor_text = f" (Floor: {o.resulting_floor})" if o.triggered else ""
+            print(f"     [{o.override_id}] {status}{floor_text}: {o.description} | Evidence: {o.evidence} | Rationale: {o.rationale}")
+            
+        print(f"  -- Proposed Criticality (after O1-O4): {res.proposed_criticality}")
+        print(f"  -- O5 User Decision: {res.human_review.user_decision if res.human_review else 'PROPOSED_ACCEPTED'} | Final Criticality: {res.final_criticality} | Depth: {res.assessment_depth}")
         if res.requires_review:
             print(f"  -- [!] REVIEW FLAGGED: {res.review_notes}")
         print("-" * 120)

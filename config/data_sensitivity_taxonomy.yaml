@@ -40,6 +40,9 @@ rubric:
       - name: portfolio_data
         aliases: ["portfolio holdings", "portfolio data", "holdings", "investment data", "advisor compensation", "commission", "revenue figures", "performance data"]
         rationale: "Confidential financial/investment data."
+      - name: payment_messages_in_transit
+        aliases: ["payment messages in transit", "messages in transit", "data in transit only", "transit only"]
+        rationale: "Payment transaction messages in transit without customer master or persistent storage."
 
   score_3:
     label: "Highly Sensitive / Regulated"

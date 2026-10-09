@@ -100,7 +100,6 @@ pytest --cov=src/meridian_assessment
 
 ```
 .
-├── AGENTS.md                  # Workspace rules (hygiene, gitignore, requirements, README accuracy)
 ├── config/
 │   ├── factor_weights.yaml                 # D/P/R/O/V formula weights
 │   ├── data_sensitivity_taxonomy.yaml      # D factor concept taxonomy

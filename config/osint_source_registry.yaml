@@ -1,5 +1,6 @@
 # Official S1-S12 Source Registry Configuration
 # Meridian Financial Third-Party AI Risk Assessment
+# Unified authoritative source taxonomy incorporating vendor-specific dynamic discovery and fixed-platform sources.
 
 sources:
   S1:
@@ -9,6 +10,8 @@ sources:
     default_evidence_grade: "A"
     reliability_rating: 5
     is_corroborative: false
+    source_nature: "VENDOR_SPECIFIC"
+    discovery_mode: "Dynamic vendor-specific domain and subprocessor/trust portal discovery"
     evidence_targets:
       - "Named AI and model providers"
       - "Customer data usage rights and restrictions"
@@ -35,6 +38,8 @@ sources:
     default_evidence_grade: "A"
     reliability_rating: 5
     is_corroborative: false
+    source_nature: "HYBRID"
+    discovery_mode: "Dynamic vendor developer documentation portals combined with fixed GitHub/GitLab repository discovery"
     evidence_targets:
       - "Direct AI feature specifications"
       - "Underlying model family and API endpoint references"
@@ -61,6 +66,8 @@ sources:
     default_evidence_grade: "A/B"
     reliability_rating: 4
     is_corroborative: false
+    source_nature: "VENDOR_SPECIFIC"
+    discovery_mode: "Dynamic vendor-specific legal, privacy, and terms portal discovery"
     evidence_targets:
       - "Customer data training and fine-tuning rights"
       - "Prompt and output ownership terms"
@@ -83,6 +90,8 @@ sources:
     default_evidence_grade: "A/B"
     reliability_rating: 4
     is_corroborative: false
+    source_nature: "HYBRID"
+    discovery_mode: "Dynamic vendor engineering blogs combined with fixed platforms (GitHub, Hugging Face, developer forums)"
     evidence_targets:
       - "Technical architecture and AI tech stack"
       - "Model frameworks (PyTorch, TensorFlow, vLLM)"
@@ -92,6 +101,7 @@ sources:
       - "engineering_blog"
       - "youtube_tech_talks"
       - "hugging_face"
+      - "github"
       - "google_search"
     query_template_ids:
       - "q_fine_tuning"
@@ -107,6 +117,8 @@ sources:
     default_evidence_grade: "B"
     reliability_rating: 4
     is_corroborative: false
+    source_nature: "FIXED_PLATFORM"
+    discovery_mode: "Fixed regulatory registries and financial news outlets (SEC EDGAR, Companies House, MCA)"
     evidence_targets:
       - "Publicly disclosed material AI investment and deployment"
       - "AI governance and risk management disclosures"
@@ -128,6 +140,8 @@ sources:
     default_evidence_grade: "B"
     reliability_rating: 3
     is_corroborative: false
+    source_nature: "FIXED_PLATFORM"
+    discovery_mode: "Fixed job boards (LinkedIn Jobs, Indeed, Greenhouse, Lever) and vendor careers pages"
     evidence_targets:
       - "Production AI/ML and LLM engineering roles"
       - "Model provider SDK experience requirements (OpenAI, Anthropic, Bedrock)"
@@ -152,6 +166,8 @@ sources:
     default_evidence_grade: "B"
     reliability_rating: 3
     is_corroborative: false
+    source_nature: "FIXED_PLATFORM"
+    discovery_mode: "Fixed news, investor, and media platforms (Google News, Crunchbase, YouTube)"
     evidence_targets:
       - "Executive-level claims of AI deployment scale"
       - "Named workflow and product-line AI implementations"
@@ -173,6 +189,8 @@ sources:
     default_evidence_grade: "B/C"
     reliability_rating: 3
     is_corroborative: false
+    source_nature: "FIXED_PLATFORM"
+    discovery_mode: "Fixed cloud marketplaces and partner catalogs"
     evidence_targets:
       - "Third-party AI ecosystem integrations"
       - "Hyperscaler marketplace offerings"
@@ -192,6 +210,8 @@ sources:
     default_evidence_grade: "C"
     reliability_rating: 2
     is_corroborative: true
+    source_nature: "FIXED_PLATFORM"
+    discovery_mode: "Fixed code and package registries (GitHub Code Search, npm, PyPI, Docker Hub)"
     evidence_targets:
       - "Public client-side AI SDK bundle inclusions"
       - "Public AI API endpoint DNS / CNAME references"
@@ -213,6 +233,8 @@ sources:
     default_evidence_grade: "C"
     reliability_rating: 2
     is_corroborative: true
+    source_nature: "FIXED_PLATFORM"
+    discovery_mode: "Fixed academic and patent indexes (Google Patents, Google Scholar, arXiv)"
     evidence_targets:
       - "Patented AI algorithmic architectures"
       - "Author affiliations indicating vendor R&D capabilities"
@@ -229,10 +251,12 @@ sources:
   S11:
     source_id: "S11"
     name: "Third-party reporting"
-    description: "Industry news reporting, technical journalism, and independent security research analysis."
+    description: "Industry news reporting, technical journalism, developer forums, and independent security research analysis."
     default_evidence_grade: "C"
     reliability_rating: 2
     is_corroborative: true
+    source_nature: "FIXED_PLATFORM"
+    discovery_mode: "Fixed news outlets and developer forums (Google News, Reddit, Stack Overflow)"
     evidence_targets:
       - "Investigative reporting on vendor AI integrations"
       - "Corroboration of primary-source findings"
@@ -254,6 +278,8 @@ sources:
     default_evidence_grade: "D"
     reliability_rating: 1
     is_corroborative: false
+    source_nature: "VENDOR_SPECIFIC"
+    discovery_mode: "Dynamic vendor domain marketing pages and public press releases"
     evidence_targets:
       - "Top-level claims of AI features and capabilities"
       - "Product marketing names that guide targeted technical search"

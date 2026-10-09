@@ -5,10 +5,8 @@ from pathlib import Path
 from typing import Any, Optional, Union
 import yaml
 
-from meridian_assessment.models.assessment import AssessmentDepth
 from meridian_assessment.models.criticality import CriticalityAssessment, CriticalityTier
 from meridian_assessment.models.factor_result import (
-    CriticalityLevel,
     CriticalityResult,
     HumanReviewRecord,
 )
@@ -19,7 +17,6 @@ from meridian_assessment.models.osint_plan import (
     GateChecklistItem,
     GateStatus,
     OSINTInvestigationPlan,
-    PolicyConflictWarning,
     SourceCoverageRecord,
     TimeboxBudget,
 )
@@ -28,25 +25,21 @@ from meridian_assessment.services.osint.query_planner import OSINTQueryPlanner
 from meridian_assessment.services.osint.source_registry import OSINTSourceRegistry
 
 _DEFAULT_PROFILES_PATH = Path("config/osint_depth_profiles.yaml")
-_DEFAULT_POLICY_PATH = Path("config/osint_policy.yaml")
 
 
 class OSINTInvestigationPlanner:
-    """Orchestrates vendor depth selection, source resolution, and query generation."""
+    """Orchestrates vendor depth selection, source resolution, and query generation from one unified configuration."""
 
     def __init__(
         self,
         profiles_path: Path = _DEFAULT_PROFILES_PATH,
-        policy_path: Path = _DEFAULT_POLICY_PATH,
         source_registry: Optional[OSINTSourceRegistry] = None,
         query_planner: Optional[OSINTQueryPlanner] = None,
     ) -> None:
         self.profiles_path = profiles_path
-        self.policy_path = policy_path
         self.source_registry = source_registry or OSINTSourceRegistry()
         self.query_planner = query_planner or OSINTQueryPlanner()
         self._profiles: dict[str, dict] = {}
-        self._policy: dict[str, dict] = {}
         self._load()
 
     def _load(self) -> None:
@@ -55,18 +48,13 @@ class OSINTInvestigationPlanner:
                 data = yaml.safe_load(f) or {}
                 self._profiles = data.get("profiles", {})
 
-        if self.policy_path.exists():
-            with open(self.policy_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-                self._policy = data
-
     def resolve_criticality(
         self,
         criticality_input: Optional[Union[CriticalityResult, CriticalityAssessment, str]],
         human_review: Optional[HumanReviewRecord] = None,
     ) -> tuple[str, CriticalityApprovalStatus]:
         """Resolve effective criticality level and audit approval governance status."""
-        # Case 1: Direct HumanReviewRecord supplied
+        # Case 1: Direct HumanReviewRecord supplied (O5 governance decision)
         if human_review:
             return (
                 self._normalize_level_str(human_review.final_criticality),
@@ -125,7 +113,7 @@ class OSINTInvestigationPlanner:
 
     def plan_investigation(
         self,
-        vendor: Union[MeridianVendor, Vendor, dict[str, Any]],
+        vendor: Union[MeridianVendor, Vendor, CriticalityResult, CriticalityAssessment, dict[str, Any]],
         criticality_input: Optional[Union[CriticalityResult, CriticalityAssessment, str]] = None,
         human_review: Optional[HumanReviewRecord] = None,
     ) -> OSINTInvestigationPlan:
@@ -150,32 +138,33 @@ class OSINTInvestigationPlanner:
         elif isinstance(vendor, dict):
             vendor_id = vendor.get("vendor_id", "V-UNKNOWN")
             vendor_name = vendor.get("vendor_name", "Unknown Vendor")
-            domain = vendor.get("domain", "")
+            domain = vendor.get("domain", "") or ""
             v_desc = vendor.get("vendor_description")
             svc_prod = vendor.get("service_product_provided")
             biz_proc = vendor.get("business_process_supported")
         else:
             raise ValueError(f"Unsupported vendor type: {type(vendor)}")
 
-        # If domain or service description is missing, try looking up in meridian dataset
-        if (not domain or not svc_prod) and Path("data/input/meridian_vendors.csv").exists():
-            try:
-                from meridian_assessment.ingestion.meridian_csv_loader import MeridianCSVVendorLoader
-                _loader = MeridianCSVVendorLoader()
-                for _v in _loader.load(Path("data/input/meridian_vendors.csv")):
-                    if _v.vendor_id == vendor_id:
-                        domain = domain or _v.domain or ""
-                        v_desc = v_desc or _v.vendor_description
-                        svc_prod = svc_prod or _v.service_product_provided
-                        biz_proc = biz_proc or _v.business_process_supported
-                        break
-            except Exception:
-                pass
+        # Only look up missing fields from meridian_vendors.csv when a CriticalityResult/Assessment was passed directly
+        if isinstance(vendor, (CriticalityResult, CriticalityAssessment)) and (not domain or not svc_prod):
+            if Path("data/input/meridian_vendors.csv").exists():
+                try:
+                    from meridian_assessment.ingestion.meridian_csv_loader import MeridianCSVVendorLoader
+                    _loader = MeridianCSVVendorLoader()
+                    for _v in _loader.load(Path("data/input/meridian_vendors.csv")):
+                        if _v.vendor_id == vendor_id:
+                            domain = domain or _v.domain or ""
+                            v_desc = v_desc or _v.vendor_description
+                            svc_prod = svc_prod or _v.service_product_provided
+                            biz_proc = biz_proc or _v.business_process_supported
+                            break
+                except Exception:
+                    pass
 
         # 1. Resolve approved / effective criticality
         crit_level, approval_status = self.resolve_criticality(criticality_input, human_review)
 
-        # 2. Select Depth Profile
+        # 2. Select Depth Profile from authoritative configuration
         profile_name = crit_level
         profile_cfg = self._profiles.get(profile_name, self._profiles.get("Low", {}))
 
@@ -184,19 +173,23 @@ class OSINTInvestigationPlanner:
             f"vendor criticality level of '{crit_level}'."
         )
 
-        required_sources = profile_cfg.get("required_sources", [])
-        corroborative_sources = profile_cfg.get("corroborative_sources", [])
-        conditional_sources = profile_cfg.get("conditional_sources", [])
+        required_sources: list[str] = list(profile_cfg.get("required_sources", []))
+        corroborative_sources: list[str] = list(profile_cfg.get("corroborative_sources", []))
+        conditional_sources: list[dict[str, str]] = list(profile_cfg.get("conditional_sources", []))
+        conditional_map: dict[str, str] = {
+            c["source_id"]: c.get("condition", "")
+            for c in conditional_sources
+            if "source_id" in c
+        }
 
         # Active sources for query generation
         active_source_classes = list(required_sources)
+        for cond_sid in conditional_map:
+            if cond_sid not in active_source_classes:
+                active_source_classes.append(cond_sid)
         for s in corroborative_sources:
             if s not in active_source_classes:
                 active_source_classes.append(s)
-        for cond in conditional_sources:
-            c_sid = cond.get("source_id")
-            if c_sid and c_sid not in active_source_classes:
-                active_source_classes.append(c_sid)
 
         # 3. Build Source Coverage Records
         coverage_records: dict[str, SourceCoverageRecord] = {}
@@ -204,11 +197,15 @@ class OSINTInvestigationPlanner:
             s_def = self.source_registry.get_source(s_id)
             s_name = s_def.name if s_def else s_id
             is_req = s_id in required_sources
+            is_cond = s_id in conditional_map
+            cond_text = conditional_map.get(s_id, "")
             is_corrob = s_id in corroborative_sources
             coverage_records[s_id] = SourceCoverageRecord(
                 source_id=s_id,
                 source_name=s_name,
                 is_required=is_req,
+                is_conditional=is_cond,
+                condition=cond_text,
                 is_corroborative=is_corrob,
             )
 
@@ -229,13 +226,17 @@ class OSINTInvestigationPlanner:
             product_name=svc_prod,
         )
 
-        # 6. Configure Timebox Budget
+        # 6. Configure POC Timebox Budget deterministically from depth profile
         tb_cfg = profile_cfg.get("timebox", {})
+        planned_mins = int(tb_cfg.get("planned_minutes", 10))
         timebox = TimeboxBudget(
-            planning_target=tb_cfg.get("planning_target", "Provisional"),
-            min_hours=float(tb_cfg.get("min_hours", 1.0)),
-            max_hours=float(tb_cfg.get("max_hours", 2.0)),
-            is_provisional=True,
+            planning_target=tb_cfg.get("planning_target", f"{planned_mins} minutes"),
+            planned_minutes=planned_mins,
+            elapsed_wall_clock_minutes=0.0,
+            actual_analyst_effort_minutes=0.0,
+            min_hours=float(tb_cfg.get("min_hours", round(planned_mins / 60.0, 2))),
+            max_hours=float(tb_cfg.get("max_hours", round(planned_mins / 60.0, 2))),
+            is_provisional=bool(tb_cfg.get("is_provisional", True)),
         )
 
         # 7. Configure Stopping Condition
@@ -294,25 +295,7 @@ class OSINTInvestigationPlanner:
             ),
         ]
 
-        # 9. Surface Policy Conflicts (Fixed Source Policy vs Depth Profile)
-        policy_conflicts: list[PolicyConflictWarning] = []
-        fixed_sources_cfg = self._policy.get("source_classification", {}).get("fixed_mandatory", {}).get("sources", [])
-        for f_item in fixed_sources_cfg:
-            mapped_classes = f_item.get("maps_to_classes", [])
-            for c_id in mapped_classes:
-                if c_id not in required_sources:
-                    policy_conflicts.append(
-                        PolicyConflictWarning(
-                            source_id=c_id,
-                            source_name=f_item.get("name", c_id),
-                            issue=f"Team policy classifies '{f_item.get('name')}' as mandatory, but the rulebook '{profile_name}' depth profile omits source class {c_id}.",
-                            rulebook_requirement=f"Rulebook '{profile_name}' requires only: {', '.join(required_sources)}.",
-                            team_policy_claim=f"Team fixed-source catalog mandates '{f_item.get('name')}'.",
-                            impact_notes=f"Investigating {c_id} for a {profile_name} vendor would add investigative overhead beyond the {timebox.planning_target} planning timebox.",
-                        )
-                    )
-
-        # 10. Check for unresolved planning issues
+        # 9. Check for unresolved planning issues
         unresolved_issues: list[str] = []
         if not domain:
             unresolved_issues.append("Missing public domain — domain-restricted queries ('site:') cannot be rendered.")
@@ -344,7 +327,6 @@ class OSINTInvestigationPlanner:
             stop_progress_notes=f"Investigation planned. Awaiting OSINT collection across {len(required_sources)} required source classes.",
             reviewer_requirements=profile_cfg.get("review_requirements", {}),
             gate_checklist=gate_checklist,
-            policy_conflicts=policy_conflicts,
             unresolved_planning_issues=unresolved_issues,
             generated_at=datetime.now().isoformat(),
         )

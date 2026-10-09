@@ -39,6 +39,8 @@ class OSINTSourceRegistry:
                         default_evidence_grade=s_data.get("default_evidence_grade", "C"),
                         reliability_rating=s_data.get("reliability_rating", 3),
                         is_corroborative=s_data.get("is_corroborative", False),
+                        source_nature=s_data.get("source_nature", "HYBRID"),
+                        discovery_mode=s_data.get("discovery_mode", ""),
                         evidence_targets=s_data.get("evidence_targets", []),
                         discovery_resources=s_data.get("discovery_resources", []),
                         query_template_ids=s_data.get("query_template_ids", []),

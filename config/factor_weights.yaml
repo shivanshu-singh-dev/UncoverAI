@@ -8,3 +8,12 @@ weights:
   R: 0.20  # Regulatory Exposure
   O: 0.20  # Operational Dependency
   V: 0.10  # Annual Data Volume
+
+# Provisional criticality thresholds on the 0.00 - 3.00 scale (inclusive lower bounds)
+# Evaluated highest-first: score >= threshold assigns that criticality level.
+provisional_thresholds:
+  Critical: 2.50
+  High: 2.00
+  Medium: 1.20
+  Low: 0.00
+

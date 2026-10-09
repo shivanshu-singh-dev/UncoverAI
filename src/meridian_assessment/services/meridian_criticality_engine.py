@@ -77,19 +77,38 @@ class MeridianCriticalityEngine:
         return {"D": 0.30, "P": 0.20, "R": 0.20, "O": 0.20, "V": 0.10}
 
     def _load_thresholds(self) -> tuple[dict[str, float], dict[str, str]]:
-        thresholds = {"TIER_1": 3.5, "TIER_2": 2.0, "TIER_3": 0.0}
-        depths = {"TIER_1": "Comprehensive", "TIER_2": "Targeted", "TIER_3": "Lightweight"}
+        thresholds = {
+            CriticalityLevel.CRITICAL: 2.50,
+            CriticalityLevel.HIGH: 2.00,
+            CriticalityLevel.MEDIUM: 1.20,
+            CriticalityLevel.LOW: 0.00,
+        }
+        depths = {
+            CriticalityLevel.CRITICAL: "Comprehensive",
+            CriticalityLevel.HIGH: "Comprehensive",
+            CriticalityLevel.MEDIUM: "Targeted",
+            CriticalityLevel.LOW: "Lightweight",
+        }
+        # First check factor_weights.yaml for provisional_thresholds
+        if self.weights_path.is_file():
+            with open(self.weights_path, "r", encoding="utf-8") as f:
+                w_cfg = yaml.safe_load(f) or {}
+                pt = w_cfg.get("provisional_thresholds", {})
+                for k, v in pt.items():
+                    if isinstance(v, (int, float)):
+                        thresholds[k] = float(v)
+        # Also allow overrides from criticality.yaml
         if self.criticality_config_path.is_file():
             with open(self.criticality_config_path, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
+                cfg = yaml.safe_load(f) or {}
+                pt = cfg.get("provisional_thresholds", {})
+                for k, v in pt.items():
+                    if isinstance(v, (int, float)):
+                        thresholds[k] = float(v)
                 tt = cfg.get("tier_thresholds", {})
                 for k, v in tt.items():
                     if isinstance(v, dict) and "min_score" in v:
                         thresholds[k] = float(v["min_score"])
-                dm = cfg.get("assessment_depth_mapping", {})
-                for k, v in dm.items():
-                    if isinstance(v, dict) and "depth" in v:
-                        depths[k] = str(v["depth"]).capitalize()
         return thresholds, depths
 
     def _load_semantic_config(self) -> dict:
@@ -248,23 +267,26 @@ class MeridianCriticalityEngine:
         )
 
     def _determine_provisional_criticality(self, score: Optional[float]) -> str:
-        """Map base score to provisional criticality using configured thresholds."""
+        """Map base score on the 0-3 scale to provisional criticality using configured thresholds.
+
+        Inclusive lower-bound thresholds (evaluated highest-first):
+          score >= Critical (2.50) -> Critical
+          score >= High     (2.00) -> High
+          score >= Medium   (1.20) -> Medium
+          otherwise                -> Low
+        """
         if score is None:
             return CriticalityLevel.LOW
 
-        # Scale 0-3 adjustment:
-        # Tier 1 (min 3.5 on 0-5 scale -> 2.10 on 0-3 scale) -> High
-        # Tier 2 (min 2.0 on 0-5 scale -> 1.20 on 0-3 scale) -> Medium
-        # Tier 3 -> Low
-        t1_thresh = self.tier_thresholds.get("TIER_1", 3.5)
-        t2_thresh = self.tier_thresholds.get("TIER_2", 2.0)
+        crit_thresh = self.tier_thresholds.get(CriticalityLevel.CRITICAL, self.tier_thresholds.get("Critical", 2.50))
+        high_thresh = self.tier_thresholds.get(CriticalityLevel.HIGH, self.tier_thresholds.get("High", 2.00))
+        med_thresh = self.tier_thresholds.get(CriticalityLevel.MEDIUM, self.tier_thresholds.get("Medium", 1.20))
 
-        adj_t1 = t1_thresh if t1_thresh <= 3.0 else (t1_thresh / 5.0) * 3.0
-        adj_t2 = t2_thresh if t2_thresh <= 3.0 else (t2_thresh / 5.0) * 3.0
-
-        if score >= adj_t1:
+        if score >= crit_thresh:
+            return CriticalityLevel.CRITICAL
+        elif score >= high_thresh:
             return CriticalityLevel.HIGH
-        elif score >= adj_t2:
+        elif score >= med_thresh:
             return CriticalityLevel.MEDIUM
         return CriticalityLevel.LOW
 

@@ -67,6 +67,8 @@ class SourceClassDefinition(BaseModel):
     default_evidence_grade: str
     reliability_rating: int
     is_corroborative: bool
+    source_nature: str = "HYBRID"
+    discovery_mode: str = ""
     evidence_targets: list[str] = Field(default_factory=list)
     discovery_resources: list[str] = Field(default_factory=list)
     query_template_ids: list[str] = Field(default_factory=list)
@@ -122,11 +124,14 @@ class SourceCoverageRecord(BaseModel):
     source_id: str
     source_name: str
     is_required: bool
+    is_conditional: bool = False
+    condition: str = ""
     is_corroborative: bool = False
     status: CoverageState = CoverageState.NOT_STARTED
     candidate_urls_count: int = 0
     reviewed_urls_count: int = 0
     produced_new_evidence: bool = False
+    evidence_references: list[str] = Field(default_factory=list)
     notes: str = ""
 
 
@@ -142,10 +147,19 @@ class GateChecklistItem(BaseModel):
 
 
 class TimeboxBudget(BaseModel):
-    """Time budget tracking and measurement for the assessment."""
+    """Time budget tracking and measurement for the assessment.
+
+    Explicitly distinguishes:
+      - planned_minutes: Configurable POC planning target (30 / 20 / 10 / 5 minutes)
+      - elapsed_wall_clock_minutes: Elapsed wall-clock duration
+      - actual_analyst_effort_minutes: Active hands-on analyst review effort
+    """
     planning_target: str
-    min_hours: float
-    max_hours: float
+    planned_minutes: int = 10
+    elapsed_wall_clock_minutes: float = 0.0
+    actual_analyst_effort_minutes: float = 0.0
+    min_hours: float = 0.0
+    max_hours: float = 0.0
     is_provisional: bool = True
     actual_analyst_time_hours: float = 0.0
     actual_automated_execution_time_minutes: float = 0.0
@@ -154,16 +168,6 @@ class TimeboxBudget(BaseModel):
     time_spent_resolving_ambiguous_minutes: float = 0.0
     time_spent_validating_minutes: float = 0.0
     is_exhausted: bool = False
-
-
-class PolicyConflictWarning(BaseModel):
-    """Explicit advisory flag surfacing tensions between team policy and rulebook."""
-    source_id: str
-    source_name: str
-    issue: str
-    rulebook_requirement: str
-    team_policy_claim: str
-    impact_notes: str
 
 
 class OSINTInvestigationPlan(BaseModel):
@@ -202,7 +206,6 @@ class OSINTInvestigationPlan(BaseModel):
     # Reviewer requirements & gates
     reviewer_requirements: dict[str, Any] = Field(default_factory=dict)
     gate_checklist: list[GateChecklistItem] = Field(default_factory=list)
-    policy_conflicts: list[PolicyConflictWarning] = Field(default_factory=list)
     unresolved_planning_issues: list[str] = Field(default_factory=list)
 
     # Metadata

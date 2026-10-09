@@ -33,9 +33,11 @@ class TestMeridianEngine:
         # P = 0 (Batch scheduling is NOT payment)
         assert res.P.score == 0
         # O1 Safeguard triggered (privileged access to production)
+        assert res.provisional_criticality == CriticalityLevel.MEDIUM
         o1 = next(o for o in res.overrides_evaluated if o.override_id == "O1")
         assert o1.triggered is True
         assert res.proposed_criticality == CriticalityLevel.HIGH
+        assert res.final_criticality == CriticalityLevel.HIGH
         # Rationale consistency: clearly explains credentials while acknowledging no direct customer data
         assert "No direct customer data identified" in res.D.rationale
         assert "credentials" in res.D.rationale
@@ -51,10 +53,12 @@ class TestMeridianEngine:
         assert res.V.score == 3
         # P = 2 (material transaction processing, not direct P3 clearing/settlement)
         assert res.P.score == 2
+        assert res.provisional_criticality == CriticalityLevel.HIGH
         # O3 triggered: D=3 and V=3
         o3 = next(o for o in res.overrides_evaluated if o.override_id == "O3")
         assert o3.triggered is True
         assert res.proposed_criticality == CriticalityLevel.HIGH
+        assert res.final_criticality == CriticalityLevel.HIGH
 
     def test_fssi_sanity(self, engine, vendors):
         v = next(x for x in vendors if x.vendor_id == "V-003")
@@ -69,10 +73,14 @@ class TestMeridianEngine:
         assert res.R.score == 2
         # P = 1 (statement production without transaction processing)
         assert res.P.score == 1
+        # Base score = 2.00 -> Provisional criticality MUST be High (inclusive lower bound 2.00)
+        assert res.base_score == pytest.approx(2.00)
+        assert res.provisional_criticality == CriticalityLevel.HIGH
         # O3 triggered (D=3 and V=3) -> High floor
         o3 = next(o for o in res.overrides_evaluated if o.override_id == "O3")
         assert o3.triggered is True
         assert res.proposed_criticality == CriticalityLevel.HIGH
+        assert res.final_criticality == CriticalityLevel.HIGH
 
     def test_terrapin_sanity(self, engine, vendors):
         v = next(x for x in vendors if x.vendor_id == "V-004")
@@ -86,7 +94,8 @@ class TestMeridianEngine:
         assert res.V.is_unknown is True
         # R should not be R3
         assert res.R.score <= 1
-        # Proposed criticality remains Low (provisional based on known contributions)
+        # Provisional and Proposed criticality remain Low (provisional based on known contributions)
+        assert res.provisional_criticality == CriticalityLevel.LOW
         assert res.proposed_criticality == CriticalityLevel.LOW
 
     def test_bny_sanity(self, engine, vendors):
@@ -100,6 +109,7 @@ class TestMeridianEngine:
         assert res.P.score == 3
         # V = 2 (2.1 million messages)
         assert res.V.score == 2
+        assert res.provisional_criticality == CriticalityLevel.HIGH
         # O4 Safeguard triggered: P=3 and O=2 -> High floor
         o4 = next(o for o in res.overrides_evaluated if o.override_id == "O4")
         assert o4.triggered is True
@@ -120,8 +130,12 @@ class TestMeridianEngine:
         # R = 3 (Performs critical regulated function / clearing and settlement operation)
         assert res.R.score == 3
         assert "critical_regulated_function" in res.R.matched_concepts
-        # O4 Safeguard triggered: P=3 and O=3
+        # Base score = 2.70 -> Provisional criticality MUST be Critical (>= 2.50)
+        assert res.base_score == pytest.approx(2.70)
+        assert res.provisional_criticality == CriticalityLevel.CRITICAL
+        # O4 Safeguard triggered: P=3 and O=3 (High floor does not downgrade Critical)
         o4 = next(o for o in res.overrides_evaluated if o.override_id == "O4")
         assert o4.triggered is True
-        # Proposed criticality is High
-        assert res.proposed_criticality == CriticalityLevel.HIGH
+        # Proposed and Final criticality are Critical
+        assert res.proposed_criticality == CriticalityLevel.CRITICAL
+        assert res.final_criticality == CriticalityLevel.CRITICAL

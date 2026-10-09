@@ -35,7 +35,12 @@ from meridian_assessment.models.factor_result import (
 from meridian_assessment.services.pipeline import AssessmentPipeline
 from meridian_assessment.services.meridian_criticality_engine import MeridianCriticalityEngine
 from meridian_assessment.ingestion.meridian_csv_loader import MeridianCSVVendorLoader
-from meridian_assessment.services.osint import OSINTInvestigationPlanner, OSINTSourceRegistry
+from meridian_assessment.services.osint import (
+    OSINTCoverageTracker,
+    OSINTInvestigationPlanner,
+    OSINTSourceRegistry,
+    StopConditionEvaluator,
+)
 from meridian_assessment.models.osint_plan import (
     AssessmentStopStatus,
     CriticalityApprovalStatus,
@@ -583,6 +588,8 @@ if "error_msg" not in st.session_state:
     st.session_state.error_msg = None
 if "human_overrides" not in st.session_state:
     st.session_state.human_overrides = {}
+if "osint_plans" not in st.session_state:
+    st.session_state.osint_plans = {}
 if "filter_tier" not in st.session_state:
     st.session_state.filter_tier = "All"
 if "show_raw_json" not in st.session_state:
@@ -602,6 +609,7 @@ if reset_btn:
     st.session_state.results = []
     st.session_state.selected_id = None
     st.session_state.human_overrides = {}
+    st.session_state.osint_plans = {}
     st.session_state.filter_tier = "All"
     st.rerun()
 
@@ -609,6 +617,7 @@ if run_btn:
     st.session_state.error_msg = None
     st.session_state.selected_id = None
     st.session_state.human_overrides = {}
+    st.session_state.osint_plans = {}
     try:
         if "Primary" in engine_mode:
             st.session_state.mode_used = "meridian"
@@ -969,6 +978,7 @@ with tab_assess:
                                         final_criticality=new_val,
                                         rationale=rationale_input.strip(),
                                     )
+                                    st.session_state.osint_plans.pop(r.vendor_id, None)
                                     st.success(f"Overridden to {new_val} by analyst.")
                                     st.rerun()
                         else:
@@ -979,6 +989,7 @@ with tab_assess:
                                     final_criticality=r.proposed_criticality or "Low",
                                     rationale="Analyst confirmed proposed automated criticality.",
                                 )
+                                st.session_state.osint_plans.pop(r.vendor_id, None)
                                 st.info("Automated criticality confirmed.")
                                 st.rerun()
 
@@ -1046,26 +1057,38 @@ with tab_osint:
         )
 
         selected_vendor_obj = vendor_lookup[selected_v_key]
+        v_id = getattr(selected_vendor_obj, "vendor_id", "UNKNOWN")
 
         # Determine criticality and human override if available
         osint_crit = None
         osint_h_rev = None
         if isinstance(selected_vendor_obj, CriticalityResult):
             osint_crit = selected_vendor_obj
-            osint_h_rev = st.session_state.human_overrides.get(selected_vendor_obj.vendor_id)
+            osint_h_rev = st.session_state.human_overrides.get(v_id)
         elif hasattr(selected_vendor_obj, "vendor_id"):
-            osint_h_rev = st.session_state.human_overrides.get(selected_vendor_obj.vendor_id)
+            osint_h_rev = st.session_state.human_overrides.get(v_id)
             for r in st.session_state.results:
-                if getattr(r, "vendor_id", None) == selected_vendor_obj.vendor_id:
+                if getattr(r, "vendor_id", None) == v_id:
                     osint_crit = r
                     break
 
         planner = OSINTInvestigationPlanner()
-        plan = planner.plan_investigation(
-            vendor=selected_vendor_obj,
-            criticality_input=osint_crit,
-            human_review=osint_h_rev,
-        )
+        eff_crit, eff_status = planner.resolve_effective_criticality(osint_crit, osint_h_rev)
+
+        cached_plan = st.session_state.osint_plans.get(v_id)
+        if (
+            cached_plan is None
+            or cached_plan.input_criticality != eff_crit
+            or cached_plan.approval_status != eff_status
+        ):
+            cached_plan = planner.plan_investigation(
+                vendor=selected_vendor_obj,
+                criticality_input=osint_crit,
+                human_review=osint_h_rev,
+            )
+            st.session_state.osint_plans[v_id] = cached_plan
+
+        plan = cached_plan
 
         # ── Executive Header ──
         approval_badge_color = "#16a34a" if plan.approval_status == CriticalityApprovalStatus.APPROVED_BY_ANALYST else "#d97706"
@@ -1089,7 +1112,7 @@ with tab_osint:
             <div class="detail-meta">
                 {pill(plan.input_criticality)}
                 <span class="detail-tag">OSINT Depth: <strong>{plan.selected_depth_profile}</strong></span>
-                <span class="detail-tag">Rulebook Timebox: <strong>{plan.timebox.planning_target}</strong></span>
+                <span class="detail-tag">POC Timebox: <strong>{plan.timebox.planning_target}</strong> (Wall: {plan.timebox.elapsed_wall_clock_minutes:.0f}m · Effort: {plan.timebox.actual_analyst_effort_minutes:.0f}m)</span>
                 <span class="detail-tag">Reviewers: <strong>{'Analyst + 2nd Reviewer' if plan.reviewer_requirements.get('second_reviewer') else 'Primary Analyst'}</strong></span>
             </div>
         </div>
@@ -1101,7 +1124,7 @@ with tab_osint:
             <div class="stat-card all">
                 <div class="stat-label">Required Sources</div>
                 <div class="stat-value">{len(plan.required_source_classes)}</div>
-                <div class="stat-sub">S1–S12 source classes</div>
+                <div class="stat-sub">+{len(plan.conditional_source_classes)} conditional · {len(plan.corroborative_source_classes)} corroborative</div>
             </div>
             <div class="stat-card high">
                 <div class="stat-label">Planned Queries</div>
@@ -1114,9 +1137,9 @@ with tab_osint:
                 <div class="stat-sub">mapped research resources</div>
             </div>
             <div class="stat-card low">
-                <div class="stat-label">Downstream Gates</div>
-                <div class="stat-value">4</div>
-                <div class="stat-sub">G1–G4 checklist objectives</div>
+                <div class="stat-label">POC Timebox</div>
+                <div class="stat-value">{plan.timebox.planned_minutes:.0f}m</div>
+                <div class="stat-sub">Effort: {plan.timebox.actual_analyst_effort_minutes:.0f}m · Wall: {plan.timebox.elapsed_wall_clock_minutes:.0f}m</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1126,23 +1149,64 @@ with tab_osint:
 
         with osint_left:
             # 1. Stopping Condition Monitor
-            st.markdown('<div class="sec-header"><span>1. Rulebook Stopping Condition</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="sec-header"><span>1. Rulebook Stopping Condition &amp; POC Timebox</span></div>', unsafe_allow_html=True)
+            stop_badge_color = (
+                "#16a34a" if plan.stop_status == AssessmentStopStatus.COMPLETED_CONDITION_MET
+                else "#dc2626" if plan.stop_status == AssessmentStopStatus.TIMEBOX_EXHAUSTED_INCOMPLETE
+                else "#2563eb"
+            )
+            stop_badge_bg = (
+                "#f0fdf4" if plan.stop_status == AssessmentStopStatus.COMPLETED_CONDITION_MET
+                else "#fef2f2" if plan.stop_status == AssessmentStopStatus.TIMEBOX_EXHAUSTED_INCOMPLETE
+                else "#eff6ff"
+            )
             st.markdown(f"""
             <div class="factor-card" style="line-height:1.5">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.35rem">
                     <strong style="color:#0f172a;font-size:0.8rem">[{plan.stopping_rule_id}]</strong>
-                    <span style="font-size:0.7rem;font-weight:700;color:#2563eb;background:#eff6ff;padding:0.15rem 0.5rem;border-radius:4px">
+                    <span style="font-size:0.7rem;font-weight:700;color:{stop_badge_color};background:{stop_badge_bg};padding:0.15rem 0.5rem;border-radius:4px">
                         {plan.stop_status.value.replace('_', ' ')}
                     </span>
                 </div>
-                <div style="font-size:0.76rem;color:#334155;margin-bottom:0.4rem">
+                <div style="font-size:0.76rem;color:#334155;margin-bottom:0.35rem">
                     {plan.stopping_rule_description}
                 </div>
+                <div style="font-size:0.73rem;color:#0f172a;background:#f8fafc;padding:0.35rem 0.55rem;border-radius:4px;margin-bottom:0.35rem">
+                    <strong>Evaluator Status:</strong> {plan.stop_progress_notes}
+                </div>
                 <div style="font-size:0.7rem;color:#64748b;border-top:1px solid #f1f5f9;padding-top:0.35rem">
-                    <strong>Timebox Target:</strong> {plan.timebox.planning_target} (Provisional planning estimate · Expiry does not equal completion)
+                    <strong>Planned Timebox:</strong> {plan.timebox.planning_target} ({plan.timebox.planned_minutes:.0f} min) &nbsp;·&nbsp;
+                    <strong>Elapsed Wall-Clock:</strong> {plan.timebox.elapsed_wall_clock_minutes:.1f} min &nbsp;·&nbsp;
+                    <strong>Actual Analyst Effort:</strong> {plan.timebox.actual_analyst_effort_minutes:.1f} min
                 </div>
             </div>
             """, unsafe_allow_html=True)
+
+            with st.expander("⏱️ Log Timebox & Analyst Effort", expanded=False):
+                tb_c1, tb_c2 = st.columns(2)
+                with tb_c1:
+                    new_wall_min = st.number_input(
+                        "Elapsed Wall-Clock (minutes)",
+                        min_value=0.0,
+                        value=float(plan.timebox.elapsed_wall_clock_minutes),
+                        step=1.0,
+                        key=f"tb_wall_{v_id}",
+                    )
+                with tb_c2:
+                    new_effort_min = st.number_input(
+                        "Actual Analyst Effort (minutes)",
+                        min_value=0.0,
+                        value=float(plan.timebox.actual_analyst_effort_minutes),
+                        step=1.0,
+                        key=f"tb_effort_{v_id}",
+                    )
+                if st.button("Update Timebox & Evaluate Stopping Rule", key=f"btn_tb_{v_id}", use_container_width=True):
+                    OSINTCoverageTracker.update_plan_timebox(
+                        plan,
+                        elapsed_wall_clock_minutes=new_wall_min,
+                        actual_analyst_effort_minutes=new_effort_min,
+                    )
+                    st.rerun()
 
             # 2. Downstream G1–G4 Investigation Checklist
             st.markdown('<div class="sec-header"><span>2. Downstream G1–G4 Gates Checklist</span></div>', unsafe_allow_html=True)
@@ -1165,37 +1229,128 @@ with tab_osint:
                 </div>
                 """, unsafe_allow_html=True)
 
-            # 3. Policy Conflicts (Fixed Sources vs Depth Profile)
-            if plan.policy_conflicts:
-                st.markdown('<div class="sec-header"><span>3. Policy Alignment Advisory</span></div>', unsafe_allow_html=True)
-                for pc in plan.policy_conflicts:
-                    st.markdown(f"""
-                    <div class="advisory-box">
-                        <strong>⚠️ {pc.source_name} ({pc.source_id}) Policy Variance</strong><br>
-                        <span style="color:#78350f">{pc.issue}</span><br>
-                        <em>Impact: {pc.impact_notes}</em>
-                    </div>
-                    """, unsafe_allow_html=True)
+            with st.expander("🔍 Update G1–G4 Gate Status", expanded=False):
+                gate_ids = [g.gate_id for g in plan.gate_checklist]
+                sel_gate_id = st.selectbox("Select Gate", options=gate_ids, key=f"sel_gate_{v_id}")
+                target_gate = next(g for g in plan.gate_checklist if g.gate_id == sel_gate_id)
+                gate_states = [s.value for s in GateStatus]
+                cur_gate_idx = gate_states.index(target_gate.status.value)
+                new_gate_state = st.selectbox(
+                    "Gate Status",
+                    options=gate_states,
+                    index=cur_gate_idx,
+                    key=f"sel_gate_status_{v_id}_{sel_gate_id}",
+                )
+                if st.button("Save Gate Status", key=f"btn_save_gate_{v_id}", use_container_width=True):
+                    OSINTCoverageTracker.update_plan_gate(
+                        plan,
+                        gate_id=sel_gate_id,
+                        new_status=GateStatus(new_gate_state),
+                    )
+                    st.rerun()
 
         with osint_right:
-            # 1. Planned Source Classes
-            st.markdown('<div class="sec-header"><span>3. Source Classes &amp; Discovery Catalog</span></div>', unsafe_allow_html=True)
-            
+            # 1. Planned Source Classes & Interactive Coverage Tracker
+            st.markdown('<div class="sec-header"><span>3. Unified Source Coverage &amp; Discovery Catalog</span></div>', unsafe_allow_html=True)
+
+            with st.expander("📝 Record Source Coverage Outcome", expanded=False):
+                source_options = list(plan.coverage_records.keys())
+                sel_src_id = st.selectbox(
+                    "Source Class",
+                    options=source_options,
+                    format_func=lambda sid: f"[{sid}] {plan.coverage_records[sid].source_name}",
+                    key=f"cov_src_sel_{v_id}",
+                )
+                cur_rec = plan.coverage_records[sel_src_id]
+                cov_states = [s.value for s in CoverageState]
+                cur_cov_idx = cov_states.index(cur_rec.status.value)
+                new_cov_state = st.selectbox(
+                    "Coverage Outcome",
+                    options=cov_states,
+                    index=cur_cov_idx,
+                    key=f"cov_state_sel_{v_id}_{sel_src_id}",
+                )
+                c_url1, c_url2 = st.columns(2)
+                with c_url1:
+                    cand_urls = st.number_input(
+                        "Candidate URLs Found",
+                        min_value=0,
+                        value=int(cur_rec.candidate_urls_count),
+                        step=1,
+                        key=f"cov_cand_{v_id}_{sel_src_id}",
+                    )
+                with c_url2:
+                    rev_urls = st.number_input(
+                        "URLs Reviewed",
+                        min_value=0,
+                        value=int(cur_rec.reviewed_urls_count),
+                        step=1,
+                        key=f"cov_rev_{v_id}_{sel_src_id}",
+                    )
+                prod_ev = st.checkbox(
+                    "Produced New Qualifying Evidence",
+                    value=bool(cur_rec.produced_new_evidence),
+                    key=f"cov_prod_{v_id}_{sel_src_id}",
+                )
+                ev_refs_raw = st.text_input(
+                    "Evidence References (URLs or IDs, comma-separated)",
+                    value=", ".join(cur_rec.evidence_references),
+                    placeholder="https://vendor.com/trust, EV-001",
+                    key=f"cov_refs_{v_id}_{sel_src_id}",
+                )
+                cov_notes = st.text_input(
+                    "Analyst Coverage Notes",
+                    value=cur_rec.notes,
+                    placeholder="Reason if unavailable, or summary of findings...",
+                    key=f"cov_notes_{v_id}_{sel_src_id}",
+                )
+                if st.button("Save Source Coverage Outcome", type="primary", key=f"btn_save_cov_{v_id}", use_container_width=True):
+                    parsed_refs = [x.strip() for x in ev_refs_raw.split(",") if x.strip()]
+                    tracker = OSINTCoverageTracker(plan.coverage_records)
+                    tracker.update_source_status(
+                        source_id=sel_src_id,
+                        new_state=CoverageState(new_cov_state),
+                        candidate_urls=int(cand_urls),
+                        reviewed_urls=int(rev_urls),
+                        produced_new_evidence=bool(prod_ev),
+                        evidence_references=parsed_refs,
+                        notes=cov_notes.strip(),
+                    )
+                    tracker.sync_plan_stop_status(plan)
+                    st.rerun()
+
             with st.expander(f"View All {len(plan.coverage_records)} Planned Source Classes", expanded=True):
                 for s_id, s_rec in plan.coverage_records.items():
                     s_def = planner.source_registry.get_source(s_id)
                     grade = s_def.default_evidence_grade if s_def else "C"
                     rel = s_def.reliability_rating if s_def else 3
-                    req_badge = "<span style='color:#dc2626;font-weight:700'>REQUIRED</span>" if s_rec.is_required else "<span style='color:#64748b'>CORROBORATIVE</span>"
+                    nature = s_def.source_nature if s_def else "HYBRID"
+                    if s_rec.is_required:
+                        req_badge = "<span style='color:#dc2626;font-weight:700'>REQUIRED</span>"
+                    elif s_rec.is_conditional:
+                        req_badge = "<span style='color:#d97706;font-weight:700'>CONDITIONAL</span>"
+                    else:
+                        req_badge = "<span style='color:#64748b'>CORROBORATIVE</span>"
+
+                    state_color = (
+                        "#16a34a" if s_rec.status in (CoverageState.REVIEWED_EVIDENCE_RECORDED, CoverageState.REVIEWED_NO_EVIDENCE)
+                        else "#d97706" if s_rec.status in (CoverageState.SEARCH_ATTEMPTED, CoverageState.REQUIRES_MANUAL_REVIEW)
+                        else "#dc2626" if s_rec.status == CoverageState.UNAVAILABLE
+                        else "#64748b"
+                    )
+                    cond_line = f"<div style='color:#b45309;font-size:0.68rem;margin-top:0.15rem'><em>Trigger: {s_rec.condition}</em></div>" if s_rec.condition else ""
+                    refs_line = f"<div style='color:#15803d;font-size:0.68rem;margin-top:0.15rem'><strong>Evidence Refs:</strong> {', '.join(s_rec.evidence_references)}</div>" if s_rec.evidence_references else ""
+                    notes_line = f"<div style='color:#334155;font-size:0.68rem;margin-top:0.15rem'><strong>Notes:</strong> {s_rec.notes}</div>" if s_rec.notes else ""
                     st.markdown(f"""
                     <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:6px;padding:0.55rem 0.75rem;margin-bottom:0.4rem;font-size:0.75rem">
                         <div style="display:flex;justify-content:space-between;align-items:center">
                             <strong>[{s_id}] {s_rec.source_name}</strong>
-                            <span style="font-size:0.68rem">Grade {grade} (★{rel}) &nbsp;·&nbsp; {req_badge}</span>
+                            <span style="font-size:0.68rem">Grade {grade} (★{rel}) &nbsp;·&nbsp; {req_badge} &nbsp;·&nbsp; <span style="color:{state_color};font-weight:700">{s_rec.status.value}</span></span>
                         </div>
                         <div style="color:#64748b;font-size:0.7rem;margin-top:0.2rem">
-                            Tools: {', '.join(s_def.discovery_resources[:4]) if s_def else 'General Search'}
+                            Nature: <code>{nature}</code> &nbsp;·&nbsp; Tools: {', '.join(s_def.discovery_resources[:4]) if s_def else 'General Search'}
                         </div>
+                        {cond_line}{refs_line}{notes_line}
                     </div>
                     """, unsafe_allow_html=True)
 

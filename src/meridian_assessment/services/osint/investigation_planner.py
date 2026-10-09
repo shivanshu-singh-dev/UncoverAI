@@ -277,13 +277,46 @@ class OSINTInvestigationPlanner:
                 for res_id in s_def.discovery_resources:
                     associated_resources.add(res_id)
 
-        # 5. Generate Deduplicated Queries
+        # 5. Generate Deduplicated Queries (preserving execution metadata if replanning)
         planned_queries = self.query_planner.generate_queries_for_vendor(
             vendor_id=vendor_id,
             vendor_name=vendor_name,
             domain=domain,
             active_source_classes=active_source_classes,
             product_name=svc_prod,
+        )
+        if existing_plan and existing_plan.planned_queries:
+            prev_by_rendered = {
+                pq.rendered_query.lower(): pq for pq in existing_plan.planned_queries
+            }
+            seen_rendered: set[str] = set()
+            for pq in planned_queries:
+                key = pq.rendered_query.lower()
+                seen_rendered.add(key)
+                prev_pq = prev_by_rendered.get(key)
+                if prev_pq is not None:
+                    pq.execution_status = prev_pq.execution_status
+                    pq.provider = prev_pq.provider
+                    pq.executed_at = prev_pq.executed_at
+                    pq.result_count = prev_pq.result_count
+                    pq.attempts = prev_pq.attempts
+                    pq.error_message = prev_pq.error_message
+            for prev_pq in existing_plan.planned_queries:
+                if (
+                    prev_pq.rendered_query.lower() not in seen_rendered
+                    and prev_pq.execution_status.value != "PLANNED"
+                ):
+                    planned_queries.append(prev_pq)
+
+        preserved_candidate_urls = (
+            [c.model_copy(deep=True) for c in existing_plan.candidate_urls]
+            if existing_plan and existing_plan.candidate_urls
+            else []
+        )
+        preserved_collection_summary = (
+            dict(existing_plan.last_collection_summary)
+            if existing_plan and existing_plan.last_collection_summary
+            else {}
         )
 
         # 6. Configure POC Timebox Budget deterministically from depth profile (preserving timer history if replanning)
@@ -406,6 +439,8 @@ class OSINTInvestigationPlanner:
             coverage_records=coverage_records,
             associated_discovery_resources=sorted(list(associated_resources)),
             planned_queries=planned_queries,
+            candidate_urls=preserved_candidate_urls,
+            last_collection_summary=preserved_collection_summary,
             timebox=timebox,
             stopping_rule_id=stop_rule_id,
             stopping_rule_description=stop_rule_desc,

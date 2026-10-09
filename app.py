@@ -38,8 +38,10 @@ from meridian_assessment.ingestion.meridian_csv_loader import MeridianCSVVendorL
 from meridian_assessment.services.osint import (
     OSINTCoverageTracker,
     OSINTInvestigationPlanner,
+    OSINTSearchCollector,
     OSINTSourceRegistry,
     StopConditionEvaluator,
+    build_search_backend_from_env,
 )
 from meridian_assessment.models.osint_plan import (
     AssessmentStopStatus,
@@ -47,6 +49,7 @@ from meridian_assessment.models.osint_plan import (
     CoverageState,
     GateStatus,
     OSINTInvestigationPlan,
+    SearchExecutionStatus,
     TimerState,
 )
 
@@ -1426,10 +1429,51 @@ with tab_osint:
                     </div>
                     """, unsafe_allow_html=True)
 
-            # 2. Targeted Search Queries
-            st.markdown('<div class="sec-header"><span>4. Generated Search Queries (Deduplicated)</span></div>', unsafe_allow_html=True)
-            st.caption(f"{len(plan.planned_queries)} queries generated. Status: PLANNED (Ready for search adapter execution).")
-            
+            # 2. Targeted Search Queries & Bounded Search Execution
+            st.markdown('<div class="sec-header"><span>4. Generated Search Queries &amp; Bounded Search Execution</span></div>', unsafe_allow_html=True)
+
+            q_planned = sum(1 for q in plan.planned_queries if q.execution_status == SearchExecutionStatus.PLANNED)
+            q_executed = sum(1 for q in plan.planned_queries if q.execution_status == SearchExecutionStatus.EXECUTED)
+            q_failed = sum(1 for q in plan.planned_queries if q.execution_status == SearchExecutionStatus.FAILED)
+            q_unavail = sum(1 for q in plan.planned_queries if q.execution_status == SearchExecutionStatus.UNAVAILABLE)
+
+            active_backend = build_search_backend_from_env()
+            backend_ok, backend_msg = active_backend.is_configured()
+
+            st.caption(
+                f"{len(plan.planned_queries)} queries total · "
+                f"PLANNED: {q_planned} · EXECUTED: {q_executed} · FAILED: {q_failed} · UNAVAILABLE: {q_unavail} · "
+                f"Candidate URLs: {len(plan.candidate_urls)} | "
+                f"Backend ({active_backend.provider_name}): {'Ready' if backend_ok else 'Unconfigured'}"
+            )
+
+            exec_col1, exec_col2 = st.columns([6, 4])
+            with exec_col1:
+                retry_failed_opt = st.checkbox(
+                    "Retry FAILED / UNAVAILABLE queries",
+                    value=False,
+                    key=f"chk_retry_search_{v_id}",
+                )
+            with exec_col2:
+                if st.button(
+                    "🔍 Execute Planned Searches",
+                    key=f"btn_exec_searches_{v_id}",
+                    use_container_width=True,
+                    type="primary",
+                    disabled=(q_planned == 0 and not (retry_failed_opt and (q_failed > 0 or q_unavail > 0))),
+                ):
+                    collector = OSINTSearchCollector(backend=active_backend)
+                    collector.execute_planned_queries(
+                        plan,
+                        retry_failed=retry_failed_opt,
+                        retry_unavailable=retry_failed_opt,
+                        persist=True,
+                    )
+                    st.rerun()
+
+            if not backend_ok and q_unavail > 0:
+                st.warning(backend_msg)
+
             query_search_term = st.text_input("Filter Queries", placeholder="Filter by keyword (e.g. Bedrock, DPA, LLM)...", label_visibility="collapsed")
             
             displayed_queries = plan.planned_queries
@@ -1441,20 +1485,68 @@ with tab_osint:
 
             with st.container(height=320):
                 for q in displayed_queries:
+                    q_status_color = (
+                        "#16a34a" if q.execution_status == SearchExecutionStatus.EXECUTED
+                        else "#dc2626" if q.execution_status == SearchExecutionStatus.FAILED
+                        else "#d97706" if q.execution_status == SearchExecutionStatus.UNAVAILABLE
+                        else "#64748b"
+                    )
+                    exec_meta_parts = []
+                    if q.provider:
+                        exec_meta_parts.append(f"Provider: <code>{q.provider}</code>")
+                    if q.executed_at:
+                        exec_meta_parts.append(f"Results: <strong>{q.result_count}</strong>")
+                        exec_meta_parts.append(f"At: {q.executed_at[:19].replace('T', ' ')} UTC")
+                    exec_meta_line = (
+                        f"<div style='font-size:0.66rem;color:#475569;margin-top:0.2rem'>{' &nbsp;·&nbsp; '.join(exec_meta_parts)}</div>"
+                        if exec_meta_parts else ""
+                    )
+                    err_line = (
+                        f"<div style='font-size:0.66rem;color:#dc2626;margin-top:0.15rem'><strong>Error:</strong> {q.error_message}</div>"
+                        if q.error_message else ""
+                    )
                     st.markdown(f"""
                     <div class="query-card">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.2rem">
                             <span style="font-size:0.68rem;font-weight:700;color:#2563eb">[{', '.join(q.source_classes)}]</span>
-                            <span style="font-size:0.65rem;color:#64748b">STATUS: {q.execution_status.value}</span>
+                            <span style="font-size:0.65rem;font-weight:700;color:{q_status_color}">STATUS: {q.execution_status.value}</span>
                         </div>
                         <code>{q.rendered_query}</code>
                         <div style="font-size:0.68rem;color:#64748b;margin-top:0.25rem">
                             Targets: {', '.join(q.expected_evidence_targets[:2])}
                         </div>
+                        {exec_meta_line}{err_line}
                     </div>
                     """, unsafe_allow_html=True)
 
-            # 3. Export Plan Action Button
+            # 3. Collected Candidate URLs (Unreviewed Candidates)
+            with st.expander(f"🔗 Collected Candidate URLs ({len(plan.candidate_urls)} deduplicated — Pending Analyst Review)", expanded=bool(plan.candidate_urls)):
+                if not plan.candidate_urls:
+                    st.caption("No candidate URLs collected yet. Click '🔍 Execute Planned Searches' with a configured search provider to collect candidate URLs.")
+                else:
+                    for cand in plan.candidate_urls:
+                        src_badges = ", ".join(cand.source_classes or ([cand.source_class] if cand.source_class else []))
+                        q_badges = ", ".join(cand.query_ids or ([cand.query_id] if cand.query_id else []))
+                        rank_str = f"#{cand.rank}" if cand.rank is not None else "N/A"
+                        st.markdown(f"""
+                        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:6px;padding:0.5rem 0.7rem;margin-bottom:0.35rem;font-size:0.73rem">
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <strong>{rank_str} · {cand.title or cand.url}</strong>
+                                <span style="font-size:0.65rem;color:#2563eb;font-weight:700">[{src_badges}] · {cand.triage_status.value}</span>
+                            </div>
+                            <div style="font-size:0.69rem;color:#0f172a;word-break:break-all;margin-top:0.15rem">
+                                <code>{cand.url}</code>
+                            </div>
+                            <div style="font-size:0.68rem;color:#475569;margin-top:0.15rem">
+                                {cand.snippet or '<em>No snippet provided</em>'}
+                            </div>
+                            <div style="font-size:0.64rem;color:#64748b;margin-top:0.2rem">
+                                Queries: <code>{q_badges}</code> &nbsp;·&nbsp; Provider: <code>{cand.provider or 'N/A'}</code> &nbsp;·&nbsp; Retrieved: {(cand.retrieved_at or '')[:19].replace('T', ' ')}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            # 4. Export Plan Action Button
             plan_json = json.dumps(plan.model_dump(mode="json"), indent=2)
             st.download_button(
                 "⬇ Export Investigation Plan (JSON)",

@@ -2,7 +2,7 @@
 
 from enum import StrEnum
 from typing import Any, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CoverageState(StrEnum):
@@ -22,6 +22,7 @@ class SearchExecutionStatus(StrEnum):
     PLANNED = "PLANNED"
     EXECUTED = "EXECUTED"
     FAILED = "FAILED"
+    UNAVAILABLE = "UNAVAILABLE"
     SKIPPED = "SKIPPED"
 
 
@@ -96,8 +97,7 @@ class DiscoveryResource(BaseModel):
 
 
 class PlannedQuery(BaseModel):
-    """A vendor-specific query generated from approved templates."""
-    model_config = ConfigDict(frozen=True)
+    """A vendor-specific query generated from approved templates with execution metadata."""
 
     query_id: str
     vendor_id: str
@@ -109,22 +109,55 @@ class PlannedQuery(BaseModel):
     expected_evidence_targets: list[str] = Field(default_factory=list)
     date_constraints: Optional[str] = None
     execution_status: SearchExecutionStatus = SearchExecutionStatus.PLANNED
+    provider: Optional[str] = None
+    executed_at: Optional[str] = None
+    result_count: int = 0
+    attempts: int = 0
+    error_message: Optional[str] = None
 
 
 class CandidateURL(BaseModel):
     """Interface model representing a candidate URL found during OSINT collection."""
-    model_config = ConfigDict(frozen=True)
 
     candidate_id: str
     url: str
+    raw_url: Optional[str] = None
     vendor_id: str
-    source_class: str
-    discovery_resource: str
-    query_id: str
+    source_class: str = ""
+    source_classes: list[str] = Field(default_factory=list)
+    discovery_resource: str = ""
+    discovery_resources: list[str] = Field(default_factory=list)
+    query_id: str = ""
+    query_ids: list[str] = Field(default_factory=list)
+    executed_queries: list[str] = Field(default_factory=list)
     triage_status: URLTriageStatus = URLTriageStatus.PENDING
     title: Optional[str] = None
     snippet: Optional[str] = None
+    rank: Optional[int] = None
+    retrieved_at: Optional[str] = None
+    provider: Optional[str] = None
     notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _sync_provenance_lists(self) -> "CandidateURL":
+        if self.source_class and self.source_class not in self.source_classes:
+            self.source_classes = [self.source_class, *self.source_classes]
+        elif not self.source_class and self.source_classes:
+            self.source_class = self.source_classes[0]
+
+        if self.discovery_resource and self.discovery_resource not in self.discovery_resources:
+            self.discovery_resources = [self.discovery_resource, *self.discovery_resources]
+        elif not self.discovery_resource and self.discovery_resources:
+            self.discovery_resource = self.discovery_resources[0]
+
+        if self.query_id and self.query_id not in self.query_ids:
+            self.query_ids = [self.query_id, *self.query_ids]
+        elif not self.query_id and self.query_ids:
+            self.query_id = self.query_ids[0]
+
+        if self.raw_url is None:
+            self.raw_url = self.url
+        return self
 
 
 class SourceCoverageRecord(BaseModel):
@@ -204,10 +237,12 @@ class OSINTInvestigationPlan(BaseModel):
     corroborative_source_classes: list[str] = Field(default_factory=list)
     conditional_source_classes: list[dict[str, str]] = Field(default_factory=list)
 
-    # Coverage & queries
+    # Coverage, queries & collected candidate URLs
     coverage_records: dict[str, SourceCoverageRecord] = Field(default_factory=dict)
     associated_discovery_resources: list[str] = Field(default_factory=list)
     planned_queries: list[PlannedQuery] = Field(default_factory=list)
+    candidate_urls: list[CandidateURL] = Field(default_factory=list)
+    last_collection_summary: dict[str, Any] = Field(default_factory=dict)
 
     # Timebox & stopping condition
     timebox: TimeboxBudget

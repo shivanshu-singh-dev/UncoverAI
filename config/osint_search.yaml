@@ -1,0 +1,49 @@
+# Meridian OSINT Phase 1 — Bounded Search Execution & Candidate-URL Collection Configuration
+# Defines execution bounds, supported API search backends, and conservative URL canonicalization rules.
+
+execution:
+  default_provider: "google_cse"
+  timeout_seconds: 10.0
+  max_results_per_query: 10
+  max_retries: 2
+  retry_backoff_seconds: 0.5
+  max_queries_per_run: 50
+
+providers:
+  google_cse:
+    name: "Google Custom Search JSON API"
+    endpoint: "https://www.googleapis.com/customsearch/v1"
+    env_vars:
+      api_key: "MERIDIAN_GOOGLE_API_KEY"
+      cx: "MERIDIAN_GOOGLE_CSE_ID"
+  brave:
+    name: "Brave Web Search API"
+    endpoint: "https://api.search.brave.com/res/v1/web/search"
+    env_vars:
+      api_key: "MERIDIAN_BRAVE_API_KEY"
+  bing:
+    name: "Bing Web Search API"
+    endpoint: "https://api.bing.microsoft.com/v7.0/search"
+    env_vars:
+      api_key: "MERIDIAN_BING_API_KEY"
+  serpapi:
+    name: "SerpAPI Google Search"
+    endpoint: "https://serpapi.com/search.json"
+    env_vars:
+      api_key: "MERIDIAN_SERPAPI_KEY"
+
+canonicalization:
+  strip_fragments: true
+  strip_default_ports: true
+  strip_tracking_params:
+    - "utm_source"
+    - "utm_medium"
+    - "utm_campaign"
+    - "utm_term"
+    - "utm_content"
+    - "utm_id"
+    - "gclid"
+    - "fbclid"
+    - "msclkid"
+    - "mc_cid"
+    - "mc_eid"

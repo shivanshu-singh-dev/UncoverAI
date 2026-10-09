@@ -270,9 +270,9 @@ templates:
     id: "q_gh_langchain"
     category: "Code and repository queries"
     template: 'site:github.com "{VENDOR}" langchain'
-    source_class: "S4"
+    source_class: "S9"
     discovery_resource: "github"
-    investigative_objective: "Find repository use of LangChain, LlamaIndex, or agentic frameworks."
+    investigative_objective: "Find repository use of LangChain, LlamaIndex, or agentic framework dependencies."
     expected_evidence_targets: ["Framework dependencies (LangChain, LlamaIndex)"]
 
   # Job and discussion queries

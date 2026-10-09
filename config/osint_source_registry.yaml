@@ -5,8 +5,8 @@
 sources:
   S1:
     source_id: "S1"
-    name: "Trust centers and contractual disclosures"
-    description: "Trust centers, subprocessor registers, Data Processing Agreements (DPAs), and AI policies/addenda."
+    name: "Trust centers, subprocessor registers, DPAs, and AI policies"
+    description: "Trust centers, subprocessor registers, DPAs, and AI policies."
     default_evidence_grade: "A"
     reliability_rating: 5
     is_corroborative: false
@@ -19,10 +19,14 @@ sources:
       - "Third-party and subprocessor processing disclosures"
       - "Hosting regions and data transfer safeguards"
     discovery_resources:
-      - "vendor_trust_center"
-      - "vendor_dpa"
-      - "subprocessor_register"
       - "google_search"
+      - "google_advanced_search"
+      - "bing_search"
+      - "wayback_machine"
+      - "archive_today"
+      - "perma_cc"
+      - "hunchly"
+      - "singlefile"
     query_template_ids:
       - "q_subprocessors"
       - "q_dpa"
@@ -33,51 +37,64 @@ sources:
 
   S2:
     source_id: "S2"
-    name: "Product and technical documentation"
-    description: "Product documentation, API references, admin guides, release notes, SDKs, and public repos."
+    name: "Product documentation, API references, admin guides, release notes, SDKs, and public repositories"
+    description: "Product documentation, API references, admin guides, release notes, SDKs, and public repositories."
     default_evidence_grade: "A"
     reliability_rating: 5
     is_corroborative: false
     source_nature: "HYBRID"
-    discovery_mode: "Dynamic vendor developer documentation portals combined with fixed GitHub/GitLab repository discovery"
+    discovery_mode: "Dynamic vendor documentation and API portals combined with public SDK and repository platforms (GitHub, GitLab, npm, PyPI, Maven Central)"
     evidence_targets:
-      - "Direct AI feature specifications"
+      - "Direct AI feature specifications and release notes"
       - "Underlying model family and API endpoint references"
       - "Input payload formats and generated output types"
       - "Admin opt-in/opt-out configuration toggles"
-      - "Product-specific AI pipeline implementations"
+      - "Published vendor SDKs and public source repositories"
     discovery_resources:
-      - "developer_portal"
-      - "api_reference"
-      - "github"
       - "google_search"
+      - "bing_search"
+      - "github"
+      - "gitlab"
+      - "github_code_search"
+      - "npm"
+      - "pypi"
+      - "maven_central"
+      - "hunchly"
+      - "singlefile"
     query_template_ids:
-      - "q_general_ai"
       - "q_general_llm"
+      - "q_openai"
+      - "q_anthropic"
+      - "q_claude"
       - "q_site_ai"
       - "q_site_llm"
+      - "q_site_openai"
+      - "q_site_anthropic"
       - "q_site_embeddings"
       - "q_site_rag"
 
   S3:
     source_id: "S3"
-    name: "Terms, privacy and security documents"
-    description: "Terms of service, privacy statements, master subscription agreements, and security whitepapers."
+    name: "Terms, privacy policies, and security whitepapers"
+    description: "Terms, privacy policies, and security whitepapers."
     default_evidence_grade: "A/B"
     reliability_rating: 4
     is_corroborative: false
     source_nature: "VENDOR_SPECIFIC"
-    discovery_mode: "Dynamic vendor-specific legal, privacy, and terms portal discovery"
+    discovery_mode: "Dynamic vendor-specific legal, privacy, terms, and security whitepaper discovery"
     evidence_targets:
       - "Customer data training and fine-tuning rights"
       - "Prompt and output ownership terms"
       - "Data retention windows for telemetry/inference"
-      - "Contractual security commitments"
+      - "Contractual and architectural security whitepaper commitments"
     discovery_resources:
-      - "terms_portal"
-      - "privacy_portal"
       - "google_search"
+      - "google_advanced_search"
       - "wayback_machine"
+      - "archive_today"
+      - "perma_cc"
+      - "hunchly"
+      - "singlefile"
     query_template_ids:
       - "q_not_used_to_train"
       - "q_site_privacy_ai"
@@ -85,48 +102,47 @@ sources:
 
   S4:
     source_id: "S4"
-    name: "Engineering and technical publications"
-    description: "Engineering blogs, technical conference talks, open-source architectures, and model cards."
+    name: "Engineering blogs, technical talks, open-source technical publications, and model cards"
+    description: "Engineering blogs, technical talks, open-source technical publications, and model cards."
     default_evidence_grade: "A/B"
     reliability_rating: 4
     is_corroborative: false
     source_nature: "HYBRID"
-    discovery_mode: "Dynamic vendor engineering blogs combined with fixed platforms (GitHub, Hugging Face, developer forums)"
+    discovery_mode: "Dynamic vendor engineering blogs combined with technical talk, model-card, and open-source publication platforms (YouTube, Hugging Face, GitHub, GitLab)"
     evidence_targets:
-      - "Technical architecture and AI tech stack"
-      - "Model frameworks (PyTorch, TensorFlow, vLLM)"
-      - "RAG pipeline implementation and vector databases"
-      - "Embedding generation and token lifecycle"
+      - "Engineering blog posts on AI architecture and model stack"
+      - "Technical conference talks and engineering presentations"
+      - "Open-source technical publications and RAG/vector pipeline designs"
+      - "Published model cards and dataset documentation"
     discovery_resources:
-      - "engineering_blog"
-      - "youtube_tech_talks"
+      - "google_search"
+      - "youtube"
       - "hugging_face"
       - "github"
-      - "google_search"
+      - "gitlab"
     query_template_ids:
       - "q_fine_tuning"
       - "q_embeddings"
       - "q_rag"
-      - "q_gh_langchain"
-      - "q_reddit_ai"
 
   S5:
     source_id: "S5"
-    name: "Filings and formal disclosures"
-    description: "SEC annual/quarterly reports (10-K, 10-Q), statutory regulatory filings, certifications (SOC 2, ISO 42001)."
+    name: "Filings, annual reports, certifications, and formal disclosures"
+    description: "Filings, annual reports, certifications, and formal disclosures."
     default_evidence_grade: "B"
     reliability_rating: 4
     is_corroborative: false
     source_nature: "FIXED_PLATFORM"
-    discovery_mode: "Fixed regulatory registries and financial news outlets (SEC EDGAR, Companies House, MCA)"
+    discovery_mode: "Statutory corporate registries and formal disclosure indexes (SEC EDGAR, UK Companies House, India MCA, Google Advanced Search)"
     evidence_targets:
-      - "Publicly disclosed material AI investment and deployment"
-      - "AI governance and risk management disclosures"
+      - "Publicly disclosed material AI investment and deployment in 10-K/10-Q/annual reports"
+      - "Formal certifications (SOC 2, ISO/IEC 42001, ISO 27001) and regulatory disclosures"
       - "Material third-party AI provider dependencies"
     discovery_resources:
       - "sec_edgar"
       - "companies_house"
       - "mca_india"
+      - "google_advanced_search"
       - "google_news"
     query_template_ids:
       - "q_general_ai"
@@ -135,13 +151,13 @@ sources:
 
   S6:
     source_id: "S6"
-    name: "Technical hiring signals"
-    description: "Technical job postings, careers portals, LinkedIn Jobs, Greenhouse, Lever, and Indeed postings."
+    name: "Technical job postings and hiring signals"
+    description: "Technical job postings and hiring signals."
     default_evidence_grade: "B"
     reliability_rating: 3
     is_corroborative: false
     source_nature: "FIXED_PLATFORM"
-    discovery_mode: "Fixed job boards (LinkedIn Jobs, Indeed, Greenhouse, Lever) and vendor careers pages"
+    discovery_mode: "Fixed job boards, ATS portals, and hiring platforms (LinkedIn Jobs, LinkedIn, Indeed, Greenhouse, Lever)"
     evidence_targets:
       - "Production AI/ML and LLM engineering roles"
       - "Model provider SDK experience requirements (OpenAI, Anthropic, Bedrock)"
@@ -149,9 +165,11 @@ sources:
       - "Product-specific AI development timelines"
     discovery_resources:
       - "linkedin_jobs"
+      - "linkedin"
       - "indeed"
       - "greenhouse"
       - "lever"
+      - "singlefile"
     query_template_ids:
       - "q_jobs_mle"
       - "q_jobs_llm"
@@ -161,21 +179,22 @@ sources:
 
   S7:
     source_id: "S7"
-    name: "Executive and investor-relations sources"
-    description: "Earnings call transcripts, investor presentations, executive interviews, and official press briefings."
+    name: "Executive statements and investor relations"
+    description: "Executive statements and investor relations."
     default_evidence_grade: "B"
     reliability_rating: 3
     is_corroborative: false
     source_nature: "FIXED_PLATFORM"
-    discovery_mode: "Fixed news, investor, and media platforms (Google News, Crunchbase, YouTube)"
+    discovery_mode: "Investor relations, executive media, and corporate intelligence platforms (Crunchbase, Google News, YouTube, LinkedIn)"
     evidence_targets:
-      - "Executive-level claims of AI deployment scale"
-      - "Named workflow and product-line AI implementations"
+      - "Executive-level statements on AI deployment scale"
+      - "Earnings call transcripts and investor relations presentations"
       - "Strategic enterprise partnerships with AI hyperscalers"
     discovery_resources:
       - "crunchbase"
       - "google_news"
       - "youtube"
+      - "linkedin"
     query_template_ids:
       - "q_general_genai"
       - "q_openai"
@@ -185,51 +204,59 @@ sources:
   S8:
     source_id: "S8"
     name: "Marketplace and partner listings"
-    description: "AWS/Azure/GCP cloud marketplaces, technology partner networks, and integration catalogs."
+    description: "Marketplace and partner listings."
     default_evidence_grade: "B/C"
     reliability_rating: 3
     is_corroborative: false
     source_nature: "FIXED_PLATFORM"
-    discovery_mode: "Fixed cloud marketplaces and partner catalogs"
+    discovery_mode: "Cloud marketplaces, partner directories, and ecosystem catalogs (Google Search, Crunchbase)"
     evidence_targets:
-      - "Third-party AI ecosystem integrations"
-      - "Hyperscaler marketplace offerings"
-      - "Partner announcements with implementation detail"
+      - "AWS, Azure, and GCP cloud marketplace listings"
+      - "Third-party AI ecosystem and technology partner integrations"
+      - "Partner catalog listings with technical integration scope"
     discovery_resources:
-      - "cloud_marketplaces"
       - "google_search"
+      - "crunchbase"
     query_template_ids:
       - "q_bedrock"
       - "q_vertex"
       - "q_azure_openai"
+      - "q_site_bedrock"
 
   S9:
     source_id: "S9"
     name: "Passive technical fingerprints"
-    description: "Publicly observable technical hints, package manifests, DNS, subdomains, and frontend bundles."
+    description: "Passive technical fingerprints, including package dependency manifests, container image layers, client-side bundle inclusions, DNS/subdomain hints, and code-level SDK indicators."
     default_evidence_grade: "C"
     reliability_rating: 2
     is_corroborative: true
     source_nature: "FIXED_PLATFORM"
-    discovery_mode: "Fixed code and package registries (GitHub Code Search, npm, PyPI, Docker Hub)"
+    discovery_mode: "Code search, package dependency registries, container registries, and passive OSINT toolkits (GitHub Code Search, GitHub, GitLab, npm, PyPI, Maven Central, Docker Hub, Hugging Face, OSINT Framework, Bellingcat Toolkit)"
     evidence_targets:
-      - "Public client-side AI SDK bundle inclusions"
-      - "Public AI API endpoint DNS / CNAME references"
-      - "Public repository package dependencies"
+      - "Public client-side AI SDK bundle inclusions and API endpoint references"
+      - "Package dependency manifests (package.json, requirements.txt, pom.xml) importing AI SDKs"
+      - "Container image layers and runtime environment indicators"
     discovery_resources:
       - "github_code_search"
+      - "github"
+      - "gitlab"
       - "npm"
       - "pypi"
+      - "maven_central"
       - "docker_hub"
+      - "hugging_face"
+      - "osint_framework"
+      - "bellingcat_toolkit"
     query_template_ids:
       - "q_gh_openai"
       - "q_gh_anthropic"
       - "q_gh_bedrock"
+      - "q_gh_langchain"
 
   S10:
     source_id: "S10"
     name: "Patents and research papers"
-    description: "Google Patents, Google Scholar, arXiv, and institutional research publications."
+    description: "Patents and research papers."
     default_evidence_grade: "C"
     reliability_rating: 2
     is_corroborative: true
@@ -238,7 +265,7 @@ sources:
     evidence_targets:
       - "Patented AI algorithmic architectures"
       - "Author affiliations indicating vendor R&D capabilities"
-      - "Exploratory AI research (distinguished from production)"
+      - "Exploratory AI research papers (distinguished from production deployment)"
     discovery_resources:
       - "google_patents"
       - "google_scholar"
@@ -250,21 +277,26 @@ sources:
 
   S11:
     source_id: "S11"
-    name: "Third-party reporting"
-    description: "Industry news reporting, technical journalism, developer forums, and independent security research analysis."
+    name: "Third-party reporting and news"
+    description: "Third-party reporting and news, including independent journalism, security research analysis, and external community discussions."
     default_evidence_grade: "C"
     reliability_rating: 2
     is_corroborative: true
     source_nature: "FIXED_PLATFORM"
-    discovery_mode: "Fixed news outlets and developer forums (Google News, Reddit, Stack Overflow)"
+    discovery_mode: "News outlets, investigative toolkits, and third-party community forums (Google News, Google Search, Bing Search, DuckDuckGo, Reddit, Stack Overflow, Bellingcat Toolkit, archive.today)"
     evidence_targets:
-      - "Investigative reporting on vendor AI integrations"
-      - "Corroboration of primary-source findings"
-      - "Customer case studies published by AI providers"
+      - "Independent news and investigative reporting on vendor AI integrations"
+      - "External community and developer forum discussions (Reddit, Stack Overflow)"
+      - "Customer case studies published by third-party AI providers"
     discovery_resources:
       - "google_news"
+      - "google_search"
+      - "bing_search"
+      - "duckduckgo"
       - "reddit"
       - "stack_overflow"
+      - "bellingcat_toolkit"
+      - "archive_today"
     query_template_ids:
       - "q_general_ai"
       - "q_openai"
@@ -273,22 +305,24 @@ sources:
 
   S12:
     source_id: "S12"
-    name: "Marketing and press material"
-    description: "Marketing landing pages, high-level product announcement press releases, and promotional blogs."
+    name: "Marketing pages and press releases without substantive technical detail"
+    description: "Marketing pages and press releases without substantive technical detail."
     default_evidence_grade: "D"
     reliability_rating: 1
     is_corroborative: false
     source_nature: "VENDOR_SPECIFIC"
-    discovery_mode: "Dynamic vendor domain marketing pages and public press releases"
+    discovery_mode: "Dynamic vendor domain marketing pages and promotional press releases"
     evidence_targets:
-      - "Top-level claims of AI features and capabilities"
-      - "Product marketing names that guide targeted technical search"
-      - "Hyperscaler partnership press statements"
+      - "Top-level marketing claims of AI features and capabilities"
+      - "Product marketing names that guide targeted technical search in S2/S4"
+      - "High-level partnership press releases without technical architecture detail"
     discovery_resources:
       - "google_search"
+      - "bing_search"
       - "duckduckgo"
       - "wayback_machine"
     query_template_ids:
       - "q_general_ai"
+      - "q_general_ml"
       - "q_general_genai"
       - "q_site_ai"

@@ -49,6 +49,14 @@ class AssessmentStopStatus(StrEnum):
     TIMEBOX_EXHAUSTED_INCOMPLETE = "TIMEBOX_EXHAUSTED_INCOMPLETE"
 
 
+class TimerState(StrEnum):
+    """Lifecycle state of the active analyst effort timer."""
+    NOT_STARTED = "NOT_STARTED"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    STOPPED = "STOPPED"
+
+
 class CriticalityApprovalStatus(StrEnum):
     """Approval governance status of the criticality input used for planning."""
     APPROVED_BY_ANALYST = "APPROVED_BY_ANALYST"
@@ -151,13 +159,18 @@ class TimeboxBudget(BaseModel):
 
     Explicitly distinguishes:
       - planned_minutes: Configurable POC planning target (30 / 20 / 10 / 5 minutes)
-      - elapsed_wall_clock_minutes: Elapsed wall-clock duration
-      - actual_analyst_effort_minutes: Active hands-on analyst review effort
+      - elapsed_wall_clock_minutes: Elapsed wall-clock duration since first start
+      - actual_analyst_effort_minutes: Active hands-on analyst review effort (controlling limit)
     """
     planning_target: str
     planned_minutes: int = 10
     elapsed_wall_clock_minutes: float = 0.0
     actual_analyst_effort_minutes: float = 0.0
+    timer_state: TimerState = TimerState.NOT_STARTED
+    first_started_at: Optional[str] = None
+    active_segment_started_at: Optional[str] = None
+    last_updated_at: Optional[str] = None
+    accumulated_active_seconds: float = 0.0
     min_hours: float = 0.0
     max_hours: float = 0.0
     is_provisional: bool = True

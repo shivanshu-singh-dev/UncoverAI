@@ -47,6 +47,7 @@ from meridian_assessment.models.osint_plan import (
     CoverageState,
     GateStatus,
     OSINTInvestigationPlan,
+    TimerState,
 )
 
 # ─── Page config ──────────────────────────────────────────────────────────────
@@ -589,7 +590,7 @@ if "error_msg" not in st.session_state:
 if "human_overrides" not in st.session_state:
     st.session_state.human_overrides = {}
 if "osint_plans" not in st.session_state:
-    st.session_state.osint_plans = {}
+    st.session_state.osint_plans = OSINTInvestigationPlanner.load_all_saved_plans(pause_if_running=True)
 if "filter_tier" not in st.session_state:
     st.session_state.filter_tier = "All"
 if "show_raw_json" not in st.session_state:
@@ -978,7 +979,16 @@ with tab_assess:
                                         final_criticality=new_val,
                                         rationale=rationale_input.strip(),
                                     )
-                                    st.session_state.osint_plans.pop(r.vendor_id, None)
+                                    existing_plan = st.session_state.osint_plans.get(r.vendor_id)
+                                    if existing_plan is not None:
+                                        updated_plan = OSINTInvestigationPlanner().plan_investigation(
+                                            vendor=r,
+                                            criticality_input=r,
+                                            human_review=st.session_state.human_overrides[r.vendor_id],
+                                            existing_plan=existing_plan,
+                                        )
+                                        st.session_state.osint_plans[r.vendor_id] = updated_plan
+                                        OSINTInvestigationPlanner.save_plan_state(updated_plan)
                                     st.success(f"Overridden to {new_val} by analyst.")
                                     st.rerun()
                         else:
@@ -989,7 +999,16 @@ with tab_assess:
                                     final_criticality=r.proposed_criticality or "Low",
                                     rationale="Analyst confirmed proposed automated criticality.",
                                 )
-                                st.session_state.osint_plans.pop(r.vendor_id, None)
+                                existing_plan = st.session_state.osint_plans.get(r.vendor_id)
+                                if existing_plan is not None:
+                                    updated_plan = OSINTInvestigationPlanner().plan_investigation(
+                                        vendor=r,
+                                        criticality_input=r,
+                                        human_review=st.session_state.human_overrides[r.vendor_id],
+                                        existing_plan=existing_plan,
+                                    )
+                                    st.session_state.osint_plans[r.vendor_id] = updated_plan
+                                    OSINTInvestigationPlanner.save_plan_state(updated_plan)
                                 st.info("Automated criticality confirmed.")
                                 st.rerun()
 
@@ -1076,6 +1095,11 @@ with tab_osint:
         eff_crit, eff_status = planner.resolve_effective_criticality(osint_crit, osint_h_rev)
 
         cached_plan = st.session_state.osint_plans.get(v_id)
+        if cached_plan is None:
+            cached_plan = OSINTInvestigationPlanner.load_plan_state(v_id, pause_if_running=True)
+            if cached_plan is not None:
+                st.session_state.osint_plans[v_id] = cached_plan
+
         if (
             cached_plan is None
             or cached_plan.input_criticality != eff_crit
@@ -1085,10 +1109,15 @@ with tab_osint:
                 vendor=selected_vendor_obj,
                 criticality_input=osint_crit,
                 human_review=osint_h_rev,
+                existing_plan=cached_plan,
             )
             st.session_state.osint_plans[v_id] = cached_plan
+            OSINTInvestigationPlanner.save_plan_state(cached_plan)
 
         plan = cached_plan
+        if plan.timebox.timer_state == TimerState.RUNNING:
+            OSINTCoverageTracker.refresh_timer(plan)
+            OSINTInvestigationPlanner.save_plan_state(plan)
 
         # ── Executive Header ──
         approval_badge_color = "#16a34a" if plan.approval_status == CriticalityApprovalStatus.APPROVED_BY_ANALYST else "#d97706"
@@ -1112,7 +1141,7 @@ with tab_osint:
             <div class="detail-meta">
                 {pill(plan.input_criticality)}
                 <span class="detail-tag">OSINT Depth: <strong>{plan.selected_depth_profile}</strong></span>
-                <span class="detail-tag">POC Timebox: <strong>{plan.timebox.planning_target}</strong> (Wall: {plan.timebox.elapsed_wall_clock_minutes:.0f}m · Effort: {plan.timebox.actual_analyst_effort_minutes:.0f}m)</span>
+                <span class="detail-tag">POC Timebox: <strong>{plan.timebox.planning_target}</strong> (Effort: {plan.timebox.actual_analyst_effort_minutes:.1f}m · Wall: {plan.timebox.elapsed_wall_clock_minutes:.1f}m · {plan.timebox.timer_state.value})</span>
                 <span class="detail-tag">Reviewers: <strong>{'Analyst + 2nd Reviewer' if plan.reviewer_requirements.get('second_reviewer') else 'Primary Analyst'}</strong></span>
             </div>
         </div>
@@ -1139,7 +1168,7 @@ with tab_osint:
             <div class="stat-card low">
                 <div class="stat-label">POC Timebox</div>
                 <div class="stat-value">{plan.timebox.planned_minutes:.0f}m</div>
-                <div class="stat-sub">Effort: {plan.timebox.actual_analyst_effort_minutes:.0f}m · Wall: {plan.timebox.elapsed_wall_clock_minutes:.0f}m</div>
+                <div class="stat-sub">Effort: {plan.timebox.actual_analyst_effort_minutes:.1f}m · Wall: {plan.timebox.elapsed_wall_clock_minutes:.1f}m</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1176,13 +1205,53 @@ with tab_osint:
                 </div>
                 <div style="font-size:0.7rem;color:#64748b;border-top:1px solid #f1f5f9;padding-top:0.35rem">
                     <strong>Planned Timebox:</strong> {plan.timebox.planning_target} ({plan.timebox.planned_minutes:.0f} min) &nbsp;·&nbsp;
-                    <strong>Elapsed Wall-Clock:</strong> {plan.timebox.elapsed_wall_clock_minutes:.1f} min &nbsp;·&nbsp;
-                    <strong>Actual Analyst Effort:</strong> {plan.timebox.actual_analyst_effort_minutes:.1f} min
+                    <strong>Active Analyst Effort (Controlling):</strong> {plan.timebox.actual_analyst_effort_minutes:.2f} min &nbsp;·&nbsp;
+                    <strong>Elapsed Wall-Clock:</strong> {plan.timebox.elapsed_wall_clock_minutes:.2f} min &nbsp;·&nbsp;
+                    <strong>Timer State:</strong> <code>{plan.timebox.timer_state.value}</code>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
-            with st.expander("⏱️ Log Timebox & Analyst Effort", expanded=False):
+            # Active Timer Controls (Start / Pause / Resume / Finish)
+            tm_col1, tm_col2, tm_col3 = st.columns(3)
+            with tm_col1:
+                if plan.timebox.timer_state == TimerState.NOT_STARTED:
+                    if st.button("▶ Start Timer", key=f"btn_tm_start_{v_id}", use_container_width=True, type="primary"):
+                        OSINTCoverageTracker.start_timer(plan)
+                        OSINTInvestigationPlanner.save_plan_state(plan)
+                        st.rerun()
+                elif plan.timebox.timer_state in (TimerState.PAUSED, TimerState.STOPPED):
+                    if st.button("▶ Resume Timer", key=f"btn_tm_resume_{v_id}", use_container_width=True, type="primary"):
+                        OSINTCoverageTracker.resume_timer(plan)
+                        OSINTInvestigationPlanner.save_plan_state(plan)
+                        st.rerun()
+                else:
+                    if st.button("🔄 Refresh Elapsed", key=f"btn_tm_refresh_{v_id}", use_container_width=True):
+                        OSINTCoverageTracker.refresh_timer(plan)
+                        OSINTInvestigationPlanner.save_plan_state(plan)
+                        st.rerun()
+            with tm_col2:
+                if st.button(
+                    "⏸ Pause Timer",
+                    key=f"btn_tm_pause_{v_id}",
+                    use_container_width=True,
+                    disabled=(plan.timebox.timer_state != TimerState.RUNNING),
+                ):
+                    OSINTCoverageTracker.pause_timer(plan)
+                    OSINTInvestigationPlanner.save_plan_state(plan)
+                    st.rerun()
+            with tm_col3:
+                if st.button(
+                    "⏹ Finish Timer",
+                    key=f"btn_tm_stop_{v_id}",
+                    use_container_width=True,
+                    disabled=(plan.timebox.timer_state in (TimerState.NOT_STARTED, TimerState.STOPPED)),
+                ):
+                    OSINTCoverageTracker.stop_timer(plan)
+                    OSINTInvestigationPlanner.save_plan_state(plan)
+                    st.rerun()
+
+            with st.expander("⏱️ Manual Timebox & Effort Adjustment", expanded=False):
                 tb_c1, tb_c2 = st.columns(2)
                 with tb_c1:
                     new_wall_min = st.number_input(
@@ -1206,6 +1275,7 @@ with tab_osint:
                         elapsed_wall_clock_minutes=new_wall_min,
                         actual_analyst_effort_minutes=new_effort_min,
                     )
+                    OSINTInvestigationPlanner.save_plan_state(plan)
                     st.rerun()
 
             # 2. Downstream G1–G4 Investigation Checklist
@@ -1247,6 +1317,7 @@ with tab_osint:
                         gate_id=sel_gate_id,
                         new_status=GateStatus(new_gate_state),
                     )
+                    OSINTInvestigationPlanner.save_plan_state(plan)
                     st.rerun()
 
         with osint_right:
@@ -1317,6 +1388,7 @@ with tab_osint:
                         notes=cov_notes.strip(),
                     )
                     tracker.sync_plan_stop_status(plan)
+                    OSINTInvestigationPlanner.save_plan_state(plan)
                     st.rerun()
 
             with st.expander(f"View All {len(plan.coverage_records)} Planned Source Classes", expanded=True):

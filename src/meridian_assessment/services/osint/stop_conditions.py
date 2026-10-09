@@ -23,11 +23,11 @@ class StopConditionEvaluator:
 
     @staticmethod
     def is_timebox_exhausted(timebox: TimeboxBudget) -> bool:
-        """Determine whether the planned timebox has been reached or exceeded."""
-        if timebox.is_exhausted:
-            return True
+        """Determine whether the planned timebox has been reached or exceeded by active analyst effort.
 
-        # Check minute-based POC budget (planned_minutes vs elapsed or analyst effort)
+        Wall-clock time (including pauses) is tracked separately and does not itself consume the analyst effort budget.
+        """
+        # Check minute-based POC budget governed by active analyst effort
         legacy_extra_minutes = (
             (timebox.actual_analyst_time_hours * 60.0)
             + timebox.actual_automated_execution_time_minutes
@@ -36,17 +36,19 @@ class StopConditionEvaluator:
             + timebox.time_spent_resolving_ambiguous_minutes
             + timebox.time_spent_validating_minutes
         )
-        effective_effort_mins = max(timebox.actual_analyst_effort_minutes, legacy_extra_minutes)
-        effective_wall_mins = timebox.elapsed_wall_clock_minutes
+        effective_effort_mins = (
+            timebox.actual_analyst_effort_minutes
+            if timebox.actual_analyst_effort_minutes > 0
+            else legacy_extra_minutes
+        )
 
         if timebox.planned_minutes > 0:
-            if effective_effort_mins >= timebox.planned_minutes or effective_wall_mins >= timebox.planned_minutes:
-                return True
+            return effective_effort_mins >= timebox.planned_minutes
 
         if timebox.max_hours > 0 and (effective_effort_mins / 60.0) >= timebox.max_hours:
             return True
 
-        return False
+        return bool(timebox.is_exhausted)
 
     @staticmethod
     def evaluate(

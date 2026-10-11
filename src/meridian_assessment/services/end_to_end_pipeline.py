@@ -259,6 +259,35 @@ class MeridianEndToEndPipeline:
         else:
             resolved_sum_llm = None
 
+        from meridian_assessment.services.rag.chunker_retriever import SentenceTransformerEmbeddingProvider
+        from meridian_assessment.services.readiness_and_exports import _check_huggingface_model_cached_locally
+        import importlib.util
+
+        if embedding_provider is not None:
+            resolved_emb_provider: EmbeddingProvider = embedding_provider
+        elif (
+            self.model_router.config.enable_rag_embeddings
+            and importlib.util.find_spec("sentence_transformers") is not None
+            and _check_huggingface_model_cached_locally(self.model_router.config.embedding_model)
+        ):
+            resolved_emb_provider = SentenceTransformerEmbeddingProvider(
+                model_name=self.model_router.config.embedding_model,
+                auto_load=True,
+            )
+        else:
+            emb_reason = (
+                f"Embedding model '{self.model_router.config.embedding_model}' is disabled "
+                "(MERIDIAN_ENABLE_RAG_EMBEDDINGS=false); Level 5 runs deterministic 500-token chunking "
+                "and passes all extracted evidence directly to Level 6."
+                if not self.model_router.config.enable_rag_embeddings
+                else f"Embedding model '{self.model_router.config.embedding_model}' or 'sentence-transformers' is not installed/cached locally; "
+                "Level 5 runs deterministic 500-token chunking and passes all extracted evidence directly to Level 6."
+            )
+            resolved_emb_provider = UnconfiguredEmbeddingProvider(
+                model_name=self.model_router.config.embedding_model,
+                reason=emb_reason,
+            )
+
         self.triage_service = OSINTURLTriageService(llm_provider=resolved_triage_llm)
         self.fetch_adapter = fetch_adapter or DisabledOfflineFetchAdapter()
         self.evidence_repository = evidence_repository
@@ -267,7 +296,7 @@ class MeridianEndToEndPipeline:
             source_registry=self.investigation_planner.source_registry,
             artifact_dir=self.evidence_repository.artifact_dir if self.evidence_repository else None,
         )
-        self.rag_service = RAGChunkerAndRetriever(embedding_provider=embedding_provider)
+        self.rag_service = RAGChunkerAndRetriever(embedding_provider=resolved_emb_provider)
         self.classification_service = SignalClassificationService(llm_adapter=resolved_cls_llm)
         self.scoring_engine = scoring_engine or DeterministicRiskScoringEngine()
         self.risk_analyzer = AIRiskAnalyzer(summary_llm_adapter=resolved_sum_llm)
@@ -287,6 +316,7 @@ class MeridianEndToEndPipeline:
         analyst_gate_overrides: Optional[dict[str, tuple[str, str]]] = None,
         human_validations: Optional[Sequence[HumanValidationRecord]] = None,
         persist_to_repository: bool = True,
+        progress_callback: Optional[Any] = None,
     ) -> VendorEndToEndAssessmentReport:
         """Execute all 9 project levels in order and produce a complete `VendorEndToEndAssessmentReport`."""
         now_iso = _utc_now_iso()
@@ -294,11 +324,19 @@ class MeridianEndToEndPipeline:
         unavailable_integrations: list[str] = []
         limitations: list[str] = []
 
+        def _notify_progress(level_num: int, stage_title: str, detail: str) -> None:
+            if callable(progress_callback):
+                try:
+                    progress_callback(level_num, stage_title, detail)
+                except Exception:
+                    pass
+
         # Reset per-run call telemetry on router so each vendor report captures its exact calls
         self.model_router.call_history.clear()
         self.model_router.vram_unload_events.clear()
 
         # ── LEVEL 1: Criticality Tiering (D/P/R/O/V + O1–O5) ──
+        _notify_progress(1, "Level 1: Criticality Tiering", f"Evaluating D/P/R/O/V factors and O1–O5 overrides for {vendor.vendor_name}...")
         crit_res = criticality_result or self.criticality_engine.evaluate(
             vendor, human_review=human_criticality_override
         )
@@ -327,6 +365,7 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 2: Assessment Depth Scoping ──
+        _notify_progress(2, "Level 2: Assessment Depth Scoping", f"Mapping '{effective_crit}' criticality to S1–S12 depth profile and query plan...")
         plan = self.investigation_planner.plan_investigation(
             vendor=vendor,
             criticality_input=crit_res,
@@ -353,17 +392,22 @@ class MeridianEndToEndPipeline:
 
         # ── LEVEL 3: Source Identification & Reconnaissance (Search + URL Triage via Model A llama3.2:latest) ──
         search_ok, search_msg = self.search_backend.is_configured()
+        triage_llm_ok, triage_llm_msg = self.triage_service.llm_provider.is_configured()
+        triage_model_name = (
+            getattr(self.triage_service.llm_provider, "model_name", None)
+            or self.model_router.resolve_model_for_task(LLMTaskType.URL_TRIAGE)
+        )
+        _notify_progress(
+            3,
+            "Level 3: Source Identification & Reconnaissance",
+            f"Executing OSINT search ({self.search_backend.provider_name}) and Level 3B URL triage ({triage_model_name})...",
+        )
         if execute_searches:
             collector = OSINTSearchCollector(backend=self.search_backend, retry_backoff_seconds=0.0)
             collector.execute_planned_queries(plan, persist=False)
         if not search_ok:
             unavailable_integrations.append(f"Search Backend ({self.search_backend.provider_name}): {search_msg}")
 
-        triage_llm_ok, triage_llm_msg = self.triage_service.llm_provider.is_configured()
-        triage_model_name = (
-            getattr(self.triage_service.llm_provider, "model_name", None)
-            or self.model_router.resolve_model_for_task(LLMTaskType.URL_TRIAGE)
-        )
         triage_decisions: list[URLTriageDecision] = self.triage_service.triage_plan_candidates(plan)
         fetch_decisions = [d for d in triage_decisions if d.action == URLTriageAction.FETCH]
 
@@ -397,7 +441,7 @@ class MeridianEndToEndPipeline:
                     f"{len(plan.planned_queries)} planned queries; "
                     f"{len(plan.candidate_urls)} candidate URLs collected; "
                     f"{len(fetch_decisions)} URLs triaged as FETCH "
-                    f"(Triage Model: {triage_model_name} [{l3_model_status}])."
+                    f"(Level 3B Triage Model: {triage_model_name} [{l3_model_status}])."
                 ),
                 limitations=l3_limits,
                 selected_model=triage_model_name,
@@ -407,12 +451,20 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 4: Data Scraping & Point-of-Capture Traceability ──
+        _notify_progress(
+            4,
+            "Level 4: Data Scraping & Point-of-Capture Traceability",
+            f"Extracting content and computing SHA-256 provenance from {len(fetch_decisions)} triaged URL(s)...",
+        )
         extracted_docs: list[ExtractedDocument] = []
         evidence_records: list[EvidenceRecord] = (
             [ev.model_copy(deep=True) for ev in pre_supplied_evidence]
             if pre_supplied_evidence
             else []
         )
+
+        from meridian_assessment.services.extraction.extractor import StubFetchAdapter
+        is_stub_fetch = isinstance(self.fetch_adapter, StubFetchAdapter)
 
         fetch_ok, fetch_msg = self.fetch_adapter.is_configured()
         if execute_extraction and fetch_decisions:
@@ -427,6 +479,7 @@ class MeridianEndToEndPipeline:
                     query_ids=q_ids,
                     triage_action=t_dec.action.value,
                     document_index=doc_idx,
+                    is_synthetic_fixture=is_stub_fetch,
                 )
                 extracted_docs.append(doc)
                 if doc.extraction_status == ExtractionStatus.EXTRACTED:
@@ -494,6 +547,11 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 5: Semantic Filtering & RAG Chunking (Separate Embedding Model) ──
+        _notify_progress(
+            5,
+            "Level 5: Semantic Filtering & RAG Chunking",
+            f"Chunking {len(evidence_records)} evidence item(s) ({self.rag_service.model_name})...",
+        )
         _, rag_summary = self.rag_service.retrieve_relevant_chunks(evidence_records)
         emb_ok, emb_msg = self.rag_service.embedding_provider.is_available()
         if not emb_ok:
@@ -528,6 +586,11 @@ class MeridianEndToEndPipeline:
         cls_model_name = (
             getattr(self.classification_service.llm_adapter, "model_name", None)
             or self.model_router.resolve_model_for_task(LLMTaskType.EVIDENCE_CLASSIFICATION)
+        )
+        _notify_progress(
+            6,
+            "Level 6: Signal Classification",
+            f"Classifying {len(evidence_records)} evidence item(s) (Model B: {cls_model_name}, E14 prompt-injection guard active)...",
         )
         if not llm_ok:
             unavailable_integrations.append(f"Local LLM Classifier ({cls_model_name}): {llm_msg}")
@@ -570,6 +633,11 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 7: Evidentiary Weighting (E1–E14), G1–G4 Gates & AI-Use Verdict ──
+        _notify_progress(
+            7,
+            "Level 7: Evidentiary Weighting",
+            f"Applying deterministic E1–E14 rules, G1–G4 gates, and AI-use verdict logic...",
+        )
         scalar_weights_cfg = self.scoring_engine.policy_data.get("evidentiary_weighting", {}).get("exact_scalar_weights")
         active_scalars = (
             {k: float(v) for k, v in scalar_weights_cfg.items() if isinstance(v, (int, float))}
@@ -590,7 +658,7 @@ class MeridianEndToEndPipeline:
         stage_ledger.append(
             StageExecutionRecord(
                 level_number=7,
-                level_name="Evidentiary Weighting, Gates G1–G4 & AI-Use Verdict",
+                level_name="Evidentiary Weighting",
                 status="COMPLETED" if weighted_items or ai_verdict.depth_completed else "PARTIAL",
                 summary=(
                     f"Evaluated E1–E14 across {len(weighted_items)} items; "
@@ -608,6 +676,11 @@ class MeridianEndToEndPipeline:
         sum_model_name = (
             getattr(self.risk_analyzer.summary_llm_adapter, "model_name", None)
             or self.model_router.resolve_model_for_task(LLMTaskType.RISK_SUMMARIZATION)
+        )
+        _notify_progress(
+            8,
+            "Level 8: Risk Surfacing & Summarization",
+            f"Evaluating R1–R8 risk rules and drafting evidence-grounded explanations ({sum_model_name})...",
         )
         risk_findings = self.risk_analyzer.analyze_vendor_risks(
             vendor_id=vendor.vendor_id,
@@ -635,7 +708,7 @@ class MeridianEndToEndPipeline:
         stage_ledger.append(
             StageExecutionRecord(
                 level_number=8,
-                level_name="Risk Surfacing & Summarization (R1–R8)",
+                level_name="Risk Surfacing & Summarization",
                 status="COMPLETED" if risk_findings or ai_verdict.verdict == AIUseVerdictValue.NO else "PARTIAL",
                 summary=(
                     f"Surfaced {len(risk_findings)} evidence-backed R1–R8 risk finding(s) "
@@ -655,6 +728,11 @@ class MeridianEndToEndPipeline:
             )
 
         # ── LEVEL 9: Deterministic Risk Rating (`M_c * sum(S_i * W_i)`) ──
+        _notify_progress(
+            9,
+            "Level 9: Deterministic Risk Rating",
+            "Evaluating deterministic risk formula (M_c * sum(S_i * W_i)) and policy readiness...",
+        )
         completeness_str = "COMPLETED" if ai_verdict.depth_completed else "INCOMPLETE"
         risk_score_res = self.scoring_engine.calculate_vendor_risk_score(
             vendor_id=vendor.vendor_id,

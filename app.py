@@ -61,6 +61,7 @@ from meridian_assessment.models.ai_risk import (
     ScoringPolicyStatus,
     VendorEndToEndAssessmentReport,
 )
+from meridian_assessment.models.meridian_vendor import MeridianVendor
 from meridian_assessment.services.end_to_end_pipeline import (
     HumanValidationService,
     MeridianEndToEndPipeline,
@@ -68,16 +69,24 @@ from meridian_assessment.services.end_to_end_pipeline import (
 from meridian_assessment.services.offline_demo_fixtures import (
     build_synthetic_demo_adapters_for_vendor,
 )
+from meridian_assessment.services.readiness_and_exports import (
+    AssessmentReportExporter,
+    CANONICAL_NINE_LEVEL_NAMES,
+    SystemReadinessInspector,
+    build_nine_level_stage_tracker,
+    gates_for_evidence,
+    validate_vendor_assessment_input,
+)
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Meridian | Vendor Risk Assessment",
-    page_icon="🛡️",
+    page_title="Meridian Financial | Third-Party AI Risk Assessment Console",
+    page_icon="M",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─── Pure Minimalist Design System ────────────────────────────────────────────
+# ─── Enterprise Financial-Services Console Design System ──────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -89,9 +98,82 @@ html, body, [class*="css"] {
 
 #MainMenu, footer, header { visibility: hidden; }
 .block-container {
-    padding: 1.5rem 2.2rem 2.5rem 2.2rem;
-    max-width: 1480px;
+    padding: 1.25rem 2rem 2.25rem 2rem;
+    max-width: 1520px;
 }
+
+.readiness-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 0.65rem;
+    margin-bottom: 0.9rem;
+}
+.readiness-card {
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-top: 3px solid #334155;
+    border-radius: 6px;
+    padding: 0.65rem 0.8rem;
+}
+.readiness-card.ok { border-top-color: #15803d; }
+.readiness-card.warn { border-top-color: #b45309; }
+.readiness-card.blocked { border-top-color: #b91c1c; }
+.readiness-title {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #475569;
+    margin-bottom: 0.25rem;
+}
+.readiness-status {
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: #0f172a;
+    margin-bottom: 0.2rem;
+}
+.readiness-detail {
+    font-size: 0.71rem;
+    color: #475569;
+    line-height: 1.38;
+}
+.console-banner {
+    padding: 0.65rem 0.95rem;
+    border-radius: 6px;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    margin-bottom: 0.9rem;
+}
+.console-banner.synth {
+    background: #fffbeb;
+    border: 1px solid #f59e0b;
+    color: #78350f;
+}
+.console-banner.incomplete {
+    background: #fef2f2;
+    border: 1px solid #ef4444;
+    color: #7f1d1d;
+}
+.console-banner.real-ok {
+    background: #f0f9ff;
+    border: 1px solid #0284c7;
+    color: #0c4a6e;
+}
+.stage-badge {
+    display: inline-block;
+    padding: 0.14rem 0.48rem;
+    border-radius: 4px;
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+.stage-badge.completed { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+.stage-badge.fallback { background: #e0f2fe; color: #075985; border: 1px solid #7dd3fc; }
+.stage-badge.blocked { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+.stage-badge.review { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+.stage-badge.skipped { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
+
 
 /* ── Top Bar ── */
 .topbar {
@@ -541,24 +623,24 @@ st.markdown("""
     <div class="topbar-brand">
         <div class="topbar-logo">M</div>
         <div>
-            <div class="topbar-name">Meridian &nbsp; Vendor Risk Assessment</div>
-            <div class="topbar-sub">Deterministic Criticality Engine — D/P/R/O/V Methodology with Safeguards &amp; Governance</div>
+            <div class="topbar-name">Meridian Financial &nbsp;|&nbsp; Third-Party AI Risk Assessment Console</div>
+            <div class="topbar-sub">Nine-Level Deterministic Governance, Point-of-Capture OSINT Evidence &amp; Dual-Model Local Analysis</div>
         </div>
     </div>
-    <div class="topbar-right">Critical / High / Medium / Low &nbsp;·&nbsp; Zero Generative LLM Scoring</div>
+    <div class="topbar-right">Levels 1–9 &nbsp;·&nbsp; Deterministic Scoring &amp; Verdict Guardrails</div>
 </div>
 """, unsafe_allow_html=True)
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("#### Methodology Mode")
+    st.markdown("#### Criticality Methodology")
     engine_mode = st.radio(
         "Engine Selection",
         ["Meridian D/P/R/O/V (Primary)", "Standard Qualitative (Legacy)"],
         label_visibility="collapsed",
     )
 
-    st.markdown("#### Vendor Input")
+    st.markdown("#### Vendor Dataset")
     if "Primary" in engine_mode:
         data_source = st.radio(
             "Source",
@@ -578,22 +660,25 @@ with st.sidebar:
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
-        run_btn = st.button("▶ Run", type="primary", use_container_width=True)
+        run_btn = st.button("Load Inventory", type="primary", use_container_width=True)
     with col_btn2:
-        reset_btn = st.button("🔄 Reset", use_container_width=True)
+        reset_btn = st.button("Reset State", use_container_width=True)
 
     st.divider()
     st.markdown("""
-    <div style="font-size:0.72rem;color:#64748b;line-height:1.6">
-    <strong style="color:#0f172a">Formula</strong><br>
-    <code>C = 0.30D + 0.20P + 0.20R + 0.20O + 0.10V</code><br><br>
-    <strong style="color:#0f172a">Safeguards (O1–O4)</strong><br>
-    • <strong>O1</strong>: Privileged Access → Min High<br>
-    • <strong>O2</strong>: Sole-Source + O3 → Critical<br>
-    • <strong>O3</strong>: D3 + V3 → Min High<br>
-    • <strong>O4</strong>: P3 + O≥2 → Min High<br><br>
-    <strong style="color:#0f172a">Governance (O5)</strong><br>
-    Audited human analyst review &amp; written rationale.
+    <div style="font-size:0.72rem;color:#475569;line-height:1.55">
+    <strong style="color:#0f172a">Nine-Level Framework</strong><br>
+    1. Criticality Tiering (D/P/R/O/V + O1–O5)<br>
+    2. Assessment Depth Scoping (S1–S12)<br>
+    3. Source Identification &amp; Recon (3B Triage)<br>
+    4. Data Scraping &amp; Point-of-Capture<br>
+    5. Semantic Filtering &amp; RAG Chunking<br>
+    6. Signal Classification (E14 Guard)<br>
+    7. Evidentiary Weighting (E1–E14, G1–G4)<br>
+    8. Risk Surfacing &amp; Summarization (R1–R8)<br>
+    9. Deterministic Risk Rating<br><br>
+    <strong style="color:#0f172a">Criticality Formula</strong><br>
+    <code>C = 0.30D + 0.20P + 0.20R + 0.20O + 0.10V</code>
     </div>
     """, unsafe_allow_html=True)
 
@@ -616,6 +701,10 @@ if "show_raw_json" not in st.session_state:
     st.session_state.show_raw_json = False
 if "e2e_reports" not in st.session_state:
     st.session_state.e2e_reports = {}
+if "custom_vendors" not in st.session_state:
+    st.session_state.custom_vendors = {}
+if "system_readiness" not in st.session_state:
+    st.session_state.system_readiness = None
 
 # Auto-load case study on startup if empty
 if not st.session_state.results and MERIDIAN_DATASET_CSV.exists():
@@ -633,6 +722,8 @@ if reset_btn:
     st.session_state.human_overrides = {}
     st.session_state.osint_plans = {}
     st.session_state.e2e_reports = {}
+    st.session_state.custom_vendors = {}
+    st.session_state.system_readiness = None
     st.session_state.filter_tier = "All"
     st.rerun()
 
@@ -669,12 +760,13 @@ if st.session_state.error_msg:
 
 # ─── Navigation Tabs ──────────────────────────────────────────────────────────
 tab_assess, tab_osint, tab_e2e, tab_reports, tab_analytics = st.tabs([
-    "⚡ Live Assessment",
-    "🎯 OSINT Investigation Planner",
-    "🔬 End-to-End AI Risk Pipeline (Levels 1–9)",
-    "📁 Report Browser",
-    "📊 Portfolio Analytics",
+    "Criticality Tiering (Level 1)",
+    "OSINT Investigation Planner (Levels 2–3)",
+    "End-to-End AI Risk & Governance (Levels 1–9)",
+    "Assessment Archive",
+    "Portfolio Analytics",
 ])
+
 
 # ==============================================================================
 # TAB 1: LIVE ASSESSMENT CONSOLE
@@ -781,11 +873,11 @@ with tab_assess:
                         "Vendor": r.vendor_name,
                         "Criticality": str(final_c),
                         "Base Score": f"{r.base_score:.2f}" if r.base_score is not None else "UNKNOWN",
-                        "D": r.D.score if r.D.score is not None else "?",
-                        "P": r.P.score if r.P.score is not None else "?",
-                        "R": r.R.score if r.R.score is not None else "?",
-                        "O": r.O.score if r.O.score is not None else "?",
-                        "V": r.V.score if r.V.score is not None else "?",
+                        "D": str(r.D.score) if r.D.score is not None else "UNKNOWN",
+                        "P": str(r.P.score) if r.P.score is not None else "UNKNOWN",
+                        "R": str(r.R.score) if r.R.score is not None else "UNKNOWN",
+                        "O": str(r.O.score) if r.O.score is not None else "UNKNOWN",
+                        "V": str(r.V.score) if r.V.score is not None else "UNKNOWN",
                         "Safeguards": "Triggered" if r.automatic_override_applied else "None",
                     })
                 else:
@@ -1908,336 +2000,958 @@ with tab_analytics:
 
 
 # ==============================================================================
-# TAB 5: END-TO-END AI RISK PIPELINE (LEVELS 1–9)
+# TAB 5: END-TO-END AI RISK & GOVERNANCE CONSOLE (LEVELS 1–9)
 # ==============================================================================
 with tab_e2e:
-    st.markdown('<div class="sec-header"><span>Meridian 9-Level End-to-End AI Risk Pipeline</span></div>', unsafe_allow_html=True)
+    # ── 1. Honest Pre-Search & Model Readiness Panel ──
+    rd_hdr_c1, rd_hdr_c2 = st.columns([8, 2])
+    with rd_hdr_c1:
+        st.markdown(
+            '<div class="sec-header"><span>System &amp; Integration Readiness (Pre-Search Status)</span></div>',
+            unsafe_allow_html=True,
+        )
+    with rd_hdr_c2:
+        if st.button("Refresh Readiness Check", use_container_width=True, key="btn_refresh_readiness"):
+            st.session_state.system_readiness = SystemReadinessInspector.check_system_readiness()
 
-    # Load MeridianVendor records
-    meridian_vendor_map: dict[str, Any] = {}
+    if st.session_state.system_readiness is None:
+        st.session_state.system_readiness = SystemReadinessInspector.check_system_readiness()
+    readiness = st.session_state.system_readiness
+
+    ollama_cls = "ok" if (readiness.ollama_reachable and readiness.llama3_2_installed and readiness.mistral_installed) else "warn"
+    ollama_lbl = (
+        "ONLINE · 2/2 Models Ready"
+        if (readiness.ollama_reachable and readiness.llama3_2_installed and readiness.mistral_installed)
+        else ("ONLINE · Model Missing" if readiness.ollama_reachable else "OFFLINE · Deterministic Fallback")
+    )
+    routing_cls = "ok" if readiness.llm_routing_enabled_in_env else "warn"
+    search_cls = "ok" if readiness.search_configured else "blocked"
+    rag_cls = "ok" if readiness.rag_active_mode == "SEMANTIC_VECTOR_RETRIEVAL" else "warn"
+    score_cls = "ok" if readiness.scoring_policy_ready else "blocked"
+
+    st.markdown(
+        f"""
+        <div class="readiness-grid">
+            <div class="readiness-card {ollama_cls}">
+                <div class="readiness-title">1. Local Ollama Server</div>
+                <div class="readiness-status">{ollama_lbl}</div>
+                <div class="readiness-detail">
+                    Endpoint: <code>{readiness.ollama_endpoint}</code><br>
+                    <code>llama3.2:latest</code>: <strong>{'INSTALLED' if readiness.llama3_2_installed else 'MISSING'}</strong> ·
+                    <code>mistral:latest</code>: <strong>{'INSTALLED' if readiness.mistral_installed else 'MISSING'}</strong>
+                </div>
+            </div>
+            <div class="readiness-card {routing_cls}">
+                <div class="readiness-title">2. Dual-Model Routing (6 GB VRAM)</div>
+                <div class="readiness-status">{'ENABLED IN .ENV' if readiness.llm_routing_enabled_in_env else 'DISABLED'}</div>
+                <div class="readiness-detail">
+                    L3B Triage: <code>{readiness.triage_model}</code><br>
+                    L6 &amp; L8 Analysis: <code>{readiness.analysis_model}</code><br>
+                    Unload on switch (<code>keep_alive=0</code>): <strong>{'ON' if readiness.unload_on_model_switch else 'OFF'}</strong>
+                </div>
+            </div>
+            <div class="readiness-card {search_cls}">
+                <div class="readiness-title">3. External OSINT Search API</div>
+                <div class="readiness-status">{'CONFIGURED' if readiness.search_configured else 'NOT CONFIGURED'} ({readiness.search_provider})</div>
+                <div class="readiness-detail">
+                    {readiness.search_status_message}
+                </div>
+            </div>
+            <div class="readiness-card {rag_cls}">
+                <div class="readiness-title">4. Level 5 RAG &amp; Embeddings</div>
+                <div class="readiness-status">{'SEMANTIC ACTIVE' if readiness.rag_active_mode == 'SEMANTIC_VECTOR_RETRIEVAL' else 'CHUNK-ONLY PASSTHROUGH'}</div>
+                <div class="readiness-detail">
+                    <code>MERIDIAN_ENABLE_RAG_EMBEDDINGS={'true' if readiness.rag_embeddings_enabled_in_env else 'false'}</code> ·
+                    <code>sentence-transformers</code>: <strong>{'INSTALLED' if readiness.sentence_transformers_installed else 'NOT INSTALLED'}</strong><br>
+                    All extracted evidence passes directly to Level 6.
+                </div>
+            </div>
+            <div class="readiness-card {score_cls}">
+                <div class="readiness-title">5. Level 9 Risk-Scoring Policy</div>
+                <div class="readiness-status">{readiness.scoring_policy_status}</div>
+                <div class="readiness-detail">
+                    Final calibrated Level 9 numerical risk score is withheld until Meridian's approved scoring policy is supplied.
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── 2. Vendor Inventory & Custom Single-Vendor Input Flow ──
+    meridian_vendor_map: dict[str, MeridianVendor] = {}
     if MERIDIAN_DATASET_CSV.exists():
         for mv in MeridianCSVVendorLoader().load(MERIDIAN_DATASET_CSV):
             meridian_vendor_map[mv.vendor_id] = mv
+    for cust_id, cust_v in st.session_state.custom_vendors.items():
+        meridian_vendor_map[cust_id] = cust_v
+
+    with st.expander("Single-Vendor Scope Input & Custom Vendor Validator (Add or Edit Vendor Inputs)", expanded=False):
+        st.caption(
+            "Enter or modify a vendor's contractual scope and D/P/R/O/V inputs. Unknown fields are preserved as "
+            "`UNKNOWN` (never coerced to zero) and evaluated transparently against deterministic rules and O1–O5 safeguards."
+        )
+        vf_c1, vf_c2, vf_c3 = st.columns(3)
+        with vf_c1:
+            in_vid = st.text_input("Vendor ID *", value="V-007", key="cust_vid")
+            in_vname = st.text_input("Vendor Legal Name *", value="Acme FinTech AI Corp", key="cust_vname")
+            in_domain = st.text_input("Primary Domain", value="acmefintech.example.com", key="cust_domain")
+        with vf_c2:
+            in_service = st.text_input(
+                "Service Purchased by Meridian (P & R input)",
+                value="Automated customer dispute triage and statement notice generation",
+                key="cust_service",
+            )
+            in_bproc = st.text_input(
+                "Business Process Supported (P & R input)",
+                value="Retail banking dispute resolution and regulatory notice fulfilment",
+                key="cust_bproc",
+            )
+            in_cat = st.text_input("Vendor Category (Contextual)", value="Financial Operations SaaS", key="cust_cat")
+        with vf_c3:
+            in_d = st.text_input(
+                "Data Classification Accessed (D input)",
+                value="Customer PII, account numbers, and transaction dispute records",
+                key="cust_d",
+            )
+            in_o = st.selectbox(
+                "Operational Dependency (O input)",
+                options=["Critical", "High", "Moderate", "Low", "UNKNOWN"],
+                index=1,
+                key="cust_o",
+            )
+            in_v = st.text_input(
+                "Annual Data Volume (V input)",
+                value="4.5 million records annually",
+                key="cust_v",
+            )
+            in_sole = st.checkbox("Sole-Source Provider (Evaluated under O2 Safeguard)", value=False, key="cust_sole")
+
+        val_col1, val_col2 = st.columns([3, 7])
+        with val_col1:
+            save_custom_btn = st.button(
+                "Validate & Register Vendor for Assessment",
+                type="secondary",
+                use_container_width=True,
+                key="btn_validate_custom_vendor",
+            )
+        if save_custom_btn:
+            cand_vendor, v_errors, v_warnings = validate_vendor_assessment_input(
+                vendor_id=in_vid,
+                vendor_name=in_vname,
+                domain=in_domain,
+                category=in_cat,
+                service_product_provided=in_service,
+                business_process_supported=in_bproc,
+                data_classification_accessed=in_d,
+                operational_dependency=in_o,
+                data_volume_annual=in_v,
+                is_sole_source=in_sole,
+            )
+            for err in v_errors:
+                st.error(err)
+            for warn in v_warnings:
+                st.warning(warn)
+            if cand_vendor is not None:
+                st.session_state.custom_vendors[cand_vendor.vendor_id] = cand_vendor
+                meridian_vendor_map[cand_vendor.vendor_id] = cand_vendor
+                preview_crit = MeridianCriticalityEngine().evaluate(cand_vendor)
+                st.success(
+                    f"Registered {cand_vendor.vendor_name} ({cand_vendor.vendor_id}) — "
+                    f"Deterministic Base Score: {preview_crit.base_score if preview_crit.base_score is not None else 'UNKNOWN'}, "
+                    f"Final Criticality: {preview_crit.final_criticality} "
+                    f"(Status: {preview_crit.score_status.value}). Select it below to run Levels 1–9."
+                )
 
     if not meridian_vendor_map:
         st.info("Meridian vendor dataset (`data/input/meridian_vendors.csv`) not found.")
     else:
-        e2e_top_c1, e2e_top_c2, e2e_top_c3 = st.columns([4, 4, 2])
+        st.markdown(
+            '<div class="sec-header"><span>Assessment Execution Controls (Single-Vendor &amp; Portfolio Batch)</span></div>',
+            unsafe_allow_html=True,
+        )
+        e2e_top_c1, e2e_top_c2, e2e_top_c3, e2e_top_c4 = st.columns([3.4, 4.2, 1.2, 1.2])
         with e2e_top_c1:
             e2e_vid = st.selectbox(
-                "Select Vendor for 9-Level Pipeline",
+                "Target Vendor",
                 options=list(meridian_vendor_map.keys()),
-                format_func=lambda vid: f"{meridian_vendor_map[vid].vendor_name} ({vid})",
+                format_func=lambda vid: f"{meridian_vendor_map[vid].vendor_name} ({vid}) — {meridian_vendor_map[vid].domain or 'no-domain'}",
                 key="e2e_vendor_select",
             )
         with e2e_top_c2:
             e2e_exec_mode = st.selectbox(
-                "Execution Mode",
+                "Assessment Data Source & Model Routing Mode",
                 options=[
-                    "Offline / Unconfigured Mode (Default — No Live Web or Model Calls)",
-                    "Offline Demo with Synthetic Test Fixtures (Deterministic Rules)",
-                    "Dual-Model Local Ollama (llama3.2:latest + mistral:latest) + Synthetic Fixtures",
+                    "Real OSINT Mode — Dual-Model Local Ollama (llama3.2:latest + mistral:latest)",
+                    "Real OSINT Mode — Deterministic Rules Only",
+                    "Synthetic Fixture Demo Mode — Dual-Model Local Ollama (llama3.2:latest + mistral:latest)",
+                    "Synthetic Fixture Demo Mode — Deterministic Rules Only",
                 ],
+                index=3,
                 key="e2e_exec_mode_select",
             )
         with e2e_top_c3:
             st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
-            run_e2e_btn = st.button("▶ Run 9-Level Pipeline", type="primary", use_container_width=True, key="btn_run_e2e")
+            run_e2e_btn = st.button("Run Vendor", type="primary", use_container_width=True, key="btn_run_e2e")
+        with e2e_top_c4:
+            st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
+            run_batch_btn = st.button("Run All (Batch)", use_container_width=True, key="btn_run_e2e_batch")
 
         selected_mv = meridian_vendor_map[e2e_vid]
-        is_synthetic_demo = "Synthetic" in e2e_exec_mode
+        is_synthetic_demo = e2e_exec_mode.startswith("Synthetic Fixture Demo Mode")
         use_dual_ollama = "Dual-Model Local Ollama" in e2e_exec_mode
-        mode_tag = "ollama_synth" if use_dual_ollama else ("synthetic" if is_synthetic_demo else "unconfigured")
+        mode_tag = (
+            "synth_ollama"
+            if (is_synthetic_demo and use_dual_ollama)
+            else "synth_det"
+            if is_synthetic_demo
+            else "real_ollama"
+            if use_dual_ollama
+            else "real_det"
+        )
         cache_key = f"{e2e_vid}::{mode_tag}"
 
-        if run_e2e_btn or cache_key not in st.session_state.e2e_reports:
-            h_rev = st.session_state.human_overrides.get(e2e_vid)
-            if is_synthetic_demo:
-                stub_search, stub_fetch = build_synthetic_demo_adapters_for_vendor(selected_mv)
+        def _execute_single_vendor_pipeline(
+            target_vendor: MeridianVendor,
+            *,
+            synthetic_mode: bool,
+            dual_ollama_mode: bool,
+            status_container: Optional[Any] = None,
+        ) -> VendorEndToEndAssessmentReport:
+            h_rev = st.session_state.human_overrides.get(target_vendor.vendor_id)
+            all_source_ids = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12"]
+
+            def _on_progress(lvl_num: int, stage_title: str, detail: str) -> None:
+                if status_container is not None:
+                    status_container.write(f"**[{lvl_num}/9] {stage_title}** — {detail}")
+
+            if synthetic_mode:
+                stub_search, stub_fetch = build_synthetic_demo_adapters_for_vendor(target_vendor)
                 pipeline = MeridianEndToEndPipeline(
                     search_backend=stub_search,
                     fetch_adapter=stub_fetch,
-                    enable_local_llm_from_env=use_dual_ollama,
+                    enable_local_llm_from_env=dual_ollama_mode,
                 )
-                rep = pipeline.run_vendor_assessment(
-                    selected_mv,
+                return pipeline.run_vendor_assessment(
+                    target_vendor,
                     human_criticality_override=h_rev,
                     execute_searches=True,
                     execute_extraction=True,
                     mark_extracted_sources_reviewed=True,
+                    reviewed_no_evidence_sources=all_source_ids,
                     persist_to_repository=True,
+                    progress_callback=_on_progress,
                 )
-            else:
-                pipeline = MeridianEndToEndPipeline(
-                    enable_local_llm_from_env=False,
+
+            pipeline = MeridianEndToEndPipeline(
+                enable_local_llm_from_env=dual_ollama_mode,
+            )
+            return pipeline.run_vendor_assessment(
+                target_vendor,
+                human_criticality_override=h_rev,
+                execute_searches=True,
+                execute_extraction=True,
+                persist_to_repository=True,
+                progress_callback=_on_progress,
+            )
+
+        if run_batch_btn:
+            with st.status(
+                f"Executing batch 9-level assessment across {len(meridian_vendor_map)} vendors ({e2e_exec_mode})...",
+                expanded=True,
+            ) as batch_status:
+                for idx_v, (b_vid, b_mv) in enumerate(meridian_vendor_map.items(), start=1):
+                    batch_status.write(f"Assessing vendor {idx_v}/{len(meridian_vendor_map)}: **{b_mv.vendor_name} ({b_vid})**...")
+                    b_rep = _execute_single_vendor_pipeline(
+                        b_mv,
+                        synthetic_mode=is_synthetic_demo,
+                        dual_ollama_mode=use_dual_ollama,
+                        status_container=None,
+                    )
+                    st.session_state.e2e_reports[f"{b_vid}::{mode_tag}"] = b_rep
+                batch_status.update(
+                    label=f"Batch assessment completed for {len(meridian_vendor_map)} vendors.",
+                    state="complete",
+                    expanded=False,
                 )
-                rep = pipeline.run_vendor_assessment(
+
+        if run_e2e_btn or cache_key not in st.session_state.e2e_reports:
+            with st.status(
+                f"Running 9-Level Assessment for {selected_mv.vendor_name} ({selected_mv.vendor_id})...",
+                expanded=run_e2e_btn,
+            ) as run_status:
+                rep = _execute_single_vendor_pipeline(
                     selected_mv,
-                    human_criticality_override=h_rev,
-                    execute_searches=False,
-                    execute_extraction=False,
-                    persist_to_repository=True,
+                    synthetic_mode=is_synthetic_demo,
+                    dual_ollama_mode=use_dual_ollama,
+                    status_container=run_status,
                 )
-            st.session_state.e2e_reports[cache_key] = rep
+                st.session_state.e2e_reports[cache_key] = rep
+                run_status.update(
+                    label=(
+                        f"Completed 9-level execution for {selected_mv.vendor_name} "
+                        f"(Verdict: {rep.ai_use_verdict.verdict.value} | "
+                        f"Criticality: {rep.criticality_summary.get('final_criticality')})"
+                    ),
+                    state="complete",
+                    expanded=False,
+                )
 
         e2e_rep: VendorEndToEndAssessmentReport = st.session_state.e2e_reports[cache_key]
 
-        if is_synthetic_demo:
-            st.info(
-                "**SYNTHETIC TEST FIXTURE MODE ACTIVE:** Candidate URLs and extracted HTML documents shown below "
-                "are offline synthetic test fixtures used to verify Levels 1–9 end-to-end without external web calls. "
-                "They are not real-world OSINT findings."
+        # Batch comparison table if multiple vendors have been run in this mode
+        batch_keys_for_mode = [
+            f"{vid}::{mode_tag}"
+            for vid in meridian_vendor_map
+            if f"{vid}::{mode_tag}" in st.session_state.e2e_reports
+        ]
+        if len(batch_keys_for_mode) > 1:
+            with st.expander(f"Portfolio Batch Comparison ({len(batch_keys_for_mode)} Vendors Assessed in Current Mode)", expanded=False):
+                b_rows = []
+                for bk in batch_keys_for_mode:
+                    brep: VendorEndToEndAssessmentReport = st.session_state.e2e_reports[bk]
+                    b_rows.append({
+                        "Vendor ID": brep.vendor_id,
+                        "Vendor": brep.legal_entity,
+                        "Criticality": brep.criticality_summary.get("final_criticality", "UNKNOWN"),
+                        "Base Score": brep.criticality_summary.get("base_score"),
+                        "OSINT Depth": brep.osint_plan_summary.get("selected_depth_profile", ""),
+                        "Depth Completed": brep.ai_use_verdict.depth_completed,
+                        "Evidence Items": len(brep.evidence_records),
+                        "AI-Use Verdict": brep.ai_use_verdict.verdict.value,
+                        "Determined Scope": brep.determined_scope,
+                        "R1–R8 Findings": len(brep.risk_findings),
+                        "Level 9 Status": brep.deterministic_risk_score.policy_status.value,
+                    })
+                st.dataframe(pd.DataFrame(b_rows), use_container_width=True, hide_index=True)
+
+        # ── 3. Explicit Data-Provenance & Assessment Completeness Banner ──
+        verdict_val = e2e_rep.ai_use_verdict.verdict.value if e2e_rep.ai_use_verdict else "INCOMPLETE_ASSESSMENT"
+        if e2e_rep.is_synthetic_evidence_run or is_synthetic_demo:
+            st.markdown(
+                """
+                <div class="console-banner synth">
+                    <strong>SYNTHETIC FIXTURE / DEMO WALKTHROUGH MODE ACTIVE — NOT REAL VENDOR EVIDENCE:</strong>
+                    Candidate URLs, HTML/PDF documents, and verbatim excerpts in this run come from labelled offline synthetic test fixtures
+                    used to verify Levels 1–9 end-to-end (including prompt-injection isolation under E14 and dual-model routing).
+                    Switch to <strong>Real OSINT Mode</strong> for production vendor reconnaissance.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        elif not readiness.search_configured:
+            unavail_q = e2e_rep.osint_plan_summary.get("unavailable_queries_count", 0)
+            plan_q = e2e_rep.osint_plan_summary.get("planned_queries_count", 0)
+            st.markdown(
+                f"""
+                <div class="console-banner incomplete">
+                    <strong>REAL OSINT MODE BLOCKED BY UNCONFIGURED SEARCH — ASSESSMENT INCOMPLETE (NOT A 'NO AI' VERDICT):</strong>
+                    Levels 1 and 2 completed deterministically, and {plan_q} targeted OSINT queries were planned.
+                    However, all {unavail_q}/{plan_q} search queries returned <code>UNAVAILABLE</code> because
+                    <code>MERIDIAN_SERPAPI_KEY</code> is not configured in the local <code>.env</code> file.
+                    In accordance with the rulebook, an unexecuted search cannot support a <code>NO</code> AI-use verdict;
+                    the assessment status is <strong><code>{verdict_val}</code></strong>.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"""
+                <div class="console-banner real-ok">
+                    <strong>REAL OSINT ASSESSMENT MODE:</strong>
+                    Run ID <code>{e2e_rep.report_id}</code> · Generated <code>{e2e_rep.generated_at}</code> ·
+                    AI-Use Verdict: <strong><code>{verdict_val}</code></strong>.
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-        # Executive Summary Banner
-        verdict_val = e2e_rep.ai_use_verdict.verdict.value if e2e_rep.ai_use_verdict else "INCOMPLETE_ASSESSMENT"
+        # ── 4. Top-Level KPI Strip ──
         score_status_val = (
             e2e_rep.deterministic_risk_score.policy_status.value
             if e2e_rep.deterministic_risk_score
             else "SCORING_POLICY_UNCONFIGURED"
         )
         crit_tier_str = e2e_rep.criticality_summary.get("final_criticality", "Unknown")
+        base_score_val = e2e_rep.criticality_summary.get("base_score")
+        base_score_str = f"{base_score_val:.2f}" if isinstance(base_score_val, (int, float)) else "UNKNOWN"
         depth_str = e2e_rep.osint_plan_summary.get("selected_depth_profile", "Unknown")
         timebox_str = e2e_rep.osint_plan_summary.get("timebox", {}).get("planning_target", "N/A")
-        st.markdown(f"""
-        <div class="stat-grid">
-            <div class="stat-card all">
-                <div class="stat-label">Level 1–2 Criticality &amp; Depth</div>
-                <div class="stat-value" style="font-size:1.25rem">{crit_tier_str}</div>
-                <div class="stat-sub">Depth: {depth_str} · Timebox: {timebox_str}</div>
-            </div>
-            <div class="stat-card high">
-                <div class="stat-label">Level 3–4 Evidence Capture</div>
-                <div class="stat-value" style="font-size:1.25rem">{len(e2e_rep.evidence_records)} Records</div>
-                <div class="stat-sub">{len(e2e_rep.url_triage_decisions)} URLs triaged · {e2e_rep.extracted_documents_count} docs</div>
-            </div>
-            <div class="stat-card medium">
-                <div class="stat-label">Level 7 AI-Use Verdict</div>
-                <div class="stat-value" style="font-size:1.1rem">{verdict_val}</div>
-                <div class="stat-sub">Scope: {e2e_rep.determined_scope}</div>
-            </div>
-            <div class="stat-card low">
-                <div class="stat-label">Level 8–9 Risk &amp; Rating</div>
-                <div class="stat-value" style="font-size:1.1rem">{len(e2e_rep.risk_findings)} Findings</div>
-                <div class="stat-sub">{score_status_val}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
 
-        # 1. Stage Execution Ledger (Levels 1–9) & Dual-Model Routing Telemetry
-        st.markdown('<div class="sec-header"><span>1. Nine-Level Stage Execution Ledger &amp; Dual-Model Routing</span></div>', unsafe_allow_html=True)
-        ledger_rows = [
-            {
-                "Level": s.level_number,
-                "Stage Name": s.level_name,
-                "Status": s.status,
-                "Task": s.model_task or "N/A",
-                "Selected Model": s.selected_model or "DETERMINISTIC_RULEBOOK",
-                "Model Execution": s.model_execution_status or "DETERMINISTIC_ONLY",
-                "Summary": s.summary,
-            }
-            for s in e2e_rep.stage_ledger
-        ]
-        st.dataframe(pd.DataFrame(ledger_rows), use_container_width=True, hide_index=True)
+        st.markdown(
+            f"""
+            <div class="stat-grid">
+                <div class="stat-card all">
+                    <div class="stat-label">Level 1–2 Criticality &amp; Depth</div>
+                    <div class="stat-value" style="font-size:1.2rem">{crit_tier_str} <span style="font-size:0.85rem;font-weight:500;color:#475569">(Base: {base_score_str})</span></div>
+                    <div class="stat-sub">Depth: {depth_str} · POC Timebox: {timebox_str}</div>
+                </div>
+                <div class="stat-card high">
+                    <div class="stat-label">Level 3–6 OSINT &amp; Evidence</div>
+                    <div class="stat-value" style="font-size:1.2rem">{len(e2e_rep.evidence_records)} Evidence Items</div>
+                    <div class="stat-sub">{len(e2e_rep.url_triage_decisions)} URLs triaged · {e2e_rep.extracted_documents_count} docs fetched</div>
+                </div>
+                <div class="stat-card medium">
+                    <div class="stat-label">Level 7 AI-Use Verdict</div>
+                    <div class="stat-value" style="font-size:1.1rem">{verdict_val}</div>
+                    <div class="stat-sub">Scope: {e2e_rep.determined_scope} · Depth Complete: {e2e_rep.ai_use_verdict.depth_completed}</div>
+                </div>
+                <div class="stat-card low">
+                    <div class="stat-label">Level 8–9 Risk &amp; Rating</div>
+                    <div class="stat-value" style="font-size:1.1rem">{len(e2e_rep.risk_findings)} R1–R8 Findings</div>
+                    <div class="stat-sub">{score_status_val}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        if e2e_rep.model_routing_telemetry:
-            tel = e2e_rep.model_routing_telemetry
-            assignments = tel.get("model_assignments", {})
-            vram_info = tel.get("vram_management", {})
-            tasks_tel = tel.get("tasks", {})
-            with st.expander("🧠 Dual-Model Routing & 6 GB VRAM Lifecycle Telemetry", expanded=use_dual_ollama):
-                st.markdown(
-                    f"• **Ollama Endpoint:** `{tel.get('ollama_endpoint', 'http://localhost:11434')}` "
-                    f"(Enabled: `{tel.get('ollama_enabled', False)}` · "
-                    f"Unload on Switch: `{vram_info.get('unload_on_model_switch', True)}`)\n"
-                    f"• **Model A (Level 3B URL Triage):** `{assignments.get('URL_TRIAGE', 'llama3.2:latest')}` → "
-                    f"Status: `{tasks_tel.get('URL_TRIAGE', {}).get('overall_status', 'SKIPPED')}` "
-                    f"({tasks_tel.get('URL_TRIAGE', {}).get('calls_succeeded', 0)}/{tasks_tel.get('URL_TRIAGE', {}).get('calls_total', 0)} calls succeeded)\n"
-                    f"• **Model B (Level 6 Evidence Classification):** `{assignments.get('EVIDENCE_CLASSIFICATION', 'mistral:latest')}` → "
-                    f"Status: `{tasks_tel.get('EVIDENCE_CLASSIFICATION', {}).get('overall_status', 'SKIPPED')}` "
-                    f"({tasks_tel.get('EVIDENCE_CLASSIFICATION', {}).get('calls_succeeded', 0)}/{tasks_tel.get('EVIDENCE_CLASSIFICATION', {}).get('calls_total', 0)} calls succeeded)\n"
-                    f"• **Model B (Level 8 Risk Summarization):** `{assignments.get('RISK_SUMMARIZATION', 'mistral:latest')}` → "
-                    f"Status: `{tasks_tel.get('RISK_SUMMARIZATION', {}).get('overall_status', 'SKIPPED')}` "
-                    f"({tasks_tel.get('RISK_SUMMARIZATION', {}).get('calls_succeeded', 0)}/{tasks_tel.get('RISK_SUMMARIZATION', {}).get('calls_total', 0)} calls succeeded)\n"
-                    f"• **Separate Embedding Model (Level 5 RAG):** `{assignments.get('RAG_EMBEDDING', 'sentence-transformers/all-MiniLM-L6-v2')}`\n"
-                    f"• **VRAM Unload Events (`keep_alive=0`):** `{len(vram_info.get('vram_unload_events', []))}`"
+        # ── 5. Canonical Nine-Level Stage Execution Tracker (Levels 1–9 + Level 3B Substep) ──
+        st.markdown(
+            '<div class="sec-header"><span>Canonical Nine-Level Framework Stage Tracker</span></div>',
+            unsafe_allow_html=True,
+        )
+        tracker_rows = build_nine_level_stage_tracker(e2e_rep)
+        stage_table_data: list[dict[str, str]] = []
+        for tr in tracker_rows:
+            stage_table_data.append({
+                "Stage": f"{tr.level_label}",
+                "Framework Level Name": tr.level_name,
+                "Status": tr.badge_label,
+                "Execution Method": tr.execution_method,
+                "Relevant Counts": tr.relevant_counts,
+                "Concise Output / Blocker": tr.blocker if tr.blocker else tr.concise_output,
+            })
+            for sub in tr.substeps:
+                stage_table_data.append({
+                    "Stage": f"↳ {sub['substep_id']}",
+                    "Framework Level Name": sub["substep_name"],
+                    "Status": sub["status"],
+                    "Execution Method": "Substep of Level 3",
+                    "Relevant Counts": "—",
+                    "Concise Output / Blocker": sub["detail"],
+                })
+        st.dataframe(pd.DataFrame(stage_table_data), use_container_width=True, hide_index=True)
+
+        # ── 6. Analyst-Friendly Results Area (Six Structured Sub-Tabs) ──
+        res_tab1, res_tab2, res_tab3, res_tab4, res_tab5, res_tab6 = st.tabs([
+            "1. Executive Summary & Status",
+            "2. Criticality & Overrides (Levels 1–2)",
+            "3. AI-Use Verdict & Gates G1–G4 (Level 7)",
+            "4. Evidence Register (Levels 3–6, E1–E14)",
+            "5. Risk Findings & Follow-Up (Levels 8–9, R1–R8)",
+            "6. Stage Audit, Telemetry, Sign-Off & Exports",
+        ])
+
+        # ── SUB-TAB 1: EXECUTIVE SUMMARY & ASSESSMENT STATUS ──
+        with res_tab1:
+            sum_c1, sum_c2 = st.columns([6, 4], gap="large")
+            with sum_c1:
+                st.markdown("##### Vendor & Service Scope")
+                scope_df = pd.DataFrame([
+                    {"Field": "Report Run ID", "Value": e2e_rep.report_id},
+                    {"Field": "Generated Timestamp (UTC)", "Value": e2e_rep.generated_at},
+                    {"Field": "Data Provenance Mode", "Value": "SYNTHETIC DEMO FIXTURES" if e2e_rep.is_synthetic_evidence_run else "REAL OSINT ASSESSMENT"},
+                    {"Field": "Vendor Legal Entity", "Value": f"{e2e_rep.legal_entity} ({e2e_rep.vendor_id})"},
+                    {"Field": "Primary Domain", "Value": e2e_rep.domain or "N/A"},
+                    {"Field": "Service Purchased by Meridian", "Value": e2e_rep.service_product_provided or "N/A"},
+                    {"Field": "Business Process Supported", "Value": e2e_rep.business_process_supported or "N/A"},
+                    {"Field": "Effective Criticality Tier", "Value": f"{crit_tier_str} (Base Score: {base_score_str})"},
+                    {"Field": "OSINT Depth Profile", "Value": f"{depth_str} (Completed: {e2e_rep.ai_use_verdict.depth_completed})"},
+                    {"Field": "Rulebook AI-Use Verdict", "Value": f"{verdict_val} — {e2e_rep.ai_use_verdict.verdict_statement}"},
+                    {"Field": "Determined AI Scope & Types", "Value": f"Scope: {e2e_rep.determined_scope} | AI Types: {', '.join(e2e_rep.determined_ai_types) or 'NONE'}"},
+                    {"Field": "Fourth-Party AI Supply Chain (G4)", "Value": f"Status: {e2e_rep.supply_chain_identity_status} | Providers: {', '.join(e2e_rep.named_providers) or 'None'} | Models: {', '.join(e2e_rep.named_models) or 'None'} | Hosting: {', '.join(e2e_rep.hosting_infrastructures) or 'None'}"},
+                    {"Field": "Level 9 Risk Rating Status", "Value": f"{score_status_val} (Final Score: {e2e_rep.deterministic_risk_score.final_risk_score if e2e_rep.deterministic_risk_score.final_risk_score is not None else 'None — Unconfigured Policy'})"},
+                ])
+                st.dataframe(scope_df, use_container_width=True, hide_index=True)
+
+            with sum_c2:
+                st.markdown("##### Assessment Limitations & Blockers")
+                if e2e_rep.unavailable_integrations:
+                    st.markdown("**Unconfigured / Unavailable External Integrations:**")
+                    for ui_msg in e2e_rep.unavailable_integrations:
+                        st.markdown(f"- {ui_msg}")
+                if e2e_rep.assessment_limitations:
+                    st.markdown("**Recorded Assessment Limitations:**")
+                    for lim_msg in e2e_rep.assessment_limitations:
+                        st.markdown(f"- {lim_msg}")
+                if not e2e_rep.unavailable_integrations and not e2e_rep.assessment_limitations:
+                    st.caption("No integration blockers or assessment limitations recorded.")
+
+                if e2e_rep.unresolved_questions:
+                    st.markdown("##### Open Diligence Questions for Vendor")
+                    for oq in e2e_rep.unresolved_questions:
+                        st.markdown(f"- {oq}")
+
+        # ── SUB-TAB 2: CRITICALITY FACTORS, SCORE, TIER & TRIGGERED OVERRIDES (LEVELS 1–2) ──
+        with res_tab2:
+            crit_data = e2e_rep.criticality_summary or {}
+            st.markdown(
+                f"##### Level 1 Deterministic Criticality Breakdown (`C = 0.30D + 0.20P + 0.20R + 0.20O + 0.10V`)\n"
+                f"**Base Score:** `{base_score_str}` &nbsp;|&nbsp; "
+                f"**Base Tier:** `{crit_data.get('base_tier', 'UNKNOWN')}` &nbsp;|&nbsp; "
+                f"**Override Tier:** `{crit_data.get('override_tier') or 'None'}` &nbsp;|&nbsp; "
+                f"**Effective Criticality:** **`{crit_tier_str}`** (`{crit_data.get('score_status', 'COMPLETE')}`)"
+            )
+            factor_rows = []
+            factors_dict = crit_data.get("factors", {})
+            for fk in ("D", "P", "R", "O", "V"):
+                fd = factors_dict.get(fk, {})
+                factor_rows.append({
+                    "Factor": fk,
+                    "Score (0–3)": str(fd.get("score", "UNKNOWN")),
+                    "Weight": f"{fd.get('weight', 0.0):.2f}" if isinstance(fd.get("weight"), (int, float)) else "—",
+                    "Weighted Contribution": (
+                        f"{fd.get('weighted_contribution'):.2f}"
+                        if isinstance(fd.get("weighted_contribution"), (int, float))
+                        else "UNKNOWN"
+                    ),
+                    "Determination Method": fd.get("determination_method", ""),
+                    "Source Fields": ", ".join(fd.get("source_fields", [])),
+                    "Matched Concepts / Phrases": ", ".join(fd.get("matched_concepts", []) or fd.get("deterministic_matches", [])),
+                    "Rationale": fd.get("rationale", ""),
+                })
+            st.dataframe(pd.DataFrame(factor_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("##### Evaluated Governance Safeguards & Overrides (`O1–O5`)")
+            ov_rows = []
+            for ov in crit_data.get("overrides_evaluated", []):
+                ov_rows.append({
+                    "Override ID": ov.get("override_id", ""),
+                    "Rule Description": ov.get("description", ""),
+                    "Condition Evaluated": ov.get("condition_evaluated", ""),
+                    "Triggered": "YES" if ov.get("triggered") else "NO",
+                    "Resulting Tier": ov.get("resulting_tier") or "—",
+                    "Rationale": ov.get("rationale", ""),
+                })
+            if ov_rows:
+                st.dataframe(pd.DataFrame(ov_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("##### Level 2 OSINT Depth Scoping & S1–S12 Source Coverage")
+            osint_sum = e2e_rep.osint_plan_summary or {}
+            cond_items = [
+                c.get("source_id", str(c)) if isinstance(c, dict) else str(c)
+                for c in osint_sum.get("conditional_source_classes", [])
+            ]
+            st.markdown(
+                f"- **Selected Depth Profile:** `{osint_sum.get('selected_depth_profile', 'N/A')}` — {osint_sum.get('selection_reason', '')}\n"
+                f"- **Required Source Classes:** `{', '.join(osint_sum.get('required_source_classes', []))}` | "
+                f"**Conditional:** `{', '.join(cond_items) or 'None'}` | "
+                f"**Corroborative:** `{', '.join(osint_sum.get('corroborative_source_classes', []))}`\n"
+                f"- **Stopping Rule (`{osint_sum.get('stopping_rule_id', '')}`):** `{osint_sum.get('stop_status', '')}`"
+            )
+            cov_details = osint_sum.get("coverage_summary", {}).get("source_details", [])
+            if cov_details:
+                st.dataframe(pd.DataFrame(cov_details), use_container_width=True, hide_index=True)
+
+        # ── SUB-TAB 3: AI-USE VERDICT & G1–G4 GATE RESULTS (LEVEL 7) ──
+        with res_tab3:
+            v_obj = e2e_rep.ai_use_verdict
+            st.markdown("##### Level 7 Rulebook AI-Use Verdict")
+            st.markdown(
+                f"- **Verdict:** **`{v_obj.verdict.value}`** (Investigation Depth Completed: `{v_obj.depth_completed}`)\n"
+                f"- **Verdict Statement:** {v_obj.verdict_statement}\n"
+                f"- **Evidentiary Basis:** {v_obj.basis_summary}\n"
+                f"- **Supporting Evidence IDs:** `{', '.join(v_obj.supporting_evidence_ids) or 'None'}`\n"
+                f"- **Corroborating Source Classes:** `{', '.join(v_obj.corroborating_source_classes) or 'None'}`"
+            )
+            if v_obj.incomplete_reasons:
+                st.warning("Completeness Guardrail Reasons: " + " | ".join(v_obj.incomplete_reasons))
+
+            st.markdown("##### Evidentiary Gates (`G1–G4`)")
+            gate_rows = []
+            for g in e2e_rep.gates:
+                gate_rows.append({
+                    "Gate ID": g.gate_id,
+                    "Gate Title": g.title,
+                    "Evaluation Question": g.question,
+                    "Status": g.status,
+                    "Supporting Evidence IDs": ", ".join(g.supporting_evidence_ids) or "None",
+                    "Rationale": g.rationale,
+                    "Open Questions": "; ".join(g.open_questions) or "None",
+                })
+            st.dataframe(pd.DataFrame(gate_rows), use_container_width=True, hide_index=True)
+
+        # ── SUB-TAB 4: EVIDENCE REGISTER (LEVELS 3–6, E1–E14) ──
+        with res_tab4:
+            st.markdown("##### Point-of-Capture Evidence Register (`E1–E14` & `G1–G4`)")
+            if not e2e_rep.evidence_records:
+                st.info(
+                    "No evidence records captured in this run. "
+                    + (
+                        "External search is currently unconfigured (`MERIDIAN_SERPAPI_KEY` is blank)."
+                        if not is_synthetic_demo and not readiness.search_configured
+                        else "No qualifying excerpts were extracted."
+                    )
+                )
+            else:
+                weight_by_id = {w.evidence_id: w for w in e2e_rep.weighted_evidence}
+                cls_by_id = {c.evidence_id: c for c in e2e_rep.signal_classifications}
+
+                all_sources = sorted({ev.source_class for ev in e2e_rep.evidence_records})
+                all_strengths = sorted({
+                    (weight_by_id[ev.evidence_id].evidence_strength.value if ev.evidence_id in weight_by_id else ev.evidence_strength.value)
+                    for ev in e2e_rep.evidence_records
+                })
+                all_scopes = sorted({ev.scope.value for ev in e2e_rep.evidence_records})
+
+                f_c1, f_c2, f_c3, f_c4, f_c5 = st.columns([2, 2, 2, 2, 3])
+                with f_c1:
+                    flt_source = st.multiselect("Source Class (S1–S12)", options=all_sources, default=[], key=f"ev_flt_src_{cache_key}")
+                with f_c2:
+                    flt_strength = st.multiselect("Evidence Strength", options=all_strengths, default=[], key=f"ev_flt_str_{cache_key}")
+                with f_c3:
+                    flt_gate = st.multiselect("Supports Gate", options=["G1", "G2", "G3", "G4"], default=[], key=f"ev_flt_gate_{cache_key}")
+                with f_c4:
+                    flt_scope = st.multiselect("Product Scope", options=all_scopes, default=[], key=f"ev_flt_scp_{cache_key}")
+                with f_c5:
+                    flt_kw = st.text_input("Keyword Filter (URL, Excerpt, E-Rule)", value="", key=f"ev_flt_kw_{cache_key}")
+
+                filtered_evs = []
+                for ev in e2e_rep.evidence_records:
+                    we = weight_by_id.get(ev.evidence_id)
+                    eff_strength = we.evidence_strength.value if we else ev.evidence_strength.value
+                    eff_erules = we.fired_e_rule_ids if we else ev.e_rule_ids
+                    ev_gates = gates_for_evidence(e2e_rep, ev.evidence_id)
+                    if flt_source and ev.source_class not in flt_source:
+                        continue
+                    if flt_strength and eff_strength not in flt_strength:
+                        continue
+                    if flt_gate and not any(g in ev_gates for g in flt_gate):
+                        continue
+                    if flt_scope and ev.scope.value not in flt_scope:
+                        continue
+                    if flt_kw.strip():
+                        kw_low = flt_kw.strip().lower()
+                        searchable = f"{ev.evidence_id} {ev.canonical_url} {ev.verbatim_excerpt} {' '.join(eff_erules)}".lower()
+                        if kw_low not in searchable:
+                            continue
+                    filtered_evs.append(ev)
+
+                st.caption(f"Showing {len(filtered_evs)} of {len(e2e_rep.evidence_records)} evidence record(s).")
+
+                ev_table_rows = []
+                for ev in filtered_evs:
+                    we = weight_by_id.get(ev.evidence_id)
+                    cls_r = cls_by_id.get(ev.evidence_id)
+                    ev_gates = gates_for_evidence(e2e_rep, ev.evidence_id)
+                    ev_table_rows.append({
+                        "Evidence ID": ev.evidence_id,
+                        "Source Class": f"{ev.source_class} (Grade {ev.source_reliability_grade})",
+                        "Source URL": ev.canonical_url,
+                        "Retrieved At (UTC)": ev.retrieved_at,
+                        "Scope": ev.scope.value,
+                        "AI Type": ev.ai_type.value,
+                        "Evidence Strength": we.evidence_strength.value if we else ev.evidence_strength.value,
+                        "Weight Band": we.weight_band.value if we else "—",
+                        "E1–E14 Rules": ", ".join(we.fired_e_rule_ids if we else ev.e_rule_ids),
+                        "Gates": ", ".join(ev_gates),
+                        "L6 Classifier": (
+                            f"{cls_r.classification_method.value} ({cls_r.model_used or 'DETERMINISTIC'} [{cls_r.model_execution_status or 'OK'}])"
+                            if cls_r else "—"
+                        ),
+                        "Verbatim Excerpt": ev.verbatim_excerpt,
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(ev_table_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Source URL": st.column_config.LinkColumn("Source URL", display_text="Open Source URL"),
+                    },
                 )
 
-        if e2e_rep.unavailable_integrations:
-            with st.expander("🔌 Unconfigured External Integrations & Offline Boundaries", expanded=not is_synthetic_demo):
-                for msg in e2e_rep.unavailable_integrations:
-                    st.markdown(f"• {msg}")
+                with st.expander("Inspect Full Verbatim Excerpts, SHA-256 Hashes & E1–E14 Rule Audit", expanded=True):
+                    for ev in filtered_evs:
+                        we = weight_by_id.get(ev.evidence_id)
+                        cls_r = cls_by_id.get(ev.evidence_id)
+                        erules_str = ", ".join(we.fired_e_rule_ids if we else ev.e_rule_ids)
+                        gates_str = ", ".join(gates_for_evidence(e2e_rep, ev.evidence_id)) or "None"
+                        hostile_badge = " · **HOSTILE PROMPT INJECTION ISOLATED (E14)**" if ev.hostile_instruction_detected else ""
+                        st.markdown(
+                            f"**`{ev.evidence_id}`** · Source **`{ev.source_class}`** (Grade `{ev.source_reliability_grade}`) · "
+                            f"Retrieved: `{ev.retrieved_at}` · Scope: `{ev.scope.value}` · "
+                            f"Strength: **`{we.evidence_strength.value if we else ev.evidence_strength.value}`** · "
+                            f"E-Rules: `{erules_str}` · Gates: `{gates_str}`{hostile_badge}\n\n"
+                            f"- **Source URL:** [{ev.canonical_url}]({ev.canonical_url})  |  "
+                            f"**SHA-256:** `{ev.content_sha256}`  |  **Offsets:** `{ev.char_start}:{ev.char_end}`\n"
+                            f"- **Verbatim Excerpt:** *\"{ev.verbatim_excerpt}\"*"
+                        )
+                        if cls_r:
+                            st.caption(
+                                f"Level 6 Classification: `{cls_r.signal_category.value}` | Method: `{cls_r.classification_method.value}` | "
+                                f"Model: `{cls_r.model_used or 'DETERMINISTIC'}` [`{cls_r.model_execution_status or 'DETERMINISTIC_ONLY'}`] — {cls_r.rationale}"
+                            )
+                        st.divider()
 
-        # 2. Level 3B–6: URL Triage, Extraction, RAG & Signal Classification
-        e2e_c_left, e2e_c_right = st.columns(2, gap="large")
-        with e2e_c_left:
-            st.markdown('<div class="sec-header"><span>2. Level 3B &amp; 4: URL Triage &amp; Point-of-Capture Evidence</span></div>', unsafe_allow_html=True)
-            if not e2e_rep.url_triage_decisions:
-                st.caption("No candidate URLs queued for triage in unconfigured search mode.")
-            else:
-                for td in e2e_rep.url_triage_decisions:
-                    mdl_badge = f" · Model: `{td.model_used}` [`{td.model_execution_status}`]" if td.model_used else ""
-                    st.markdown(
-                        f"**[{td.action.value}]** `{td.url}` — Source `{td.candidate_source_class}` "
-                        f"(Confidence: `{td.confidence}`, Method: `{td.decision_method.value}`{mdl_badge})\n\n"
-                        f"<span style='font-size:0.74rem;color:#475569'>{td.rationale}</span>",
-                        unsafe_allow_html=True,
+            with st.expander(f"Level 3B Candidate-URL Triage Log ({len(e2e_rep.url_triage_decisions)} URLs)", expanded=False):
+                if not e2e_rep.url_triage_decisions:
+                    st.caption("No candidate URLs queued for triage in this run.")
+                else:
+                    t_rows = [
+                        {
+                            "Candidate ID": td.candidate_id,
+                            "Action": getattr(td.action, "value", str(td.action)),
+                            "Source Class": td.candidate_source_class,
+                            "Scope Relevance": getattr(td.product_scope_relevance, "value", str(td.product_scope_relevance)),
+                            "Target Gates": ", ".join(td.target_gates),
+                            "Confidence": td.confidence,
+                            "Method": getattr(td.decision_method, "value", str(td.decision_method)),
+                            "Model Used": td.model_used or "DETERMINISTIC",
+                            "Model Status": td.model_execution_status or "DETERMINISTIC_ONLY",
+                            "URL": td.url,
+                            "Rationale": td.rationale,
+                        }
+                        for td in e2e_rep.url_triage_decisions
+                    ]
+                    st.dataframe(
+                        pd.DataFrame(t_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={"URL": st.column_config.LinkColumn("URL")},
                     )
-            if e2e_rep.evidence_records:
-                with st.expander(f"📄 Point-of-Capture Evidence Records ({len(e2e_rep.evidence_records)})", expanded=True):
-                    for ev in e2e_rep.evidence_records:
-                        st.markdown(f"""
+
+            with st.expander("Level 5 Semantic Filtering & RAG Chunking Summary", expanded=False):
+                rag_s = e2e_rep.semantic_retrieval
+                st.markdown(
+                    f"- **Status:** `{rag_s.status}` | **Embedding Model:** `{rag_s.model_name}` (Available: `{rag_s.model_available}`)\n"
+                    f"- **Chunk Size:** `{rag_s.chunk_size_tokens}` tokens (`{rag_s.chunk_overlap_tokens}` token overlap)\n"
+                    f"- **Chunks Created:** `{rag_s.chunks_created}` | **Chunks Embedded:** `{rag_s.chunks_embedded}` | **Concept Matches:** `{len(rag_s.matches)}`"
+                )
+                for lim in rag_s.limitations:
+                    st.caption(f"Note: {lim}")
+
+        # ── SUB-TAB 5: RISK FINDINGS (R1–R8) & RECOMMENDED FOLLOW-UP ACTIONS (LEVELS 8–9) ──
+        with res_tab5:
+            st.markdown("##### Level 8 AI Security Risk Findings (`R1–R8`) & Recommended Follow-Up Actions")
+            st.caption(
+                "Rule-determined fields (Rule ID, Severity, Exposure Determination, Supporting Evidence IDs, Verbatim Quotes, and Remediation) "
+                "are strictly deterministic. Optional Model B (`mistral:latest`) narrative explanations are separated below and validated against cited evidence."
+            )
+            if not e2e_rep.risk_findings:
+                st.info("No R1–R8 AI risk findings triggered for this assessment run.")
+            else:
+                rf_c1, rf_c2 = st.columns(2)
+                all_sev = sorted({rf.severity.value for rf in e2e_rep.risk_findings})
+                all_det = sorted({rf.exposure_determination.value for rf in e2e_rep.risk_findings})
+                with rf_c1:
+                    flt_sev = st.multiselect("Filter by Severity", options=all_sev, default=[], key=f"rf_flt_sev_{cache_key}")
+                with rf_c2:
+                    flt_det = st.multiselect("Filter by Exposure Determination", options=all_det, default=[], key=f"rf_flt_det_{cache_key}")
+
+                shown_rfs = [
+                    rf for rf in e2e_rep.risk_findings
+                    if (not flt_sev or rf.severity.value in flt_sev)
+                    and (not flt_det or rf.exposure_determination.value in flt_det)
+                ]
+
+                for rf in shown_rfs:
+                    llm_status_str = rf.model_execution_status or "DETERMINISTIC_ONLY"
+                    is_llm_fallback = rf.summary_method != "LOCAL_LLM_VALIDATED"
+                    st.markdown(
+                        f"""
                         <div class="factor-card">
-                            <div style="display:flex;justify-content:space-between">
-                                <strong>[{ev.evidence_id}] Source {ev.source_class} (Grade {ev.source_reliability_grade})</strong>
-                                <code>SHA-256: {ev.content_sha256[:16]}...</code>
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <strong>[{rf.risk_rule_id}] {rf.risk_title} (<code>{rf.finding_id}</code>)</strong>
+                                <span>
+                                    Rule Severity: <strong><code>{rf.severity.value}</code></strong> &nbsp;·&nbsp;
+                                    Rule Exposure: <code>{rf.exposure_determination.value}</code> &nbsp;·&nbsp;
+                                    Confidence: <code>{rf.confidence}</code>
+                                </span>
                             </div>
-                            <div style="font-size:0.72rem;color:#2563eb;margin-top:0.15rem"><code>{ev.canonical_url}</code></div>
-                            <div style="font-size:0.73rem;color:#0f172a;background:#f8fafc;padding:0.35rem 0.5rem;border-radius:4px;margin-top:0.25rem">
-                                <em>"{ev.verbatim_excerpt[:280]}"</em>
+                            <div style="font-size:0.76rem;color:#0f172a;margin-top:0.35rem">
+                                <strong>Deterministic Rule Finding:</strong> {rf.finding_description}
                             </div>
-                            <div style="font-size:0.68rem;color:#64748b;margin-top:0.2rem">
-                                Scope: <code>{ev.scope.value}</code> · AI Type: <code>{ev.ai_type.value}</code> ·
-                                Strength: <code>{ev.evidence_strength.value}</code> · Offsets: <code>{ev.char_start}:{ev.char_end}</code> ·
-                                Date: <code>{ev.published_or_observed_date or 'Undated'}</code>
+                            <div style="font-size:0.73rem;color:#334155;margin-top:0.25rem">
+                                <strong>Supporting Evidence IDs:</strong> <code>{', '.join(rf.evidence_ids)}</code> &nbsp;|&nbsp;
+                                <strong>Fired E-Rules:</strong> <code>{', '.join(rf.fired_e_rules) or 'None'}</code> &nbsp;|&nbsp;
+                                <strong>Gates:</strong> <code>{', '.join(rf.fired_gate_rules) or 'None'}</code>
+                            </div>
+                            <div style="font-size:0.73rem;color:#1e293b;background:#f8fafc;border-left:3px solid {'#0284c7' if not is_llm_fallback else '#64748b'};padding:0.4rem 0.6rem;border-radius:4px;margin-top:0.35rem">
+                                <strong>Analyst Explanation (Method: <code>{rf.summary_method}</code> · Model: <code>{rf.model_used or 'DETERMINISTIC'}</code> [<code>{llm_status_str}</code>]):</strong><br>
+                                {rf.analyst_explanation or rf.finding_description}
+                            </div>
+                            <div style="font-size:0.74rem;color:#0f172a;margin-top:0.35rem">
+                                <strong>Recommended Follow-Up / Remediation Action:</strong> {rf.recommended_remediation}
                             </div>
                         </div>
-                        """, unsafe_allow_html=True)
-
-        with e2e_c_right:
-            st.markdown('<div class="sec-header"><span>3. Level 7: E1–E14 Weighting, G1–G4 Gates &amp; AI-Use Verdict</span></div>', unsafe_allow_html=True)
-            if e2e_rep.ai_use_verdict:
-                v_obj = e2e_rep.ai_use_verdict
-                st.markdown(f"""
-                <div class="factor-card">
-                    <div style="display:flex;justify-content:space-between;align-items:center">
-                        <strong>Rulebook AI-Use Verdict: <code>{v_obj.verdict.value}</code></strong>
-                        <span style="font-size:0.72rem">Depth Completed: <strong>{v_obj.depth_completed}</strong></span>
-                    </div>
-                    <div style="font-size:0.75rem;color:#334155;margin-top:0.25rem">{v_obj.verdict_statement}</div>
-                    <div style="font-size:0.72rem;color:#475569;margin-top:0.2rem">{v_obj.basis_summary}</div>
-                    <div style="font-size:0.7rem;color:#64748b;margin-top:0.25rem">
-                        Models: <code>{', '.join(e2e_rep.named_models) or 'None'}</code> ·
-                        Providers: <code>{', '.join(e2e_rep.named_providers) or 'None'}</code> ·
-                        Hosting: <code>{', '.join(e2e_rep.hosting_infrastructures) or 'None'}</code>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                for g_eval in e2e_rep.gates:
-                    st.markdown(
-                        f"• **[{g_eval.gate_id}] {g_eval.title}:** `{g_eval.status}` — {g_eval.rationale}"
+                        """,
+                        unsafe_allow_html=True,
                     )
-            if e2e_rep.weighted_evidence:
-                with st.expander(f"⚖️ E1–E14 Weighted Evidence Items ({len(e2e_rep.weighted_evidence)})", expanded=False):
-                    for w_item in e2e_rep.weighted_evidence:
-                        rules_str = ", ".join(w_item.fired_e_rule_ids)
-                        lo, hi = w_item.weight_band_range
-                        st.markdown(
-                            f"• **{w_item.evidence_id}** (`{w_item.source_class}`) → "
-                            f"Strength: `{w_item.evidence_strength.value}` | Band: `{w_item.weight_band.value}` "
-                            f"[`{lo:.2f}–{hi:.2f}`] | Rules: `{rules_str}`"
-                        )
 
-        # 3. Level 8 & 9: R1–R8 Risk Findings & Deterministic Risk Rating
-        st.markdown('<div class="sec-header"><span>4. Level 8 &amp; 9: R1–R8 AI Risk Findings &amp; Deterministic Risk Score</span></div>', unsafe_allow_html=True)
-        if not e2e_rep.risk_findings:
-            st.caption("No R1–R8 AI risk findings triggered for the current evidence set.")
-        else:
-            for rf in e2e_rep.risk_findings:
-                sum_meta = (
-                    f"Summary: <code>{rf.summary_method}</code>"
-                    + (f" via <code>{rf.model_used}</code>" if rf.model_used else "")
-                )
-                expl_html = (
-                    f"<div style='font-size:0.73rem;color:#1e293b;background:#f8fafc;padding:0.35rem 0.5rem;border-radius:4px;margin-top:0.2rem'>"
-                    f"<strong>Analyst Explanation:</strong> {rf.analyst_explanation}</div>"
-                    if rf.analyst_explanation and rf.analyst_explanation != rf.finding_description
-                    else ""
-                )
-                st.markdown(f"""
-                <div class="factor-card">
-                    <div style="display:flex;justify-content:space-between;align-items:center">
-                        <strong>[{rf.risk_rule_id}] {rf.risk_title}</strong>
-                        <span>Severity: <code>{rf.severity.value}</code> · Exposure: <code>{rf.exposure_determination.value}</code> · Confidence: <code>{rf.confidence}</code></span>
-                    </div>
-                    <div style="font-size:0.75rem;color:#334155;margin-top:0.25rem">{rf.finding_description}</div>
-                    {expl_html}
-                    <div style="font-size:0.72rem;color:#0f172a;margin-top:0.25rem">
-                        <strong>Recommended Remediation:</strong> {rf.recommended_remediation}
-                    </div>
-                    <div style="font-size:0.68rem;color:#64748b;margin-top:0.2rem">
-                        Supporting Evidence IDs: <code>{', '.join(rf.evidence_ids)}</code> &nbsp;·&nbsp; {sum_meta}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-
-        if e2e_rep.deterministic_risk_score:
+            st.markdown("##### Level 9 Deterministic Risk Rating (`Risk Score = M_c * sum(S_i * W_i)`)")
             drs = e2e_rep.deterministic_risk_score
-            st.markdown(f"""
-            <div class="factor-card" style="background:#f8fafc">
-                <strong>Level 9 Deterministic Formula:</strong> <code>{drs.calculation_method}</code><br>
-                <strong>Policy Status:</strong> <code>{drs.policy_status.value}</code><br>
-                <strong>Numerical Risk Score:</strong> <code>{drs.final_risk_score if drs.final_risk_score is not None else 'NOT ACTIVATED (Policy Unconfigured)'}</code> &nbsp;·&nbsp;
-                <strong>Overall Risk Rating:</strong> <code>{drs.overall_risk_rating or 'N/A'}</code><br>
-                <span style="font-size:0.75rem;color:#475569">{drs.status_message}</span>
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown(
+                f"- **Policy Readiness Status:** **`{drs.policy_status.value}`** (Policy Version: `{drs.policy_version}`)\n"
+                f"- **Calculation Formula:** `{drs.calculation_method}`\n"
+                f"- **Vendor Criticality Tier (`M_c`):** `{drs.criticality_tier}` (Multiplier: `{drs.criticality_multiplier if drs.criticality_multiplier is not None else 'UNCONFIGURED'}`)\n"
+                f"- **Distinct Findings Evaluated:** `{drs.distinct_findings_scored}` (`{drs.duplicates_suppressed}` duplicate exposure(s) suppressed)\n"
+                f"- **Final Numerical Risk Score:** **`{drs.final_risk_score if drs.final_risk_score is not None else 'None (SCORING_POLICY_UNCONFIGURED)'}`** | **Overall Rating:** `{drs.overall_risk_rating or 'UNCONFIGURED'}`\n"
+                f"- **Status Explanation:** {drs.status_message}"
+            )
+            if drs.finding_breakdowns:
+                bd_rows = [
+                    {
+                        "Finding ID": b.finding_id,
+                        "Rule": b.risk_rule_id,
+                        "Deduplication Key": b.dedup_exposure_key,
+                        "Severity": b.severity_label,
+                        "S_i (Numeric)": b.severity_numeric if b.severity_numeric is not None else "UNCONFIGURED",
+                        "W_i (Weight)": b.evidentiary_weight if b.evidentiary_weight is not None else "UNCONFIGURED",
+                        "S_i * W_i": b.weighted_contribution if b.weighted_contribution is not None else "UNCONFIGURED",
+                        "Primary (Not Duplicate)": "YES" if b.is_deduplicated_primary else "NO (Suppressed)",
+                        "Evidence IDs": ", ".join(b.source_evidence_ids),
+                    }
+                    for b in drs.finding_breakdowns
+                ]
+                st.dataframe(pd.DataFrame(bd_rows), use_container_width=True, hide_index=True)
 
-        # 4. Human Validation & Export
-        st.markdown('<div class="sec-header"><span>5. Human Validation &amp; Full Report Export</span></div>', unsafe_allow_html=True)
-        hv_c1, hv_c2 = st.columns([6, 4])
-        with hv_c1:
+        # ── SUB-TAB 6: STAGE AUDIT, TELEMETRY, HUMAN VALIDATION & CLEAN EXPORTS ──
+        with res_tab6:
+            st.markdown("##### Clean Assessment Report & Evidence Exports")
+            st.caption(
+                "Export the complete assessment report or filtered evidence register. Exports include run ID, timestamp, "
+                "provenance hashes, stage statuses, and human-validation records, and never include API keys or secrets."
+            )
+            dl_c1, dl_c2, dl_c3, dl_c4 = st.columns(4)
+            with dl_c1:
+                st.download_button(
+                    "Download Assessment JSON (.json)",
+                    data=AssessmentReportExporter.to_json(e2e_rep),
+                    file_name=f"Meridian_Assessment_{e2e_rep.vendor_id}_{e2e_rep.report_id}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key=f"dl_json_{cache_key}",
+                )
+            with dl_c2:
+                st.download_button(
+                    "Download Evidence CSV (.csv)",
+                    data=AssessmentReportExporter.to_evidence_csv(e2e_rep),
+                    file_name=f"Meridian_Evidence_{e2e_rep.vendor_id}_{e2e_rep.report_id}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key=f"dl_csv_{cache_key}",
+                )
+            with dl_c3:
+                st.download_button(
+                    "Download Markdown Report (.md)",
+                    data=AssessmentReportExporter.to_markdown(e2e_rep),
+                    file_name=f"Meridian_Report_{e2e_rep.vendor_id}_{e2e_rep.report_id}.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                    key=f"dl_md_{cache_key}",
+                )
+            with dl_c4:
+                st.download_button(
+                    "Download HTML Report (.html)",
+                    data=AssessmentReportExporter.to_html(e2e_rep),
+                    file_name=f"Meridian_Report_{e2e_rep.vendor_id}_{e2e_rep.report_id}.html",
+                    mime="text/html",
+                    use_container_width=True,
+                    key=f"dl_html_{cache_key}",
+                )
+
+            st.divider()
+            st.markdown("##### Dual-Model Routing & 6 GB VRAM Lifecycle Telemetry")
+            if e2e_rep.model_routing_telemetry:
+                tel = e2e_rep.model_routing_telemetry
+                assignments = tel.get("model_assignments", {})
+                vram_info = tel.get("vram_management", {})
+                tasks_tel = tel.get("tasks", {})
+                tel_rows = []
+                for t_key, t_label in [
+                    ("URL_TRIAGE", "Level 3B: Candidate-URL Triage (Model A)"),
+                    ("RAG_EMBEDDING", "Level 5: Semantic Chunk Embedding (Separate Model)"),
+                    ("EVIDENCE_CLASSIFICATION", "Level 6: Signal Classification (Model B)"),
+                    ("RISK_SUMMARIZATION", "Level 8: Risk Finding Summarization (Model B)"),
+                ]:
+                    td = tasks_tel.get(t_key, {})
+                    tel_rows.append({
+                        "Pipeline Task": t_label,
+                        "Assigned Model": assignments.get(t_key, "N/A"),
+                        "Overall Status": td.get("overall_status", "NOT_CALLED"),
+                        "Calls Total": td.get("calls_total", 0),
+                        "Calls Succeeded": td.get("calls_succeeded", 0),
+                        "Total Latency (ms)": td.get("total_latency_ms", 0.0),
+                        "Errors / Fallback Notes": "; ".join(td.get("errors", [])) or "None",
+                    })
+                st.dataframe(pd.DataFrame(tel_rows), use_container_width=True, hide_index=True)
+                unload_evts = vram_info.get("vram_unload_events", [])
+                st.caption(
+                    f"Ollama Endpoint: `{tel.get('ollama_endpoint')}` | Enabled: `{tel.get('ollama_enabled')}` | "
+                    f"Sequential VRAM Unload (`keep_alive=0`): `{vram_info.get('unload_on_model_switch')}` "
+                    f"({len(unload_evts)} unload event(s) recorded in this run)."
+                )
+
+            st.divider()
+            st.markdown("##### Human Validation & Governance Sign-Off")
             if e2e_rep.human_Review_required:
                 st.warning(
-                    "Human validation is required for this assessment: "
-                    + "; ".join(e2e_rep.human_review_triggers)
+                    "Human validation is required before final governance sign-off: "
+                    + " | ".join(e2e_rep.human_review_triggers)
                 )
-            with st.expander("✍️ Record Analyst Validation / Verdict Sign-Off", expanded=False):
+            hv_f1, hv_f2 = st.columns([5, 5], gap="large")
+            with hv_f1:
                 hv_reviewer = st.text_input("Reviewer Name / Role", value="Primary TPRM Analyst", key=f"hv_rev_{cache_key}")
+                hv_target_type = st.selectbox(
+                    "Validation Target Type",
+                    options=["VERDICT", "GATE", "RISK_FINDING", "CRITICALITY_O5"],
+                    key=f"hv_ttype_{cache_key}",
+                )
                 hv_decision = st.selectbox(
-                    "Validation Action",
-                    options=["CONFIRM_ASSESSMENT", "OVERRIDE_AI_VERDICT"],
+                    "Validation Decision",
+                    options=["CONFIRM_ASSESSMENT", "OVERRIDE_AI_VERDICT", "ACCEPT_WITH_CONDITIONS"],
                     key=f"hv_dec_{cache_key}",
                 )
+            with hv_f2:
                 hv_verdict = st.selectbox(
-                    "Final AI-Use Verdict",
+                    "Updated Status / Verdict",
                     options=["YES", "INCONCLUSIVE", "NO", "INCOMPLETE_ASSESSMENT"],
                     index=0,
                     key=f"hv_verd_{cache_key}",
                 )
                 hv_rat = st.text_area(
-                    "Mandatory Validation Rationale",
-                    placeholder="Document evidence review and validation rationale...",
+                    "Mandatory Written Rationale",
+                    placeholder="Document evidence review, compensating controls, and validation rationale...",
                     key=f"hv_rat_{cache_key}",
                 )
-                if st.button("Save Human Validation Record", key=f"btn_save_hv_{cache_key}", use_container_width=True):
+                if st.button("Record Human Validation Decision", type="primary", key=f"btn_save_hv_{cache_key}", use_container_width=True):
                     try:
                         val_rec = HumanValidationService.create_validation_record(
                             vendor_id=e2e_rep.vendor_id,
-                            target_type="VERDICT",
-                            target_id="AI_USE_VERDICT",
+                            target_type=hv_target_type,
+                            target_id="AI_USE_VERDICT" if hv_target_type == "VERDICT" else hv_target_type,
                             proposed_automated_finding=verdict_val,
                             human_decision=hv_decision,
                             rationale=hv_rat,
                             original_status=verdict_val,
-                            updated_status=hv_verdict if hv_decision == "OVERRIDE_AI_VERDICT" else verdict_val,
+                            updated_status=hv_verdict if hv_decision != "CONFIRM_ASSESSMENT" else verdict_val,
                             reviewer_id=hv_reviewer,
                         )
                         e2e_rep.human_validations.append(val_rec)
-                        st.success("Human validation recorded in audit history.")
+                        st.success(f"Recorded human validation `{val_rec.validation_id}`.")
                         st.rerun()
                     except ValueError as err:
                         st.error(str(err))
-        with hv_c2:
-            e2e_json_str = json.dumps(e2e_rep.model_dump(mode="json"), indent=2)
-            st.download_button(
-                "⬇ Export Complete 9-Level Report (JSON)",
-                data=e2e_json_str,
-                file_name=f"Meridian_9Level_Report_{e2e_rep.vendor_id}.json",
-                mime="application/json",
-                use_container_width=True,
-                key=f"btn_dl_e2e_{cache_key}",
-            )
+
+            if e2e_rep.human_validations:
+                st.markdown("**Logged Human Validation Records:**")
+                hv_rows = [
+                    {
+                        "Validation ID": hv.validation_id,
+                        "Target": f"{hv.target_type}:{hv.target_id}",
+                        "Decision": hv.human_decision,
+                        "Original Status": hv.original_status,
+                        "Updated Status": hv.updated_status,
+                        "Reviewer": hv.reviewer_id,
+                        "Reviewed At (UTC)": hv.reviewed_at,
+                        "Rationale": hv.rationale,
+                    }
+                    for hv in e2e_rep.human_validations
+                ]
+                st.dataframe(pd.DataFrame(hv_rows), use_container_width=True, hide_index=True)
+
 
 

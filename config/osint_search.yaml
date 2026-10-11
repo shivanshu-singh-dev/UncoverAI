@@ -2,7 +2,7 @@
 # Defines execution bounds, supported API search backends, and conservative URL canonicalization rules.
 
 execution:
-  default_provider: "google_cse"
+  default_provider: "serpapi"
   timeout_seconds: 10.0
   max_results_per_query: 10
   max_retries: 2

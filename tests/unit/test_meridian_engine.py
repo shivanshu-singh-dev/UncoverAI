@@ -53,6 +53,9 @@ class TestMeridianEngine:
         assert res.V.score == 3
         # P = 2 (material transaction processing, not direct P3 clearing/settlement)
         assert res.P.score == 2
+        # R = 0 (no direct or indirect regulatory obligations in service description -> base_score = 2.20)
+        assert res.R.score == 0
+        assert res.base_score == pytest.approx(2.20)
         assert res.provisional_criticality == CriticalityLevel.HIGH
         # O3 triggered: D=3 and V=3
         o3 = next(o for o in res.overrides_evaluated if o.override_id == "O3")
@@ -107,8 +110,11 @@ class TestMeridianEngine:
         assert res.D.score == 3
         # P = 3 (RTP transmission)
         assert res.P.score == 3
+        # R = 0 (no regulatory obligation in RTP file transmission description)
+        assert res.R.score == 0
         # V = 2 (2.1 million messages)
         assert res.V.score == 2
+        assert res.base_score == pytest.approx(2.10)
         assert res.provisional_criticality == CriticalityLevel.HIGH
         # O4 Safeguard triggered: P=3 and O=2 -> High floor
         o4 = next(o for o in res.overrides_evaluated if o.override_id == "O4")
@@ -121,6 +127,9 @@ class TestMeridianEngine:
     def test_clearing_house_sanity(self, engine, vendors):
         v = next(x for x in vendors if x.vendor_id == "V-006")
         res = engine.evaluate(v)
+        # D = 2 (Payment messages in transit only -> payment_messages_in_transit)
+        assert res.D.score == 2
+        assert "payment_messages_in_transit" in res.D.matched_concepts
         # O = 3 (Critical)
         assert res.O.score == 3
         # P = 3 (ACH and RTP clearing and settlement)
@@ -130,9 +139,12 @@ class TestMeridianEngine:
         # R = 3 (Performs critical regulated function / clearing and settlement operation)
         assert res.R.score == 3
         assert "critical_regulated_function" in res.R.matched_concepts
-        # Base score = 2.70 -> Provisional criticality MUST be Critical (>= 2.50)
+        # Base score = 0.30*2 + 0.20*3 + 0.20*3 + 0.20*3 + 0.10*3 = 2.70 -> Provisional Critical (>= 2.50)
         assert res.base_score == pytest.approx(2.70)
         assert res.provisional_criticality == CriticalityLevel.CRITICAL
+        # O3 must NOT trigger because D=2 (not 3)
+        o3 = next(o for o in res.overrides_evaluated if o.override_id == "O3")
+        assert o3.triggered is False
         # O4 Safeguard triggered: P=3 and O=3 (High floor does not downgrade Critical)
         o4 = next(o for o in res.overrides_evaluated if o.override_id == "O4")
         assert o4.triggered is True

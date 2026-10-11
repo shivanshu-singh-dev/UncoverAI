@@ -2,7 +2,10 @@
 
 from meridian_assessment.services.risk.risk_analyzer import (
     AIRiskAnalyzer,
+    OllamaRiskSummaryAdapter,
     RISK_CATALOG,
+    RiskSummaryLLMProvider,
+    UnconfiguredRiskSummaryAdapter,
 )
 from meridian_assessment.services.risk.deterministic_scorer import (
     DeterministicRiskScoringEngine,
@@ -11,7 +14,11 @@ from meridian_assessment.services.risk.deterministic_scorer import (
 
 __all__ = [
     "AIRiskAnalyzer",
+    "OllamaRiskSummaryAdapter",
     "RISK_CATALOG",
+    "RiskSummaryLLMProvider",
+    "UnconfiguredRiskSummaryAdapter",
     "DeterministicRiskScoringEngine",
     "DeterministicRiskScoringPolicyError",
 ]
+

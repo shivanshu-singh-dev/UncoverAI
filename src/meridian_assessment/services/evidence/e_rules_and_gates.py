@@ -392,6 +392,33 @@ class ERuleEngineAndWeighter:
             record_rule("E12", "Opt-in/off-by-default feature", False, None, "No opt-in/off-by-default caveat detected.")
 
         # ── E13: No-training / ZDR assertion ──
+        if not ev.no_training_commitment and any(
+            p in low
+            for p in (
+                "not used to train",
+                "never used to train",
+                "not used for model training",
+                "never used for model training",
+                "prohibits using customer data to train",
+                "do not train",
+                "does not train",
+                "excluded from model training",
+                "no customer data training",
+            )
+        ):
+            ev.no_training_commitment = True
+        if not ev.zdr_commitment and any(
+            p in low
+            for p in (
+                "zero data retention",
+                "zero-data-retention",
+                "zdr",
+                "not retained after inference",
+                "0-day retention",
+            )
+        ):
+            ev.zdr_commitment = True
+
         if ev.no_training_commitment or ev.zdr_commitment:
             if src in ("S1", "S3", "S5"):
                 if current_strength in (EvidenceStrength.REQUIRES_REVIEW, EvidenceStrength.INDICATIVE, EvidenceStrength.MARKETING):
@@ -400,7 +427,7 @@ class ERuleEngineAndWeighter:
                 explanations.append(e13_msg)
                 record_rule("E13", "No-training/ZDR assertion", True, EvidenceStrength.STRONG, e13_msg)
             else:
-                if current_strength == EvidenceStrength.REQUIRES_REVIEW:
+                if current_strength in (EvidenceStrength.REQUIRES_REVIEW, EvidenceStrength.MARKETING):
                     current_strength = EvidenceStrength.INDICATIVE
                 e13_msg = f"Non-contractual / marketing ({src}) no-training claim is INDICATIVE only (Rule E13)."
                 explanations.append(e13_msg)

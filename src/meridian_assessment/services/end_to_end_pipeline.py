@@ -49,6 +49,7 @@ from meridian_assessment.models.osint_plan import (
 )
 from meridian_assessment.services.classification import (
     LocalLLMClassificationAdapter,
+    OllamaClassificationAdapter,
     SignalClassificationService,
     UnconfiguredOllamaAdapter,
 )
@@ -62,6 +63,11 @@ from meridian_assessment.services.extraction import (
     EvidenceRepository,
     OSINTExtractionService,
 )
+from meridian_assessment.services.llm.model_router import (
+    LLMTaskType,
+    ModelRoutingConfig,
+    OllamaModelRouter,
+)
 from meridian_assessment.services.meridian_criticality_engine import MeridianCriticalityEngine
 from meridian_assessment.services.osint import (
     OSINTCoverageTracker,
@@ -73,6 +79,7 @@ from meridian_assessment.services.osint import (
 )
 from meridian_assessment.services.osint.url_triage import (
     OSINTURLTriageService,
+    OllamaURLTriageProvider,
     URLTriageLLMProvider,
 )
 from meridian_assessment.services.rag import (
@@ -83,7 +90,11 @@ from meridian_assessment.services.rag import (
 from meridian_assessment.services.risk import (
     AIRiskAnalyzer,
     DeterministicRiskScoringEngine,
+    OllamaRiskSummaryAdapter,
+    RiskSummaryLLMProvider,
 )
+import os
+
 
 
 def _utc_now_iso() -> str:
@@ -199,17 +210,56 @@ class MeridianEndToEndPipeline:
         criticality_engine: Optional[MeridianCriticalityEngine] = None,
         investigation_planner: Optional[OSINTInvestigationPlanner] = None,
         search_backend: Optional[SearchBackend] = None,
+        model_router: Optional[OllamaModelRouter] = None,
+        enable_local_llm_from_env: Optional[bool] = None,
         triage_llm_provider: Optional[URLTriageLLMProvider] = None,
         fetch_adapter: Optional[ContentFetchAdapter] = None,
         evidence_repository: Optional[EvidenceRepository] = None,
         embedding_provider: Optional[EmbeddingProvider] = None,
         classification_llm_adapter: Optional[LocalLLMClassificationAdapter] = None,
+        risk_summary_llm_adapter: Optional[RiskSummaryLLMProvider] = None,
         scoring_engine: Optional[DeterministicRiskScoringEngine] = None,
     ) -> None:
         self.criticality_engine = criticality_engine or MeridianCriticalityEngine()
         self.investigation_planner = investigation_planner or OSINTInvestigationPlanner()
         self.search_backend = search_backend or build_search_backend_from_env()
-        self.triage_service = OSINTURLTriageService(llm_provider=triage_llm_provider)
+
+        if model_router is not None:
+            self.model_router = model_router
+        else:
+            # In normal CLI/UI execution, load .env and enable dual-model routing if MERIDIAN_OLLAMA_ENABLED=true.
+            # When running inside pytest without an explicit model_router or enable_local_llm_from_env=True,
+            # default to offline deterministic mode so unit tests remain fast and network-free.
+            in_pytest = "PYTEST_CURRENT_TEST" in os.environ
+            cfg = ModelRoutingConfig.from_env_and_config()
+            if enable_local_llm_from_env is True:
+                cfg.enabled = True
+            elif enable_local_llm_from_env is False or (enable_local_llm_from_env is None and in_pytest):
+                cfg.enabled = False
+            self.model_router = OllamaModelRouter(config=cfg)
+
+        if triage_llm_provider is not None:
+            resolved_triage_llm: Optional[URLTriageLLMProvider] = triage_llm_provider
+        elif self.model_router.config.enabled:
+            resolved_triage_llm = OllamaURLTriageProvider(router=self.model_router)
+        else:
+            resolved_triage_llm = None
+
+        if classification_llm_adapter is not None:
+            resolved_cls_llm: Optional[LocalLLMClassificationAdapter] = classification_llm_adapter
+        elif self.model_router.config.enabled:
+            resolved_cls_llm = OllamaClassificationAdapter(router=self.model_router)
+        else:
+            resolved_cls_llm = None
+
+        if risk_summary_llm_adapter is not None:
+            resolved_sum_llm: Optional[RiskSummaryLLMProvider] = risk_summary_llm_adapter
+        elif self.model_router.config.enabled:
+            resolved_sum_llm = OllamaRiskSummaryAdapter(router=self.model_router)
+        else:
+            resolved_sum_llm = None
+
+        self.triage_service = OSINTURLTriageService(llm_provider=resolved_triage_llm)
         self.fetch_adapter = fetch_adapter or DisabledOfflineFetchAdapter()
         self.evidence_repository = evidence_repository
         self.extraction_service = OSINTExtractionService(
@@ -218,9 +268,9 @@ class MeridianEndToEndPipeline:
             artifact_dir=self.evidence_repository.artifact_dir if self.evidence_repository else None,
         )
         self.rag_service = RAGChunkerAndRetriever(embedding_provider=embedding_provider)
-        self.classification_service = SignalClassificationService(llm_adapter=classification_llm_adapter)
+        self.classification_service = SignalClassificationService(llm_adapter=resolved_cls_llm)
         self.scoring_engine = scoring_engine or DeterministicRiskScoringEngine()
-        self.risk_analyzer = AIRiskAnalyzer()
+        self.risk_analyzer = AIRiskAnalyzer(summary_llm_adapter=resolved_sum_llm)
 
     def run_vendor_assessment(
         self,
@@ -244,6 +294,10 @@ class MeridianEndToEndPipeline:
         unavailable_integrations: list[str] = []
         limitations: list[str] = []
 
+        # Reset per-run call telemetry on router so each vendor report captures its exact calls
+        self.model_router.call_history.clear()
+        self.model_router.vram_unload_events.clear()
+
         # ── LEVEL 1: Criticality Tiering (D/P/R/O/V + O1–O5) ──
         crit_res = criticality_result or self.criticality_engine.evaluate(
             vendor, human_review=human_criticality_override
@@ -266,6 +320,9 @@ class MeridianEndToEndPipeline:
                     f"({approval_status.value})."
                 ),
                 limitations=list(crit_res.review_notes),
+                selected_model="DETERMINISTIC_RULEBOOK",
+                model_task="CRITICALITY_D_P_R_O_V",
+                model_execution_status="DETERMINISTIC_ONLY",
             )
         )
 
@@ -288,10 +345,13 @@ class MeridianEndToEndPipeline:
                     f"{len(plan.planned_queries)} deduplicated queries)."
                 ),
                 limitations=list(plan.unresolved_planning_issues),
+                selected_model="DETERMINISTIC_RULEBOOK",
+                model_task="OSINT_DEPTH_SCOPING",
+                model_execution_status="DETERMINISTIC_ONLY",
             )
         )
 
-        # ── LEVEL 3: Source Identification & Reconnaissance (Search + URL Triage) ──
+        # ── LEVEL 3: Source Identification & Reconnaissance (Search + URL Triage via Model A llama3.2:latest) ──
         search_ok, search_msg = self.search_backend.is_configured()
         if execute_searches:
             collector = OSINTSearchCollector(backend=self.search_backend, retry_backoff_seconds=0.0)
@@ -299,8 +359,24 @@ class MeridianEndToEndPipeline:
         if not search_ok:
             unavailable_integrations.append(f"Search Backend ({self.search_backend.provider_name}): {search_msg}")
 
+        triage_llm_ok, triage_llm_msg = self.triage_service.llm_provider.is_configured()
+        triage_model_name = (
+            getattr(self.triage_service.llm_provider, "model_name", None)
+            or self.model_router.resolve_model_for_task(LLMTaskType.URL_TRIAGE)
+        )
         triage_decisions: list[URLTriageDecision] = self.triage_service.triage_plan_candidates(plan)
         fetch_decisions = [d for d in triage_decisions if d.action == URLTriageAction.FETCH]
+
+        triage_llm_succeeded = sum(1 for d in triage_decisions if d.decision_method.value == "LOCAL_LLM")
+        triage_task_tel = self.model_router.get_task_telemetry_summary(LLMTaskType.URL_TRIAGE)
+        if not triage_llm_ok:
+            l3_model_status = "SKIPPED_DETERMINISTIC_FALLBACK"
+        elif not triage_decisions:
+            l3_model_status = "SKIPPED_NO_INPUT"
+        elif triage_llm_succeeded > 0:
+            l3_model_status = "SUCCEEDED" if triage_llm_succeeded == len(triage_decisions) else "PARTIAL_SUCCEEDED"
+        else:
+            l3_model_status = triage_task_tel["overall_status"]
 
         l3_status = (
             "COMPLETED"
@@ -309,6 +385,9 @@ class MeridianEndToEndPipeline:
             if not search_ok
             else "PARTIAL"
         )
+        l3_limits: list[str] = [] if search_ok else [search_msg]
+        if triage_task_tel.get("errors"):
+            l3_limits.extend(triage_task_tel["errors"])
         stage_ledger.append(
             StageExecutionRecord(
                 level_number=3,
@@ -317,9 +396,13 @@ class MeridianEndToEndPipeline:
                 summary=(
                     f"{len(plan.planned_queries)} planned queries; "
                     f"{len(plan.candidate_urls)} candidate URLs collected; "
-                    f"{len(fetch_decisions)} URLs triaged as FETCH."
+                    f"{len(fetch_decisions)} URLs triaged as FETCH "
+                    f"(Triage Model: {triage_model_name} [{l3_model_status}])."
                 ),
-                limitations=[] if search_ok else [search_msg],
+                limitations=l3_limits,
+                selected_model=triage_model_name,
+                model_task=LLMTaskType.URL_TRIAGE.value,
+                model_execution_status=l3_model_status,
             )
         )
 
@@ -404,15 +487,25 @@ class MeridianEndToEndPipeline:
                     f"{len(evidence_records)} traceable EvidenceRecord items created."
                 ),
                 limitations=[] if evidence_records else ["No extracted evidence records present."],
+                selected_model="N/A",
+                model_task="DOCUMENT_EXTRACTION",
+                model_execution_status="DETERMINISTIC_ONLY",
             )
         )
 
-        # ── LEVEL 5: Semantic Filtering & RAG Chunking ──
+        # ── LEVEL 5: Semantic Filtering & RAG Chunking (Separate Embedding Model) ──
         _, rag_summary = self.rag_service.retrieve_relevant_chunks(evidence_records)
         emb_ok, emb_msg = self.rag_service.embedding_provider.is_available()
         if not emb_ok:
             unavailable_integrations.append(f"RAG Embedding Model ({self.rag_service.model_name}): {emb_msg}")
 
+        l5_model_status = (
+            "SUCCEEDED"
+            if (rag_summary.model_available and rag_summary.chunks_embedded > 0)
+            else "SKIPPED_NO_INPUT"
+            if rag_summary.model_available
+            else "UNAVAILABLE"
+        )
         stage_ledger.append(
             StageExecutionRecord(
                 level_number=5,
@@ -424,19 +517,42 @@ class MeridianEndToEndPipeline:
                     f"{len(rag_summary.matches)} concept matches retrieved ({rag_summary.status})."
                 ),
                 limitations=list(rag_summary.limitations),
+                selected_model=self.rag_service.model_name,
+                model_task=LLMTaskType.RAG_EMBEDDING.value,
+                model_execution_status=l5_model_status,
             )
         )
 
-        # ── LEVEL 6: Signal Classification (with Prompt-Injection Defence & Optional Local LLM) ──
+        # ── LEVEL 6: Signal Classification (Model B mistral:latest + Prompt-Injection Defence) ──
         llm_ok, llm_msg = self.classification_service.llm_adapter.is_configured()
+        cls_model_name = (
+            getattr(self.classification_service.llm_adapter, "model_name", None)
+            or self.model_router.resolve_model_for_task(LLMTaskType.EVIDENCE_CLASSIFICATION)
+        )
         if not llm_ok:
-            unavailable_integrations.append(f"Local LLM Classifier (Ollama): {llm_msg}")
+            unavailable_integrations.append(f"Local LLM Classifier ({cls_model_name}): {llm_msg}")
 
         classifications = self.classification_service.classify_evidence_batch(
             evidence_records,
             meridian_service_scope=vendor.service_product_provided,
             meridian_business_process=vendor.business_process_supported,
         )
+        cls_llm_succeeded = sum(
+            1 for c in classifications if c.classification_method.value == "LOCAL_LLM_VALIDATED"
+        )
+        cls_task_tel = self.model_router.get_task_telemetry_summary(LLMTaskType.EVIDENCE_CLASSIFICATION)
+        if not llm_ok:
+            l6_model_status = "SKIPPED_DETERMINISTIC_FALLBACK"
+        elif not classifications:
+            l6_model_status = "SKIPPED_NO_INPUT"
+        elif cls_llm_succeeded > 0:
+            l6_model_status = "SUCCEEDED" if cls_llm_succeeded == len(classifications) else "PARTIAL_SUCCEEDED"
+        else:
+            l6_model_status = cls_task_tel["overall_status"]
+
+        l6_limits: list[str] = [] if llm_ok else [llm_msg]
+        if cls_task_tel.get("errors"):
+            l6_limits.extend(cls_task_tel["errors"])
         stage_ledger.append(
             StageExecutionRecord(
                 level_number=6,
@@ -444,9 +560,12 @@ class MeridianEndToEndPipeline:
                 status="COMPLETED" if classifications else "SKIPPED_NO_INPUT",
                 summary=(
                     f"{len(classifications)} evidence items classified "
-                    f"(Mode: {'Local LLM + Deterministic Rules' if llm_ok else 'Deterministic Rules'})."
+                    f"(Analysis Model: {cls_model_name} [{l6_model_status}])."
                 ),
-                limitations=[] if llm_ok else [llm_msg],
+                limitations=l6_limits,
+                selected_model=cls_model_name,
+                model_task=LLMTaskType.EVIDENCE_CLASSIFICATION.value,
+                model_execution_status=l6_model_status,
             )
         )
 
@@ -478,10 +597,18 @@ class MeridianEndToEndPipeline:
                     f"AI-Use Verdict: {ai_verdict.verdict.value}."
                 ),
                 limitations=list(ai_verdict.incomplete_reasons),
+                selected_model="DETERMINISTIC_RULEBOOK",
+                model_task="E1_E14_AND_G1_G4_VERDICT",
+                model_execution_status="DETERMINISTIC_ONLY",
             )
         )
 
-        # ── LEVEL 8: Risk Surfacing & Summarization (R1–R8) ──
+        # ── LEVEL 8: Risk Surfacing & Summarization (R1–R8 + Model B mistral:latest Summaries) ──
+        sum_llm_ok, sum_llm_msg = self.risk_analyzer.summary_llm_adapter.is_configured()
+        sum_model_name = (
+            getattr(self.risk_analyzer.summary_llm_adapter, "model_name", None)
+            or self.model_router.resolve_model_for_task(LLMTaskType.RISK_SUMMARIZATION)
+        )
         risk_findings = self.risk_analyzer.analyze_vendor_risks(
             vendor_id=vendor.vendor_id,
             evidence_records=evidence_records,
@@ -491,15 +618,41 @@ class MeridianEndToEndPipeline:
             data_classification_accessed=vendor.data_classification_accessed,
             service_product_provided=vendor.service_product_provided,
         )
+        sum_llm_succeeded = sum(1 for rf in risk_findings if rf.summary_method == "LOCAL_LLM_VALIDATED")
+        sum_task_tel = self.model_router.get_task_telemetry_summary(LLMTaskType.RISK_SUMMARIZATION)
+        if not sum_llm_ok:
+            l8_model_status = "SKIPPED_DETERMINISTIC_FALLBACK"
+        elif not risk_findings:
+            l8_model_status = "SKIPPED_NO_INPUT"
+        elif sum_llm_succeeded > 0:
+            l8_model_status = "SUCCEEDED" if sum_llm_succeeded == len(risk_findings) else "PARTIAL_SUCCEEDED"
+        else:
+            l8_model_status = sum_task_tel["overall_status"]
+
+        l8_limits: list[str] = []
+        if sum_task_tel.get("errors"):
+            l8_limits.extend(sum_task_tel["errors"])
         stage_ledger.append(
             StageExecutionRecord(
                 level_number=8,
                 level_name="Risk Surfacing & Summarization (R1–R8)",
                 status="COMPLETED" if risk_findings or ai_verdict.verdict == AIUseVerdictValue.NO else "PARTIAL",
-                summary=f"Surfaced {len(risk_findings)} evidence-backed R1–R8 risk finding(s).",
-                limitations=[],
+                summary=(
+                    f"Surfaced {len(risk_findings)} evidence-backed R1–R8 risk finding(s) "
+                    f"(Summary Model: {sum_model_name} [{l8_model_status}])."
+                ),
+                limitations=l8_limits,
+                selected_model=sum_model_name,
+                model_task=LLMTaskType.RISK_SUMMARIZATION.value,
+                model_execution_status=l8_model_status,
             )
         )
+
+        # Unload active generative model at end of Level 8 if configured
+        if self.model_router.config.unload_on_model_switch and self.model_router.active_generative_model:
+            self.model_router.unload_active_model(
+                reason="Level 8 risk summarization completed; releasing VRAM"
+            )
 
         # ── LEVEL 9: Deterministic Risk Rating (`M_c * sum(S_i * W_i)`) ──
         completeness_str = "COMPLETED" if ai_verdict.depth_completed else "INCOMPLETE"
@@ -524,8 +677,12 @@ class MeridianEndToEndPipeline:
                 limitations=[
                     f"Unconfigured scoring parameter: {p}" for p in risk_score_res.unconfigured_parameters
                 ],
+                selected_model="DETERMINISTIC_RULEBOOK",
+                model_task="DETERMINISTIC_RISK_SCORING",
+                model_execution_status="DETERMINISTIC_ONLY",
             )
         )
+
 
         # ── Human Validation & Final Report Assembly (Sections 20 & 21) ──
         review_triggers = HumanValidationService.evaluate_review_triggers(
@@ -652,9 +809,11 @@ class MeridianEndToEndPipeline:
             human_validations=all_validations,
             unresolved_questions=unresolved_questions,
             stage_ledger=stage_ledger,
+            model_routing_telemetry=self.model_router.get_full_telemetry_summary(),
             unavailable_integrations=unavailable_integrations,
             assessment_limitations=limitations + list(ai_verdict.incomplete_reasons),
         )
+
 
         if persist_to_repository and self.evidence_repository is not None:
             for doc in extracted_docs:

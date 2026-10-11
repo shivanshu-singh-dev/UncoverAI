@@ -26,6 +26,7 @@ from meridian_assessment.services.osint.search_collector import (
 )
 from meridian_assessment.services.osint.url_triage import (
     OSINTURLTriageService,
+    OllamaURLTriageProvider,
     URLTriageLLMProvider,
     UnconfiguredURLTriageLLMProvider,
 )
@@ -54,7 +55,9 @@ __all__ = [
     "build_search_backend_from_env",
     "canonicalize_url",
     "OSINTURLTriageService",
+    "OllamaURLTriageProvider",
     "URLTriageLLMProvider",
     "UnconfiguredURLTriageLLMProvider",
 ]
+
 

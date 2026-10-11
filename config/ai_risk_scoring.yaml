@@ -54,13 +54,19 @@ rag_chunking:
       query: "AI governance policy tenant isolation prompt injection guardrails SOC2 ISO42001"
       target_risks: ["R5", "R7", "R8"]
 
-# ─── Level 6: Optional Local-LLM (Ollama) Adapter Configuration ───────────────
+# ─── Dual-Model Local-LLM (Ollama) Routing Configuration (Levels 3B, 6 & 8) ──
 local_llm:
   enabled: false
   provider: "ollama"
-  endpoint: ""           # Set via MERIDIAN_OLLAMA_ENDPOINT when ready
-  model_name: ""         # Set via MERIDIAN_OLLAMA_MODEL when ready (no silent default model)
-  timeout_seconds: 15.0
+  endpoint: "http://localhost:11434"
+  triage_model: "llama3.2:latest"     # Model A (~2.0 GB): Level 3B URL & search-result triage
+  analysis_model: "mistral:latest"    # Model B (~4.4 GB): Level 6 deeper semantic signal classification
+  summary_model: "mistral:latest"     # Model B (~4.4 GB): Level 8 evidence-grounded risk summarization
+  model_name: "mistral:latest"        # Legacy fallback alias for analysis_model
+  timeout_seconds: 25.0
+  keep_alive: "2m"
+  unload_on_model_switch: true        # Unloads prior model (keep_alive=0) before switching models on 6 GB VRAM GPUs
+
 
 # ─── Level 7: Evidentiary Weight Bands (Case-Study Brief Ranges) ──────────────
 evidentiary_weighting:

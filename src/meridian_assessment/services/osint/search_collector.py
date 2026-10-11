@@ -640,10 +640,19 @@ def build_search_backend_from_env(
     *,
     env: Optional[dict[str, str]] = None,
     config_path: Path = _DEFAULT_SEARCH_CONFIG_PATH,
+    load_dotenv: bool = True,
 ) -> SearchBackend:
-    """Resolve and instantiate a SearchBackend from environment variables and config."""
-    environ = os.environ if env is None else env
+    """Resolve and instantiate a SearchBackend from environment variables (`.env`) and config."""
+    if env is None:
+        if load_dotenv:
+            from meridian_assessment.config.env_loader import load_dotenv_if_present
+
+            load_dotenv_if_present()
+        environ = os.environ
+    else:
+        environ = env
     selected = (provider or environ.get("MERIDIAN_SEARCH_PROVIDER", "")).strip().lower()
+
 
     # Auto-detect if MERIDIAN_SEARCH_PROVIDER was not explicitly set
     if not selected:

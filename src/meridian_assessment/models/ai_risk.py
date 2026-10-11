@@ -53,6 +53,9 @@ class URLTriageDecision(BaseModel):
     decision_method: TriageDecisionMethod = TriageDecisionMethod.DETERMINISTIC_HEURISTIC
     confidence: str = "MEDIUM"
     triaged_at: str
+    model_used: Optional[str] = None
+    model_execution_status: Optional[str] = None
+
 
 
 # ─── Level 4: Web/PDF Extraction & Evidence Models ────────────────────────────
@@ -274,6 +277,9 @@ class SignalClassificationResult(BaseModel):
     prompt_injection_detected: bool = False
     security_events: list[str] = Field(default_factory=list)
     classification_method: ClassificationMethod = ClassificationMethod.DETERMINISTIC_RULES
+    model_used: Optional[str] = None
+    model_execution_status: Optional[str] = None
+
 
 
 # ─── Level 7: Evidentiary Weighting & E1–E14 Models ───────────────────────────
@@ -396,6 +402,11 @@ class AIRiskFinding(BaseModel):
     recommended_remediation: str
     requires_human_review: bool = True
     dedup_exposure_key: str
+    analyst_explanation: Optional[str] = None
+    summary_method: str = "DETERMINISTIC_TEMPLATE"
+    model_used: Optional[str] = None
+    model_execution_status: Optional[str] = None
+
 
 
 # ─── Level 9: Deterministic AI Security Risk Rating Models ────────────────────
@@ -473,6 +484,9 @@ class StageExecutionRecord(BaseModel):
     status: str  # COMPLETED / PARTIAL / NOT_CONFIGURED / UNAVAILABLE / REQUIRES_REVIEW / SKIPPED_NO_INPUT
     summary: str
     limitations: list[str] = Field(default_factory=list)
+    selected_model: Optional[str] = None
+    model_task: Optional[str] = None
+    model_execution_status: Optional[str] = None
 
 
 class VendorEndToEndAssessmentReport(BaseModel):
@@ -532,7 +546,9 @@ class VendorEndToEndAssessmentReport(BaseModel):
     human_validations: list[HumanValidationRecord] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
 
-    # 11. Nine-Level Stage Execution Ledger & Limitations
+    # 11. Nine-Level Stage Execution Ledger, Model Routing Telemetry & Limitations
     stage_ledger: list[StageExecutionRecord] = Field(default_factory=list)
+    model_routing_telemetry: dict[str, Any] = Field(default_factory=dict)
     unavailable_integrations: list[str] = Field(default_factory=list)
     assessment_limitations: list[str] = Field(default_factory=list)
+

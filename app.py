@@ -23,7 +23,12 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from meridian_assessment.config.env_loader import load_dotenv_if_present
+
+load_dotenv_if_present()
+
 from meridian_assessment.models.criticality import CriticalityAssessment, CriticalityTier
+
 from meridian_assessment.models.assessment import AssessmentDepth
 from meridian_assessment.models.factor_result import (
     CriticalityLevel,
@@ -1930,7 +1935,8 @@ with tab_e2e:
                 "Execution Mode",
                 options=[
                     "Offline / Unconfigured Mode (Default — No Live Web or Model Calls)",
-                    "Offline Demo with Synthetic Test Fixtures (Labelled Test Walkthrough)",
+                    "Offline Demo with Synthetic Test Fixtures (Deterministic Rules)",
+                    "Dual-Model Local Ollama (llama3.2:latest + mistral:latest) + Synthetic Fixtures",
                 ],
                 key="e2e_exec_mode_select",
             )
@@ -1940,7 +1946,9 @@ with tab_e2e:
 
         selected_mv = meridian_vendor_map[e2e_vid]
         is_synthetic_demo = "Synthetic" in e2e_exec_mode
-        cache_key = f"{e2e_vid}::{'synthetic' if is_synthetic_demo else 'unconfigured'}"
+        use_dual_ollama = "Dual-Model Local Ollama" in e2e_exec_mode
+        mode_tag = "ollama_synth" if use_dual_ollama else ("synthetic" if is_synthetic_demo else "unconfigured")
+        cache_key = f"{e2e_vid}::{mode_tag}"
 
         if run_e2e_btn or cache_key not in st.session_state.e2e_reports:
             h_rev = st.session_state.human_overrides.get(e2e_vid)
@@ -1949,6 +1957,7 @@ with tab_e2e:
                 pipeline = MeridianEndToEndPipeline(
                     search_backend=stub_search,
                     fetch_adapter=stub_fetch,
+                    enable_local_llm_from_env=use_dual_ollama,
                 )
                 rep = pipeline.run_vendor_assessment(
                     selected_mv,
@@ -1959,7 +1968,9 @@ with tab_e2e:
                     persist_to_repository=True,
                 )
             else:
-                pipeline = MeridianEndToEndPipeline()
+                pipeline = MeridianEndToEndPipeline(
+                    enable_local_llm_from_env=False,
+                )
                 rep = pipeline.run_vendor_assessment(
                     selected_mv,
                     human_criticality_override=h_rev,
@@ -1974,7 +1985,7 @@ with tab_e2e:
         if is_synthetic_demo:
             st.info(
                 "**SYNTHETIC TEST FIXTURE MODE ACTIVE:** Candidate URLs and extracted HTML documents shown below "
-                "are offline synthetic test fixtures used to verify Levels 1–9 end-to-end without network calls. "
+                "are offline synthetic test fixtures used to verify Levels 1–9 end-to-end without external web calls. "
                 "They are not real-world OSINT findings."
             )
 
@@ -1987,7 +1998,7 @@ with tab_e2e:
         )
         crit_tier_str = e2e_rep.criticality_summary.get("final_criticality", "Unknown")
         depth_str = e2e_rep.osint_plan_summary.get("selected_depth_profile", "Unknown")
-        timebox_str = e2e_rep.osint_plan_summary.get("planning_target", "N/A")
+        timebox_str = e2e_rep.osint_plan_summary.get("timebox", {}).get("planning_target", "N/A")
         st.markdown(f"""
         <div class="stat-grid">
             <div class="stat-card all">
@@ -2013,18 +2024,44 @@ with tab_e2e:
         </div>
         """, unsafe_allow_html=True)
 
-        # 1. Stage Execution Ledger (Levels 1–9)
-        st.markdown('<div class="sec-header"><span>1. Nine-Level Stage Execution Ledger</span></div>', unsafe_allow_html=True)
+        # 1. Stage Execution Ledger (Levels 1–9) & Dual-Model Routing Telemetry
+        st.markdown('<div class="sec-header"><span>1. Nine-Level Stage Execution Ledger &amp; Dual-Model Routing</span></div>', unsafe_allow_html=True)
         ledger_rows = [
             {
                 "Level": s.level_number,
                 "Stage Name": s.level_name,
                 "Status": s.status,
+                "Task": s.model_task or "N/A",
+                "Selected Model": s.selected_model or "DETERMINISTIC_RULEBOOK",
+                "Model Execution": s.model_execution_status or "DETERMINISTIC_ONLY",
                 "Summary": s.summary,
             }
             for s in e2e_rep.stage_ledger
         ]
         st.dataframe(pd.DataFrame(ledger_rows), use_container_width=True, hide_index=True)
+
+        if e2e_rep.model_routing_telemetry:
+            tel = e2e_rep.model_routing_telemetry
+            assignments = tel.get("model_assignments", {})
+            vram_info = tel.get("vram_management", {})
+            tasks_tel = tel.get("tasks", {})
+            with st.expander("🧠 Dual-Model Routing & 6 GB VRAM Lifecycle Telemetry", expanded=use_dual_ollama):
+                st.markdown(
+                    f"• **Ollama Endpoint:** `{tel.get('ollama_endpoint', 'http://localhost:11434')}` "
+                    f"(Enabled: `{tel.get('ollama_enabled', False)}` · "
+                    f"Unload on Switch: `{vram_info.get('unload_on_model_switch', True)}`)\n"
+                    f"• **Model A (Level 3B URL Triage):** `{assignments.get('URL_TRIAGE', 'llama3.2:latest')}` → "
+                    f"Status: `{tasks_tel.get('URL_TRIAGE', {}).get('overall_status', 'SKIPPED')}` "
+                    f"({tasks_tel.get('URL_TRIAGE', {}).get('calls_succeeded', 0)}/{tasks_tel.get('URL_TRIAGE', {}).get('calls_total', 0)} calls succeeded)\n"
+                    f"• **Model B (Level 6 Evidence Classification):** `{assignments.get('EVIDENCE_CLASSIFICATION', 'mistral:latest')}` → "
+                    f"Status: `{tasks_tel.get('EVIDENCE_CLASSIFICATION', {}).get('overall_status', 'SKIPPED')}` "
+                    f"({tasks_tel.get('EVIDENCE_CLASSIFICATION', {}).get('calls_succeeded', 0)}/{tasks_tel.get('EVIDENCE_CLASSIFICATION', {}).get('calls_total', 0)} calls succeeded)\n"
+                    f"• **Model B (Level 8 Risk Summarization):** `{assignments.get('RISK_SUMMARIZATION', 'mistral:latest')}` → "
+                    f"Status: `{tasks_tel.get('RISK_SUMMARIZATION', {}).get('overall_status', 'SKIPPED')}` "
+                    f"({tasks_tel.get('RISK_SUMMARIZATION', {}).get('calls_succeeded', 0)}/{tasks_tel.get('RISK_SUMMARIZATION', {}).get('calls_total', 0)} calls succeeded)\n"
+                    f"• **Separate Embedding Model (Level 5 RAG):** `{assignments.get('RAG_EMBEDDING', 'sentence-transformers/all-MiniLM-L6-v2')}`\n"
+                    f"• **VRAM Unload Events (`keep_alive=0`):** `{len(vram_info.get('vram_unload_events', []))}`"
+                )
 
         if e2e_rep.unavailable_integrations:
             with st.expander("🔌 Unconfigured External Integrations & Offline Boundaries", expanded=not is_synthetic_demo):
@@ -2039,9 +2076,10 @@ with tab_e2e:
                 st.caption("No candidate URLs queued for triage in unconfigured search mode.")
             else:
                 for td in e2e_rep.url_triage_decisions:
+                    mdl_badge = f" · Model: `{td.model_used}` [`{td.model_execution_status}`]" if td.model_used else ""
                     st.markdown(
                         f"**[{td.action.value}]** `{td.url}` — Source `{td.candidate_source_class}` "
-                        f"(Confidence: `{td.confidence}`, Method: `{td.decision_method.value}`)\n\n"
+                        f"(Confidence: `{td.confidence}`, Method: `{td.decision_method.value}`{mdl_badge})\n\n"
                         f"<span style='font-size:0.74rem;color:#475569'>{td.rationale}</span>",
                         unsafe_allow_html=True,
                     )
@@ -2106,6 +2144,16 @@ with tab_e2e:
             st.caption("No R1–R8 AI risk findings triggered for the current evidence set.")
         else:
             for rf in e2e_rep.risk_findings:
+                sum_meta = (
+                    f"Summary: <code>{rf.summary_method}</code>"
+                    + (f" via <code>{rf.model_used}</code>" if rf.model_used else "")
+                )
+                expl_html = (
+                    f"<div style='font-size:0.73rem;color:#1e293b;background:#f8fafc;padding:0.35rem 0.5rem;border-radius:4px;margin-top:0.2rem'>"
+                    f"<strong>Analyst Explanation:</strong> {rf.analyst_explanation}</div>"
+                    if rf.analyst_explanation and rf.analyst_explanation != rf.finding_description
+                    else ""
+                )
                 st.markdown(f"""
                 <div class="factor-card">
                     <div style="display:flex;justify-content:space-between;align-items:center">
@@ -2113,14 +2161,16 @@ with tab_e2e:
                         <span>Severity: <code>{rf.severity.value}</code> · Exposure: <code>{rf.exposure_determination.value}</code> · Confidence: <code>{rf.confidence}</code></span>
                     </div>
                     <div style="font-size:0.75rem;color:#334155;margin-top:0.25rem">{rf.finding_description}</div>
+                    {expl_html}
                     <div style="font-size:0.72rem;color:#0f172a;margin-top:0.25rem">
                         <strong>Recommended Remediation:</strong> {rf.recommended_remediation}
                     </div>
                     <div style="font-size:0.68rem;color:#64748b;margin-top:0.2rem">
-                        Supporting Evidence IDs: <code>{', '.join(rf.evidence_ids)}</code>
+                        Supporting Evidence IDs: <code>{', '.join(rf.evidence_ids)}</code> &nbsp;·&nbsp; {sum_meta}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
 
         if e2e_rep.deterministic_risk_score:
             drs = e2e_rep.deterministic_risk_score

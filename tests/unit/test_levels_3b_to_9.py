@@ -909,3 +909,111 @@ def test_level_9_deterministic_scoring_unconfigured_vs_test_fixture() -> None:
     assert scored.sum_weighted_exposures == pytest.approx(6.55)
     assert scored.final_risk_score == pytest.approx(13.10)
     assert scored.overall_risk_rating == "Critical"
+
+
+def test_regression_e6_non_ai_automation_vs_e13_no_training_zdr() -> None:
+    """Regression test:
+    - E6 strictly governs ordinary non-AI automation (batch scheduling, cron, rules engine, RPA) -> NONE.
+    - E13 strictly governs no-training and zero-data-retention (ZDR) assertions -> STRONG in S1/S3/S5, INDICATIVE in S12/S7.
+    """
+    engine = ERuleEngineAndWeighter()
+    classifier = SignalClassificationService()
+
+    # 1. Ordinary non-AI automation -> must trigger E6 (and NOT E13)
+    rec_auto = _make_record(
+        "EV-REG-E6",
+        "S2",
+        "Workload automation uses deterministic batch scheduling, cron triggers, and static rules engine workflows.",
+        ai_type=AIType.UNRESOLVED,
+    )
+    # 2. Contractual no-training & ZDR assertion in S1/S3 -> must trigger E13 with STRONG (and NOT E6)
+    rec_e13_contract = _make_record(
+        "EV-REG-E13-S3",
+        "S3",
+        "Privacy Policy & DPA: Customer data is never used for model training and zero data retention (ZDR) applies to all requests.",
+        ai_type=AIType.NONE,
+    )
+    # 3. Non-contractual / marketing no-training assertion in S12 -> must trigger E13 with INDICATIVE (not STRONG)
+    rec_e13_marketing = _make_record(
+        "EV-REG-E13-S12",
+        "S12",
+        "Marketing FAQ: Our AI-powered assistant does not train on customer data.",
+        ai_type=AIType.UNRESOLVED,
+    )
+
+    cls_batch = classifier.classify_evidence_batch(
+        [rec_auto, rec_e13_contract, rec_e13_marketing],
+        meridian_service_scope="Core Service",
+    )
+    cls_map = {c.evidence_id: c for c in cls_batch}
+    assert "E6" in cls_map["EV-REG-E6"].recommended_e_rules
+    assert "E13" not in cls_map["EV-REG-E6"].recommended_e_rules
+    assert "E13" in cls_map["EV-REG-E13-S3"].recommended_e_rules
+    assert "E6" not in cls_map["EV-REG-E13-S3"].recommended_e_rules
+
+    weighted_map = {
+        w.evidence_id: w
+        for w in engine.evaluate_evidence_batch([rec_auto, rec_e13_contract, rec_e13_marketing], cls_batch)
+    }
+
+    # Verify E6
+    assert "E6" in weighted_map["EV-REG-E6"].fired_e_rule_ids
+    assert "E13" not in weighted_map["EV-REG-E6"].fired_e_rule_ids
+    assert weighted_map["EV-REG-E6"].evidence_strength == EvidenceStrength.NONE
+    assert weighted_map["EV-REG-E6"].weight_band == EvidentiaryWeightBand.NONE
+    assert rec_auto.ai_type == AIType.NONE_AUTOMATION_ONLY
+
+    # Verify E13 (contractual S3 -> STRONG)
+    assert "E13" in weighted_map["EV-REG-E13-S3"].fired_e_rule_ids
+    assert "E6" not in weighted_map["EV-REG-E13-S3"].fired_e_rule_ids
+    assert weighted_map["EV-REG-E13-S3"].evidence_strength == EvidenceStrength.STRONG
+
+    # Verify E13 (non-contractual S12 -> INDICATIVE)
+    assert "E13" in weighted_map["EV-REG-E13-S12"].fired_e_rule_ids
+    assert "E6" not in weighted_map["EV-REG-E13-S12"].fired_e_rule_ids
+    assert weighted_map["EV-REG-E13-S12"].evidence_strength == EvidenceStrength.INDICATIVE
+
+
+def test_regression_search_provider_config_and_env_alignment() -> None:
+    """Verify .env.example, config/osint_search.yaml, and build_search_backend_from_env share exact provider & env var names."""
+    import yaml
+    from meridian_assessment.services.osint.search_collector import build_search_backend_from_env
+
+    env_example_text = Path(".env.example").read_text(encoding="utf-8")
+    search_cfg = yaml.safe_load(Path("config/osint_search.yaml").read_text(encoding="utf-8"))
+
+    expected_providers = {"google_cse", "brave", "bing", "serpapi"}
+    assert set(search_cfg["providers"].keys()) == expected_providers
+
+    expected_env_vars = {
+        "MERIDIAN_SEARCH_PROVIDER",
+        "MERIDIAN_GOOGLE_API_KEY",
+        "MERIDIAN_GOOGLE_CSE_ID",
+        "MERIDIAN_BRAVE_API_KEY",
+        "MERIDIAN_BING_API_KEY",
+        "MERIDIAN_SERPAPI_KEY",
+    }
+    for var_name in expected_env_vars:
+        assert f"{var_name}=" in env_example_text
+
+    # Verify factory instantiates each provider when configured via those exact env vars
+    b_google = build_search_backend_from_env(
+        env={"MERIDIAN_SEARCH_PROVIDER": "google_cse", "MERIDIAN_GOOGLE_API_KEY": "k", "MERIDIAN_GOOGLE_CSE_ID": "cx"}
+    )
+    assert b_google.provider_name == "google_cse" and b_google.is_configured()[0] is True
+
+    b_brave = build_search_backend_from_env(
+        env={"MERIDIAN_SEARCH_PROVIDER": "brave", "MERIDIAN_BRAVE_API_KEY": "k"}
+    )
+    assert b_brave.provider_name == "brave" and b_brave.is_configured()[0] is True
+
+    b_bing = build_search_backend_from_env(
+        env={"MERIDIAN_SEARCH_PROVIDER": "bing", "MERIDIAN_BING_API_KEY": "k"}
+    )
+    assert b_bing.provider_name == "bing" and b_bing.is_configured()[0] is True
+
+    b_serp = build_search_backend_from_env(
+        env={"MERIDIAN_SEARCH_PROVIDER": "serpapi", "MERIDIAN_SERPAPI_KEY": "k"}
+    )
+    assert b_serp.provider_name == "serpapi" and b_serp.is_configured()[0] is True
+

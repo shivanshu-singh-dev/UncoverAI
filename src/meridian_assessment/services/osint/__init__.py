@@ -24,6 +24,11 @@ from meridian_assessment.services.osint.search_collector import (
     build_search_backend_from_env,
     canonicalize_url,
 )
+from meridian_assessment.services.osint.url_triage import (
+    OSINTURLTriageService,
+    URLTriageLLMProvider,
+    UnconfiguredURLTriageLLMProvider,
+)
 
 __all__ = [
     "OSINTSourceRegistry",
@@ -48,4 +53,8 @@ __all__ = [
     "SearchTimeoutError",
     "build_search_backend_from_env",
     "canonicalize_url",
+    "OSINTURLTriageService",
+    "URLTriageLLMProvider",
+    "UnconfiguredURLTriageLLMProvider",
 ]
+

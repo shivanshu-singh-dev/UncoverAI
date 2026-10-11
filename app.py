@@ -52,6 +52,17 @@ from meridian_assessment.models.osint_plan import (
     SearchExecutionStatus,
     TimerState,
 )
+from meridian_assessment.models.ai_risk import (
+    ScoringPolicyStatus,
+    VendorEndToEndAssessmentReport,
+)
+from meridian_assessment.services.end_to_end_pipeline import (
+    HumanValidationService,
+    MeridianEndToEndPipeline,
+)
+from meridian_assessment.services.offline_demo_fixtures import (
+    build_synthetic_demo_adapters_for_vendor,
+)
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -598,6 +609,8 @@ if "filter_tier" not in st.session_state:
     st.session_state.filter_tier = "All"
 if "show_raw_json" not in st.session_state:
     st.session_state.show_raw_json = False
+if "e2e_reports" not in st.session_state:
+    st.session_state.e2e_reports = {}
 
 # Auto-load case study on startup if empty
 if not st.session_state.results and MERIDIAN_DATASET_CSV.exists():
@@ -614,6 +627,7 @@ if reset_btn:
     st.session_state.selected_id = None
     st.session_state.human_overrides = {}
     st.session_state.osint_plans = {}
+    st.session_state.e2e_reports = {}
     st.session_state.filter_tier = "All"
     st.rerun()
 
@@ -622,6 +636,7 @@ if run_btn:
     st.session_state.selected_id = None
     st.session_state.human_overrides = {}
     st.session_state.osint_plans = {}
+    st.session_state.e2e_reports = {}
     try:
         if "Primary" in engine_mode:
             st.session_state.mode_used = "meridian"
@@ -648,9 +663,10 @@ if st.session_state.error_msg:
     st.error(st.session_state.error_msg)
 
 # ─── Navigation Tabs ──────────────────────────────────────────────────────────
-tab_assess, tab_osint, tab_reports, tab_analytics = st.tabs([
+tab_assess, tab_osint, tab_e2e, tab_reports, tab_analytics = st.tabs([
     "⚡ Live Assessment",
     "🎯 OSINT Investigation Planner",
+    "🔬 End-to-End AI Risk Pipeline (Levels 1–9)",
     "📁 Report Browser",
     "📊 Portfolio Analytics",
 ])
@@ -1884,3 +1900,294 @@ with tab_analytics:
                 st.markdown(f"• **{sv['name']} ({sv['id']})** — Elevated to **{sv['criticality']}** (Base Score: `{sv['score']:.2f}`)")
         else:
             st.markdown("No vendors in the current dataset required safeguard elevation.")
+
+
+# ==============================================================================
+# TAB 5: END-TO-END AI RISK PIPELINE (LEVELS 1–9)
+# ==============================================================================
+with tab_e2e:
+    st.markdown('<div class="sec-header"><span>Meridian 9-Level End-to-End AI Risk Pipeline</span></div>', unsafe_allow_html=True)
+
+    # Load MeridianVendor records
+    meridian_vendor_map: dict[str, Any] = {}
+    if MERIDIAN_DATASET_CSV.exists():
+        for mv in MeridianCSVVendorLoader().load(MERIDIAN_DATASET_CSV):
+            meridian_vendor_map[mv.vendor_id] = mv
+
+    if not meridian_vendor_map:
+        st.info("Meridian vendor dataset (`data/input/meridian_vendors.csv`) not found.")
+    else:
+        e2e_top_c1, e2e_top_c2, e2e_top_c3 = st.columns([4, 4, 2])
+        with e2e_top_c1:
+            e2e_vid = st.selectbox(
+                "Select Vendor for 9-Level Pipeline",
+                options=list(meridian_vendor_map.keys()),
+                format_func=lambda vid: f"{meridian_vendor_map[vid].vendor_name} ({vid})",
+                key="e2e_vendor_select",
+            )
+        with e2e_top_c2:
+            e2e_exec_mode = st.selectbox(
+                "Execution Mode",
+                options=[
+                    "Offline / Unconfigured Mode (Default — No Live Web or Model Calls)",
+                    "Offline Demo with Synthetic Test Fixtures (Labelled Test Walkthrough)",
+                ],
+                key="e2e_exec_mode_select",
+            )
+        with e2e_top_c3:
+            st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
+            run_e2e_btn = st.button("▶ Run 9-Level Pipeline", type="primary", use_container_width=True, key="btn_run_e2e")
+
+        selected_mv = meridian_vendor_map[e2e_vid]
+        is_synthetic_demo = "Synthetic" in e2e_exec_mode
+        cache_key = f"{e2e_vid}::{'synthetic' if is_synthetic_demo else 'unconfigured'}"
+
+        if run_e2e_btn or cache_key not in st.session_state.e2e_reports:
+            h_rev = st.session_state.human_overrides.get(e2e_vid)
+            if is_synthetic_demo:
+                stub_search, stub_fetch = build_synthetic_demo_adapters_for_vendor(selected_mv)
+                pipeline = MeridianEndToEndPipeline(
+                    search_backend=stub_search,
+                    fetch_adapter=stub_fetch,
+                )
+                rep = pipeline.run_vendor_assessment(
+                    selected_mv,
+                    human_criticality_override=h_rev,
+                    execute_searches=True,
+                    execute_extraction=True,
+                    mark_extracted_sources_reviewed=True,
+                    persist_to_repository=True,
+                )
+            else:
+                pipeline = MeridianEndToEndPipeline()
+                rep = pipeline.run_vendor_assessment(
+                    selected_mv,
+                    human_criticality_override=h_rev,
+                    execute_searches=False,
+                    execute_extraction=False,
+                    persist_to_repository=True,
+                )
+            st.session_state.e2e_reports[cache_key] = rep
+
+        e2e_rep: VendorEndToEndAssessmentReport = st.session_state.e2e_reports[cache_key]
+
+        if is_synthetic_demo:
+            st.info(
+                "**SYNTHETIC TEST FIXTURE MODE ACTIVE:** Candidate URLs and extracted HTML documents shown below "
+                "are offline synthetic test fixtures used to verify Levels 1–9 end-to-end without network calls. "
+                "They are not real-world OSINT findings."
+            )
+
+        # Executive Summary Banner
+        verdict_val = e2e_rep.ai_use_verdict.verdict.value if e2e_rep.ai_use_verdict else "INCOMPLETE_ASSESSMENT"
+        score_status_val = (
+            e2e_rep.deterministic_risk_score.policy_status.value
+            if e2e_rep.deterministic_risk_score
+            else "SCORING_POLICY_UNCONFIGURED"
+        )
+        crit_tier_str = e2e_rep.criticality_summary.get("final_criticality", "Unknown")
+        depth_str = e2e_rep.osint_plan_summary.get("selected_depth_profile", "Unknown")
+        timebox_str = e2e_rep.osint_plan_summary.get("planning_target", "N/A")
+        st.markdown(f"""
+        <div class="stat-grid">
+            <div class="stat-card all">
+                <div class="stat-label">Level 1–2 Criticality &amp; Depth</div>
+                <div class="stat-value" style="font-size:1.25rem">{crit_tier_str}</div>
+                <div class="stat-sub">Depth: {depth_str} · Timebox: {timebox_str}</div>
+            </div>
+            <div class="stat-card high">
+                <div class="stat-label">Level 3–4 Evidence Capture</div>
+                <div class="stat-value" style="font-size:1.25rem">{len(e2e_rep.evidence_records)} Records</div>
+                <div class="stat-sub">{len(e2e_rep.url_triage_decisions)} URLs triaged · {e2e_rep.extracted_documents_count} docs</div>
+            </div>
+            <div class="stat-card medium">
+                <div class="stat-label">Level 7 AI-Use Verdict</div>
+                <div class="stat-value" style="font-size:1.1rem">{verdict_val}</div>
+                <div class="stat-sub">Scope: {e2e_rep.determined_scope}</div>
+            </div>
+            <div class="stat-card low">
+                <div class="stat-label">Level 8–9 Risk &amp; Rating</div>
+                <div class="stat-value" style="font-size:1.1rem">{len(e2e_rep.risk_findings)} Findings</div>
+                <div class="stat-sub">{score_status_val}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 1. Stage Execution Ledger (Levels 1–9)
+        st.markdown('<div class="sec-header"><span>1. Nine-Level Stage Execution Ledger</span></div>', unsafe_allow_html=True)
+        ledger_rows = [
+            {
+                "Level": s.level_number,
+                "Stage Name": s.level_name,
+                "Status": s.status,
+                "Summary": s.summary,
+            }
+            for s in e2e_rep.stage_ledger
+        ]
+        st.dataframe(pd.DataFrame(ledger_rows), use_container_width=True, hide_index=True)
+
+        if e2e_rep.unavailable_integrations:
+            with st.expander("🔌 Unconfigured External Integrations & Offline Boundaries", expanded=not is_synthetic_demo):
+                for msg in e2e_rep.unavailable_integrations:
+                    st.markdown(f"• {msg}")
+
+        # 2. Level 3B–6: URL Triage, Extraction, RAG & Signal Classification
+        e2e_c_left, e2e_c_right = st.columns(2, gap="large")
+        with e2e_c_left:
+            st.markdown('<div class="sec-header"><span>2. Level 3B &amp; 4: URL Triage &amp; Point-of-Capture Evidence</span></div>', unsafe_allow_html=True)
+            if not e2e_rep.url_triage_decisions:
+                st.caption("No candidate URLs queued for triage in unconfigured search mode.")
+            else:
+                for td in e2e_rep.url_triage_decisions:
+                    st.markdown(
+                        f"**[{td.action.value}]** `{td.url}` — Source `{td.candidate_source_class}` "
+                        f"(Confidence: `{td.confidence}`, Method: `{td.decision_method.value}`)\n\n"
+                        f"<span style='font-size:0.74rem;color:#475569'>{td.rationale}</span>",
+                        unsafe_allow_html=True,
+                    )
+            if e2e_rep.evidence_records:
+                with st.expander(f"📄 Point-of-Capture Evidence Records ({len(e2e_rep.evidence_records)})", expanded=True):
+                    for ev in e2e_rep.evidence_records:
+                        st.markdown(f"""
+                        <div class="factor-card">
+                            <div style="display:flex;justify-content:space-between">
+                                <strong>[{ev.evidence_id}] Source {ev.source_class} (Grade {ev.source_reliability_grade})</strong>
+                                <code>SHA-256: {ev.content_sha256[:16]}...</code>
+                            </div>
+                            <div style="font-size:0.72rem;color:#2563eb;margin-top:0.15rem"><code>{ev.canonical_url}</code></div>
+                            <div style="font-size:0.73rem;color:#0f172a;background:#f8fafc;padding:0.35rem 0.5rem;border-radius:4px;margin-top:0.25rem">
+                                <em>"{ev.verbatim_excerpt[:280]}"</em>
+                            </div>
+                            <div style="font-size:0.68rem;color:#64748b;margin-top:0.2rem">
+                                Scope: <code>{ev.scope.value}</code> · AI Type: <code>{ev.ai_type.value}</code> ·
+                                Strength: <code>{ev.evidence_strength.value}</code> · Offsets: <code>{ev.char_start}:{ev.char_end}</code> ·
+                                Date: <code>{ev.published_or_observed_date or 'Undated'}</code>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+        with e2e_c_right:
+            st.markdown('<div class="sec-header"><span>3. Level 7: E1–E14 Weighting, G1–G4 Gates &amp; AI-Use Verdict</span></div>', unsafe_allow_html=True)
+            if e2e_rep.ai_use_verdict:
+                v_obj = e2e_rep.ai_use_verdict
+                st.markdown(f"""
+                <div class="factor-card">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <strong>Rulebook AI-Use Verdict: <code>{v_obj.verdict.value}</code></strong>
+                        <span style="font-size:0.72rem">Depth Completed: <strong>{v_obj.depth_completed}</strong></span>
+                    </div>
+                    <div style="font-size:0.75rem;color:#334155;margin-top:0.25rem">{v_obj.verdict_statement}</div>
+                    <div style="font-size:0.72rem;color:#475569;margin-top:0.2rem">{v_obj.basis_summary}</div>
+                    <div style="font-size:0.7rem;color:#64748b;margin-top:0.25rem">
+                        Models: <code>{', '.join(e2e_rep.named_models) or 'None'}</code> ·
+                        Providers: <code>{', '.join(e2e_rep.named_providers) or 'None'}</code> ·
+                        Hosting: <code>{', '.join(e2e_rep.hosting_infrastructures) or 'None'}</code>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                for g_eval in e2e_rep.gates:
+                    st.markdown(
+                        f"• **[{g_eval.gate_id}] {g_eval.title}:** `{g_eval.status}` — {g_eval.rationale}"
+                    )
+            if e2e_rep.weighted_evidence:
+                with st.expander(f"⚖️ E1–E14 Weighted Evidence Items ({len(e2e_rep.weighted_evidence)})", expanded=False):
+                    for w_item in e2e_rep.weighted_evidence:
+                        rules_str = ", ".join(w_item.fired_e_rule_ids)
+                        lo, hi = w_item.weight_band_range
+                        st.markdown(
+                            f"• **{w_item.evidence_id}** (`{w_item.source_class}`) → "
+                            f"Strength: `{w_item.evidence_strength.value}` | Band: `{w_item.weight_band.value}` "
+                            f"[`{lo:.2f}–{hi:.2f}`] | Rules: `{rules_str}`"
+                        )
+
+        # 3. Level 8 & 9: R1–R8 Risk Findings & Deterministic Risk Rating
+        st.markdown('<div class="sec-header"><span>4. Level 8 &amp; 9: R1–R8 AI Risk Findings &amp; Deterministic Risk Score</span></div>', unsafe_allow_html=True)
+        if not e2e_rep.risk_findings:
+            st.caption("No R1–R8 AI risk findings triggered for the current evidence set.")
+        else:
+            for rf in e2e_rep.risk_findings:
+                st.markdown(f"""
+                <div class="factor-card">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <strong>[{rf.risk_rule_id}] {rf.risk_title}</strong>
+                        <span>Severity: <code>{rf.severity.value}</code> · Exposure: <code>{rf.exposure_determination.value}</code> · Confidence: <code>{rf.confidence}</code></span>
+                    </div>
+                    <div style="font-size:0.75rem;color:#334155;margin-top:0.25rem">{rf.finding_description}</div>
+                    <div style="font-size:0.72rem;color:#0f172a;margin-top:0.25rem">
+                        <strong>Recommended Remediation:</strong> {rf.recommended_remediation}
+                    </div>
+                    <div style="font-size:0.68rem;color:#64748b;margin-top:0.2rem">
+                        Supporting Evidence IDs: <code>{', '.join(rf.evidence_ids)}</code>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        if e2e_rep.deterministic_risk_score:
+            drs = e2e_rep.deterministic_risk_score
+            st.markdown(f"""
+            <div class="factor-card" style="background:#f8fafc">
+                <strong>Level 9 Deterministic Formula:</strong> <code>{drs.calculation_method}</code><br>
+                <strong>Policy Status:</strong> <code>{drs.policy_status.value}</code><br>
+                <strong>Numerical Risk Score:</strong> <code>{drs.final_risk_score if drs.final_risk_score is not None else 'NOT ACTIVATED (Policy Unconfigured)'}</code> &nbsp;·&nbsp;
+                <strong>Overall Risk Rating:</strong> <code>{drs.overall_risk_rating or 'N/A'}</code><br>
+                <span style="font-size:0.75rem;color:#475569">{drs.status_message}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # 4. Human Validation & Export
+        st.markdown('<div class="sec-header"><span>5. Human Validation &amp; Full Report Export</span></div>', unsafe_allow_html=True)
+        hv_c1, hv_c2 = st.columns([6, 4])
+        with hv_c1:
+            if e2e_rep.human_Review_required:
+                st.warning(
+                    "Human validation is required for this assessment: "
+                    + "; ".join(e2e_rep.human_review_triggers)
+                )
+            with st.expander("✍️ Record Analyst Validation / Verdict Sign-Off", expanded=False):
+                hv_reviewer = st.text_input("Reviewer Name / Role", value="Primary TPRM Analyst", key=f"hv_rev_{cache_key}")
+                hv_decision = st.selectbox(
+                    "Validation Action",
+                    options=["CONFIRM_ASSESSMENT", "OVERRIDE_AI_VERDICT"],
+                    key=f"hv_dec_{cache_key}",
+                )
+                hv_verdict = st.selectbox(
+                    "Final AI-Use Verdict",
+                    options=["YES", "INCONCLUSIVE", "NO", "INCOMPLETE_ASSESSMENT"],
+                    index=0,
+                    key=f"hv_verd_{cache_key}",
+                )
+                hv_rat = st.text_area(
+                    "Mandatory Validation Rationale",
+                    placeholder="Document evidence review and validation rationale...",
+                    key=f"hv_rat_{cache_key}",
+                )
+                if st.button("Save Human Validation Record", key=f"btn_save_hv_{cache_key}", use_container_width=True):
+                    try:
+                        val_rec = HumanValidationService.create_validation_record(
+                            vendor_id=e2e_rep.vendor_id,
+                            target_type="VERDICT",
+                            target_id="AI_USE_VERDICT",
+                            proposed_automated_finding=verdict_val,
+                            human_decision=hv_decision,
+                            rationale=hv_rat,
+                            original_status=verdict_val,
+                            updated_status=hv_verdict if hv_decision == "OVERRIDE_AI_VERDICT" else verdict_val,
+                            reviewer_id=hv_reviewer,
+                        )
+                        e2e_rep.human_validations.append(val_rec)
+                        st.success("Human validation recorded in audit history.")
+                        st.rerun()
+                    except ValueError as err:
+                        st.error(str(err))
+        with hv_c2:
+            e2e_json_str = json.dumps(e2e_rep.model_dump(mode="json"), indent=2)
+            st.download_button(
+                "⬇ Export Complete 9-Level Report (JSON)",
+                data=e2e_json_str,
+                file_name=f"Meridian_9Level_Report_{e2e_rep.vendor_id}.json",
+                mime="application/json",
+                use_container_width=True,
+                key=f"btn_dl_e2e_{cache_key}",
+            )
+
+

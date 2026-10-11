@@ -1,0 +1,83 @@
+# ==============================================================================
+# TEST-ONLY FIXTURE POLICY — DO NOT USE AS PRODUCTION AUTHORITATIVE CONFIG
+# ==============================================================================
+# Purpose: Validates the mathematical implementation of Level 9 Deterministic
+# Risk Scoring (Risk Score = M_c * sum(S_i * W_i)), deduplication of identical
+# exposures, and escalation rules in unit/integration tests without putting
+# unapproved numbers into config/ai_risk_scoring.yaml.
+
+policy_metadata:
+  policy_id: "MERIDIAN-AI-RISK-POLICY-TEST-FIXTURE"
+  policy_version: "1.0.0-TEST-FIXTURE-ONLY"
+  policy_status: "TEST_FIXTURE_ONLY"
+  calculation_method: "M_c * sum(S_i * W_i)"
+
+rag_chunking:
+  chunk_size_tokens: 500
+  chunk_overlap_tokens: 50
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  auto_load_model: false
+  similarity_threshold: 0.35
+  top_k_per_concept: 3
+
+local_llm:
+  enabled: false
+  provider: "ollama"
+  endpoint: ""
+  model_name: ""
+  timeout_seconds: 15.0
+
+evidentiary_weighting:
+  broad_weight_bands:
+    HIGH:
+      min: 0.80
+      max: 1.00
+    MEDIUM:
+      min: 0.50
+      max: 0.70
+    LOW:
+      min: 0.10
+      max: 0.40
+    NONE:
+      min: 0.00
+      max: 0.00
+  exact_scalar_weights:
+    CONFIRMED: 1.00
+    STRONG: 0.85
+    INDICATIVE: 0.40
+    MARKETING: 0.00
+    NONE: 0.00
+    DISCARDED_HOSTILE: 0.00
+    HIGH: 0.90
+    MEDIUM: 0.60
+    LOW: 0.25
+  multi_source_weight_resolution: "MAX"
+
+deterministic_scoring:
+  formula: "M_c * sum(S_i * W_i)"
+  criticality_multipliers:
+    Critical: 2.0
+    High: 1.5
+    Medium: 1.0
+    Low: 0.5
+  exposure_severity_mapping:
+    Low: 1.0
+    Medium: 2.0
+    High: 3.0
+    Critical: 4.0
+  rating_thresholds:
+    Critical: 12.0
+    High: 7.0
+    Medium: 3.0
+    Low: 0.0
+  minimum_rating_escalation_rules:
+    - rule_id: "ESC_R1_CONFIRMED"
+      risk_rule_id: "R1"
+      exposure_determination: "CONFIRMED_EXPOSURE"
+      minimum_rating: "Critical"
+    - rule_id: "ESC_R2_CONFIRMED"
+      risk_rule_id: "R2"
+      exposure_determination: "CONFIRMED_EXPOSURE"
+      minimum_rating: "High"
+  aggregation_normalization_or_cap:
+    max_score: 50.0

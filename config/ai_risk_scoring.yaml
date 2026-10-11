@@ -1,0 +1,107 @@
+# Meridian Third-Party AI Risk Assessment — Levels 5–9 Configuration & Deterministic Scoring Policy
+# Authoritative configuration for RAG chunking, local-LLM adapters, E1–E14 evidentiary bands,
+# R1–R8 risk rules, and Level 9 deterministic risk scoring.
+#
+# IMPORTANT GOVERNANCE NOTE (Level 9):
+# Undecided numerical production parameters for the deterministic risk formula
+#   Risk Score = M_c * sum(S_i * W_i)
+# are explicitly set to "UNCONFIGURED" below. The scoring engine validates this file and refuses
+# to fabricate a numeric production rating until all required numeric parameters are approved.
+
+policy_metadata:
+  policy_id: "MERIDIAN-AI-RISK-POLICY"
+  policy_version: "0.1.0-POC-UNCONFIGURED"
+  policy_status: "SCORING_POLICY_UNCONFIGURED"
+  calculation_method: "M_c * sum(S_i * W_i)"
+  effective_date: null
+  change_notes: "Initial POC structure. Production numerical multipliers, severity scalars, exact evidentiary weights, and rating thresholds await risk committee calibration."
+
+# ─── Level 5: Semantic Filtering & RAG Chunking ───────────────────────────────
+rag_chunking:
+  chunk_size_tokens: 500
+  chunk_overlap_tokens: 50
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  auto_load_model: false
+  similarity_threshold: 0.45
+  top_k_per_concept: 3
+  risk_query_concepts:
+    - id: "RC_01_MODEL_TRAINING"
+      name: "Third-Party & Customer-Data Model Training"
+      query: "customer data used to train fine-tune machine learning foundation models or improve AI services"
+      target_risks: ["R1", "R3"]
+    - id: "RC_02_AI_SUBPROCESSORS"
+      name: "AI Subprocessors & Model Providers"
+      query: "subprocessor register third-party AI model provider OpenAI Anthropic AWS Bedrock Azure Vertex AI"
+      target_risks: ["R2", "R7"]
+    - id: "RC_03_FEATURE_ARCHITECTURE"
+      name: "AI Feature Architecture & Inference Pipeline"
+      query: "AI architecture inference pipeline API endpoint LLM completions embeddings vector database"
+      target_risks: ["R2", "R4", "R8"]
+    - id: "RC_04_RETENTION_ZDR"
+      name: "Prompt/Output Retention & Zero-Data-Retention"
+      query: "prompt and output log retention period zero data retention ZDR deletion policy"
+      target_risks: ["R3"]
+    - id: "RC_05_SENSITIVE_DATA_EXPOSURE"
+      name: "Sensitive & Regulated Data in AI Path"
+      query: "PII financial records account numbers credentials SSNs customer documents ingested into AI prompts or RAG"
+      target_risks: ["R4"]
+    - id: "RC_06_AGENTIC_AUTONOMOUS"
+      name: "Autonomous & Agentic AI Decision-Making"
+      query: "autonomous AI agent tool calling automated approval execution workflow without human review"
+      target_risks: ["R6", "R8"]
+    - id: "RC_07_GOVERNANCE_ISOLATION"
+      name: "AI Governance, Tenant Isolation & Security Controls"
+      query: "AI governance policy tenant isolation prompt injection guardrails SOC2 ISO42001"
+      target_risks: ["R5", "R7", "R8"]
+
+# ─── Level 6: Optional Local-LLM (Ollama) Adapter Configuration ───────────────
+local_llm:
+  enabled: false
+  provider: "ollama"
+  endpoint: ""           # Set via MERIDIAN_OLLAMA_ENDPOINT when ready
+  model_name: ""         # Set via MERIDIAN_OLLAMA_MODEL when ready (no silent default model)
+  timeout_seconds: 15.0
+
+# ─── Level 7: Evidentiary Weight Bands (Case-Study Brief Ranges) ──────────────
+evidentiary_weighting:
+  broad_weight_bands:
+    HIGH:
+      min: 0.80
+      max: 1.00
+      description: "Grade A / CONFIRMED or corroborated STRONG operational evidence"
+    MEDIUM:
+      min: 0.50
+      max: 0.70
+      description: "Grade B / uncorroborated STRONG or high-reliability INDICATIVE evidence"
+    LOW:
+      min: 0.10
+      max: 0.40
+      description: "Grade C-D / uncorroborated INDICATIVE or historical evidence"
+    NONE:
+      min: 0.00
+      max: 0.00
+      description: "MARKETING-only, non-AI automation (E6), or discarded hostile text (E14)"
+  # Exact scalar mapping per (source_grade, evidence_strength) is undecided in production:
+  exact_scalar_weights: "UNCONFIGURED"
+  multi_source_weight_resolution: "UNCONFIGURED"
+
+# ─── Level 9: Deterministic AI Security Risk Scoring Parameters ───────────────
+deterministic_scoring:
+  formula: "M_c * sum(S_i * W_i)"
+  criticality_multipliers:
+    Critical: "UNCONFIGURED"
+    High: "UNCONFIGURED"
+    Medium: "UNCONFIGURED"
+    Low: "UNCONFIGURED"
+  exposure_severity_mapping:
+    Low: "UNCONFIGURED"
+    Medium: "UNCONFIGURED"
+    High: "UNCONFIGURED"
+    Critical: "UNCONFIGURED"
+  rating_thresholds:
+    Critical: "UNCONFIGURED"
+    High: "UNCONFIGURED"
+    Medium: "UNCONFIGURED"
+    Low: "UNCONFIGURED"
+  minimum_rating_escalation_rules: "UNCONFIGURED"
+  aggregation_normalization_or_cap: "UNCONFIGURED"

@@ -19,9 +19,12 @@ from datetime import datetime, timezone
 import hashlib
 from html.parser import HTMLParser
 import ipaddress
+import os
 from pathlib import Path
 import re
-from typing import Any, Optional, Sequence
+import threading
+import time
+from typing import Any, Callable, Optional, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -98,6 +101,141 @@ def validate_safe_public_url(url: str) -> tuple[bool, str]:
     return True, "Valid public HTTP/HTTPS URL."
 
 
+# ─── Source-Integrity & Identity Validation ───────────────────────────────────
+
+
+def _normalize_host_identity(url_or_host: Optional[str]) -> str:
+    """Extract normalized lowercase hostname without leading 'www.'."""
+    if not url_or_host or not isinstance(url_or_host, str):
+        return ""
+    cleaned = url_or_host.strip()
+    if not cleaned or cleaned.upper() == "UNKNOWN":
+        return ""
+    if "://" in cleaned:
+        try:
+            host = (urllib.parse.urlsplit(cleaned).hostname or "").lower().strip()
+        except Exception:
+            host = ""
+    else:
+        host = cleaned.split("/")[0].split(":")[0].lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _hosts_belong_to_same_identity(host_a: str, host_b: str) -> bool:
+    """Return True if two normalized hostnames belong to the same domain family."""
+    if not host_a or not host_b:
+        return True
+    if host_a == host_b:
+        return True
+    if host_a.endswith("." + host_b) or host_b.endswith("." + host_a):
+        return True
+    parts_a = host_a.split(".")
+    parts_b = host_b.split(".")
+    if len(parts_a) >= 2 and len(parts_b) >= 2 and parts_a[-2:] == parts_b[-2:]:
+        # Avoid matching shared multi-part public suffixes like co.uk
+        if parts_a[-2] not in ("co", "com", "org", "net", "gov", "edu"):
+            return True
+    return False
+
+
+def validate_source_integrity(
+    *,
+    requested_url: str,
+    final_response_url: Optional[str] = None,
+    content_type: str = "text/html",
+    declared_canonical_url: Optional[str] = None,
+    declared_og_url: Optional[str] = None,
+    page_title: Optional[str] = None,
+) -> tuple[bool, str, list[str]]:
+    """Validate that a fetched webpage/document matches the requested source identity.
+
+    Returns `(is_valid, integrity_status, warnings_or_reasons)`.
+      - `is_valid == False` (`integrity_status == "SOURCE_IDENTITY_MISMATCH"`) when the final
+        response URL, declared canonical/OG URL, or page title indicates an unrelated domain
+        (such as requesting `https://httpbin.org/json/` and receiving `https://saas.group/` HTML).
+      - Same-host canonical path differences produce `is_valid == True` with
+        `integrity_status == "WARNING_SAME_HOST_PATH_DIFF"` so valid vendor documentation is not discarded.
+    """
+    warnings: list[str] = []
+    req_host = _normalize_host_identity(requested_url)
+    if not req_host:
+        return True, "VERIFIED", warnings
+
+    try:
+        req_parsed = urllib.parse.urlsplit(requested_url.strip())
+        req_path = (req_parsed.path or "/").rstrip("/") or "/"
+    except Exception:
+        req_path = "/"
+
+    # 1. Check final response URL host if known
+    if final_response_url and final_response_url.upper() != "UNKNOWN":
+        final_host = _normalize_host_identity(final_response_url)
+        if final_host and not _hosts_belong_to_same_identity(req_host, final_host):
+            warnings.append(
+                f"Final response URL '{final_response_url}' resolved to unrelated host '{final_host}' "
+                f"(requested '{requested_url}', expected host '{req_host}')."
+            )
+            return False, "SOURCE_IDENTITY_MISMATCH", warnings
+
+    # 2. Check declared <link rel="canonical"> and <meta property="og:url">
+    for meta_label, meta_url in (
+        ("canonical", declared_canonical_url),
+        ("og:url", declared_og_url),
+    ):
+        if not meta_url or not isinstance(meta_url, str):
+            continue
+        cleaned_meta = meta_url.strip()
+        if not cleaned_meta.lower().startswith(("http://", "https://")):
+            continue
+        meta_host = _normalize_host_identity(cleaned_meta)
+        if not meta_host:
+            continue
+        if not _hosts_belong_to_same_identity(req_host, meta_host):
+            warnings.append(
+                f"Declared HTML {meta_label} '{cleaned_meta}' points to unrelated host '{meta_host}' "
+                f"instead of requested host '{req_host}' ('{requested_url}')."
+            )
+            return False, "SOURCE_IDENTITY_MISMATCH", warnings
+
+        try:
+            meta_path = (urllib.parse.urlsplit(cleaned_meta).path or "/").rstrip("/") or "/"
+        except Exception:
+            meta_path = "/"
+        if meta_path != req_path:
+            msg = (
+                f"Declared same-host {meta_label} path '{meta_path}' differs from requested path '{req_path}'; "
+                "preserving actual requested/response URL."
+            )
+            if msg not in warnings:
+                warnings.append(msg)
+
+    # 3. Check if page title explicitly advertises a completely different domain (e.g. "saas.group - ...")
+    if page_title:
+        title_domain_match = re.match(r"^\s*([a-z0-9-]+(?:\.[a-z]{2,10})+)\b", page_title.strip(), re.IGNORECASE)
+        if title_domain_match:
+            title_host = _normalize_host_identity(title_domain_match.group(1))
+            if title_host and not _hosts_belong_to_same_identity(req_host, title_host):
+                warnings.append(
+                    f"Page title '{page_title}' identifies unrelated domain '{title_host}' "
+                    f"for requested URL '{requested_url}' (expected '{req_host}')."
+                )
+                return False, "SOURCE_IDENTITY_MISMATCH", warnings
+
+    # 4. Check if a JSON endpoint returned HTML with an unrelated title
+    if (req_path.endswith("/json") or req_path.endswith(".json")) and "html" in (content_type or "").lower():
+        if page_title and req_host.split(".")[0] not in page_title.lower():
+            warnings.append(
+                f"Requested JSON endpoint '{requested_url}' returned HTML document titled '{page_title}'."
+            )
+            return False, "SOURCE_IDENTITY_MISMATCH", warnings
+
+    if warnings:
+        return True, "WARNING_SAME_HOST_PATH_DIFF", warnings
+    return True, "VERIFIED", warnings
+
+
 # ─── HTML Readable Text Extractor ─────────────────────────────────────────────
 
 
@@ -123,7 +261,7 @@ _COOKIE_NOISE_PATTERNS = re.compile(
 
 
 class _ReadableHTMLParser(HTMLParser):
-    """Standard-library HTML parser extracting title, section headings, and clean body paragraphs."""
+    """Standard-library HTML parser extracting title, metadata URLs, section headings, and clean body paragraphs."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -131,6 +269,8 @@ class _ReadableHTMLParser(HTMLParser):
         self._in_title = False
         self._current_heading_tag: Optional[str] = None
         self.title_parts: list[str] = []
+        self.declared_canonical_url: Optional[str] = None
+        self.declared_og_url: Optional[str] = None
         self.sections: list[tuple[Optional[str], str]] = []
         self._current_heading: Optional[str] = None
         self._heading_buf: list[str] = []
@@ -138,7 +278,23 @@ class _ReadableHTMLParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         t = tag.lower()
-        attr_dict = {k.lower(): (v or "").lower() for k, v in attrs}
+        raw_attr_dict = {k.lower(): (v or "") for k, v in attrs}
+        attr_dict = {k: v.lower() for k, v in raw_attr_dict.items()}
+
+        if t == "link":
+            rel_tokens = attr_dict.get("rel", "").split()
+            href_val = raw_attr_dict.get("href", "").strip()
+            if "canonical" in rel_tokens and href_val and not self.declared_canonical_url:
+                self.declared_canonical_url = href_val
+            return
+
+        if t == "meta":
+            prop_name = (attr_dict.get("property") or attr_dict.get("name") or "").strip()
+            content_val = raw_attr_dict.get("content", "").strip()
+            if prop_name == "og:url" and content_val and not self.declared_og_url:
+                self.declared_og_url = content_val
+            return
+
         cls_id = f"{attr_dict.get('class', '')} {attr_dict.get('id', '')} {attr_dict.get('role', '')}"
 
         if t in _IGNORED_HTML_TAGS or any(
@@ -212,32 +368,49 @@ class _ReadableHTMLParser(HTMLParser):
 
 
 class HTMLTextExtractor:
-    """Extracts readable text, page title, and section structure from HTML content."""
+    """Extracts readable text, page title, metadata URLs, and section structure from HTML content."""
 
     @staticmethod
-    def extract(html_content: str | bytes) -> tuple[Optional[str], str, list[tuple[Optional[str], str]], ExtractionStatus]:
+    def extract_with_metadata(
+        html_content: str | bytes,
+    ) -> tuple[
+        Optional[str],
+        str,
+        list[tuple[Optional[str], str]],
+        ExtractionStatus,
+        Optional[str],
+        Optional[str],
+    ]:
         raw_str = (
             html_content.decode("utf-8", errors="replace")
             if isinstance(html_content, bytes)
             else html_content
         )
         if not raw_str or not raw_str.strip():
-            return None, "", [], ExtractionStatus.EMPTY_CONTENT
+            return None, "", [], ExtractionStatus.EMPTY_CONTENT, None, None
 
         parser = _ReadableHTMLParser()
         try:
             parser.feed(raw_str)
             title, cleaned_text, sections = parser.finalize()
+            decl_canon = parser.declared_canonical_url
+            decl_og = parser.declared_og_url
         except Exception:
-            # Fallback simple tag strip if HTML is severely broken
             title = None
+            decl_canon = None
+            decl_og = None
             cleaned_text = re.sub(r"<[^>]+>", " ", raw_str)
             cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
             sections = [(None, cleaned_text)] if cleaned_text else []
 
         if not cleaned_text:
-            return title, "", [], ExtractionStatus.EMPTY_CONTENT
-        return title, cleaned_text, sections, ExtractionStatus.EXTRACTED
+            return title, "", [], ExtractionStatus.EMPTY_CONTENT, decl_canon, decl_og
+        return title, cleaned_text, sections, ExtractionStatus.EXTRACTED, decl_canon, decl_og
+
+    @staticmethod
+    def extract(html_content: str | bytes) -> tuple[Optional[str], str, list[tuple[Optional[str], str]], ExtractionStatus]:
+        title, cleaned_text, sections, status, _, _ = HTMLTextExtractor.extract_with_metadata(html_content)
+        return title, cleaned_text, sections, status
 
 
 # ─── PDF Document Extractor ───────────────────────────────────────────────────
@@ -367,7 +540,7 @@ class PDFDocumentExtractor:
 
 
 class FetchResponse:
-    """Raw HTTP fetch payload with content type and final URL."""
+    """Raw HTTP fetch payload with content type, final URL, redirect chain, and retrieval method."""
 
     def __init__(
         self,
@@ -378,8 +551,16 @@ class FetchResponse:
         content_bytes: bytes = b"",
         error_status: Optional[ExtractionStatus] = None,
         error_message: Optional[str] = None,
+        requested_url: Optional[str] = None,
+        final_url: Optional[str] = None,
+        redirect_chain: Optional[list[str]] = None,
+        retrieval_method: str = "DIRECT_HTTP",
     ) -> None:
         self.url = url
+        self.requested_url = requested_url or url
+        self.final_url = final_url if final_url is not None else url
+        self.redirect_chain = list(redirect_chain or [])
+        self.retrieval_method = retrieval_method
         self.status_code = status_code
         self.content_type = content_type
         self.content_bytes = content_bytes
@@ -408,6 +589,9 @@ class DisabledOfflineFetchAdapter(ContentFetchAdapter):
     def fetch(self, url: str, *, timeout_seconds: float = 10.0, max_bytes: int = 2_000_000) -> FetchResponse:
         return FetchResponse(
             url=url,
+            requested_url=url,
+            final_url="UNKNOWN",
+            retrieval_method="OFFLINE_DISABLED",
             status_code=0,
             content_type="",
             content_bytes=b"",
@@ -431,6 +615,8 @@ class StubFetchAdapter(ContentFetchAdapter):
         if not ok:
             return FetchResponse(
                 url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
                 status_code=0,
                 error_status=ExtractionStatus.BLOCKED_UNSAFE_URL,
                 error_message=reason,
@@ -442,6 +628,8 @@ class StubFetchAdapter(ContentFetchAdapter):
         if entry is None:
             return FetchResponse(
                 url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
                 status_code=404,
                 error_status=ExtractionStatus.FETCH_FAILED,
                 error_message=f"No offline fixture registered for URL '{url}'.",
@@ -450,6 +638,10 @@ class StubFetchAdapter(ContentFetchAdapter):
             if len(entry.content_bytes) > max_bytes:
                 return FetchResponse(
                     url=entry.url,
+                    requested_url=entry.requested_url or url,
+                    final_url=entry.final_url,
+                    redirect_chain=entry.redirect_chain,
+                    retrieval_method=entry.retrieval_method,
                     status_code=entry.status_code,
                     content_type=entry.content_type,
                     content_bytes=entry.content_bytes[:max_bytes],
@@ -458,8 +650,13 @@ class StubFetchAdapter(ContentFetchAdapter):
 
         raw_body = entry.get("body", b"")
         body_bytes = raw_body.encode("utf-8") if isinstance(raw_body, str) else bytes(raw_body)
+        final_u = entry.get("final_url", url)
         return FetchResponse(
-            url=entry.get("final_url", url),
+            url=final_u if final_u and final_u != "UNKNOWN" else url,
+            requested_url=url,
+            final_url=final_u,
+            redirect_chain=list(entry.get("redirect_chain", [])),
+            retrieval_method=str(entry.get("retrieval_method", "DIRECT_HTTP")),
             status_code=int(entry.get("status_code", 200)),
             content_type=str(entry.get("content_type", "text/html")),
             content_bytes=body_bytes[:max_bytes],
@@ -469,12 +666,17 @@ class StubFetchAdapter(ContentFetchAdapter):
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Validates every HTTP redirect destination against SSRF/private-network rules."""
+    """Validates every HTTP redirect destination against SSRF/private-network rules and records hops."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.redirect_chain: list[str] = []
 
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
         ok, reason = validate_safe_public_url(newurl)
         if not ok:
             raise urllib.error.URLError(f"Blocked unsafe redirect target '{newurl}': {reason}")
+        self.redirect_chain.append(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -489,12 +691,16 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
         if not ok:
             return FetchResponse(
                 url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                retrieval_method="DIRECT_HTTP",
                 status_code=0,
                 error_status=ExtractionStatus.BLOCKED_UNSAFE_URL,
                 error_message=reason,
             )
 
-        opener = urllib.request.build_opener(_SafeRedirectHandler())
+        redirect_handler = _SafeRedirectHandler()
+        opener = urllib.request.build_opener(redirect_handler)
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "MeridianRiskAssessmentPOC/1.0"},
@@ -507,14 +713,23 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
                 if not ok_final:
                     return FetchResponse(
                         url=final_url,
+                        requested_url=url,
+                        final_url=final_url,
+                        redirect_chain=redirect_handler.redirect_chain,
+                        retrieval_method="DIRECT_HTTP",
                         status_code=0,
                         error_status=ExtractionStatus.BLOCKED_UNSAFE_URL,
                         error_message=reason_final,
                     )
                 ctype = (resp.headers.get("Content-Type") or "text/html").split(";")[0].strip().lower()
                 data = resp.read(max_bytes)
+                method_label = "DIRECT_PDF" if ctype == "application/pdf" else "DIRECT_HTTP"
                 return FetchResponse(
                     url=final_url,
+                    requested_url=url,
+                    final_url=final_url,
+                    redirect_chain=redirect_handler.redirect_chain,
+                    retrieval_method=method_label,
                     status_code=getattr(resp, "status", 200),
                     content_type=ctype,
                     content_bytes=data,
@@ -522,6 +737,10 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
         except TimeoutError as exc:
             return FetchResponse(
                 url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                redirect_chain=redirect_handler.redirect_chain,
+                retrieval_method="DIRECT_HTTP",
                 status_code=0,
                 error_status=ExtractionStatus.TIMEOUT,
                 error_message=f"Fetch timed out after {timeout_seconds}s: {exc}",
@@ -529,6 +748,10 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
         except urllib.error.HTTPError as exc:
             return FetchResponse(
                 url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                redirect_chain=redirect_handler.redirect_chain,
+                retrieval_method="DIRECT_HTTP",
                 status_code=exc.code,
                 error_status=ExtractionStatus.FETCH_FAILED,
                 error_message=f"HTTP {exc.code}: {exc.reason}",
@@ -537,6 +760,10 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
             if "Blocked unsafe redirect" in str(exc):
                 return FetchResponse(
                     url=url,
+                    requested_url=url,
+                    final_url="UNKNOWN",
+                    redirect_chain=redirect_handler.redirect_chain,
+                    retrieval_method="DIRECT_HTTP",
                     status_code=0,
                     error_status=ExtractionStatus.BLOCKED_UNSAFE_URL,
                     error_message=str(exc),
@@ -544,16 +771,371 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
             if "timed out" in str(exc).lower():
                 return FetchResponse(
                     url=url,
+                    requested_url=url,
+                    final_url="UNKNOWN",
+                    redirect_chain=redirect_handler.redirect_chain,
+                    retrieval_method="DIRECT_HTTP",
                     status_code=0,
                     error_status=ExtractionStatus.TIMEOUT,
                     error_message=str(exc),
                 )
             return FetchResponse(
                 url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                redirect_chain=redirect_handler.redirect_chain,
+                retrieval_method="DIRECT_HTTP",
                 status_code=0,
                 error_status=ExtractionStatus.FETCH_FAILED,
                 error_message=f"Network error: {exc.reason}",
             )
+
+
+class ScraperAPIFetchAdapter(ContentFetchAdapter):
+    """ScraperAPI webpage retrieval adapter (`https://api.scraperapi.com`).
+
+    Enforces:
+      - Public URL validation before forwarding to ScraperAPI.
+      - Concurrency cap (`max_concurrent_requests=5` by default).
+      - Bounded retries and timeouts.
+      - `render=true` disabled by default unless explicitly requested.
+      - Complete redaction of `api_key` from any error message or diagnostic string.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        endpoint: str = "https://api.scraperapi.com",
+        *,
+        render_js: bool = False,
+        max_concurrent_requests: int = 5,
+        max_retries: int = 1,
+        retry_backoff_seconds: float = 0.5,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.api_key = (api_key or "").strip()
+        self.endpoint = endpoint
+        self.render_js = render_js
+        self.max_concurrent_requests = max(1, int(max_concurrent_requests))
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_seconds = float(retry_backoff_seconds)
+        self._sleep_fn = sleep_fn
+        self._semaphore = threading.BoundedSemaphore(self.max_concurrent_requests)
+
+    def _redact(self, message: str) -> str:
+        if not self.api_key or not message:
+            return message
+        return message.replace(self.api_key, "[REDACTED]")
+
+    def is_configured(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, "ScraperAPI fallback requires MERIDIAN_SCRAPERAPI_KEY in .env."
+        return True, "ScraperAPI retrieval fallback configured."
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 20.0,
+        max_bytes: int = 2_000_000,
+        render_js: Optional[bool] = None,
+    ) -> FetchResponse:
+        ok_url, url_reason = validate_safe_public_url(url)
+        if not ok_url:
+            return FetchResponse(
+                url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                retrieval_method="SCRAPERAPI",
+                status_code=0,
+                error_status=ExtractionStatus.BLOCKED_UNSAFE_URL,
+                error_message=url_reason,
+            )
+
+        ok_cfg, cfg_reason = self.is_configured()
+        if not ok_cfg:
+            return FetchResponse(
+                url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                retrieval_method="SCRAPERAPI",
+                status_code=0,
+                error_status=ExtractionStatus.UNAVAILABLE,
+                error_message=cfg_reason,
+            )
+
+        params: dict[str, str] = {
+            "api_key": self.api_key,
+            "url": url,
+        }
+        use_render = self.render_js if render_js is None else bool(render_js)
+        if use_render:
+            params["render"] = "true"
+
+        query_str = urllib.parse.urlencode(params)
+        request_url = f"{self.endpoint}?{query_str}"
+        max_attempts = 1 + self.max_retries
+        last_resp: Optional[FetchResponse] = None
+
+        with self._semaphore:
+            for attempt in range(1, max_attempts + 1):
+                req = urllib.request.Request(
+                    request_url,
+                    headers={"Accept": "text/html,application/xhtml+xml,application/pdf,*/*"},
+                    method="GET",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                        ctype = (resp.headers.get("Content-Type") or "text/html").split(";")[0].strip().lower()
+                        resolved_hdr = (
+                            resp.headers.get("Sa-Final-Url")
+                            or resp.headers.get("X-Resolved-Url")
+                            or "UNKNOWN"
+                        ).strip()
+                        if resolved_hdr != "UNKNOWN":
+                            ok_res, reason_res = validate_safe_public_url(resolved_hdr)
+                            if not ok_res:
+                                return FetchResponse(
+                                    url=url,
+                                    requested_url=url,
+                                    final_url=resolved_hdr,
+                                    retrieval_method="SCRAPERAPI",
+                                    status_code=0,
+                                    error_status=ExtractionStatus.BLOCKED_UNSAFE_URL,
+                                    error_message=reason_res,
+                                )
+                        data = resp.read(max_bytes)
+                        method_label = "SCRAPERAPI_PDF" if ctype == "application/pdf" else "SCRAPERAPI"
+                        return FetchResponse(
+                            url=resolved_hdr if resolved_hdr != "UNKNOWN" else url,
+                            requested_url=url,
+                            final_url=resolved_hdr,
+                            retrieval_method=method_label,
+                            status_code=getattr(resp, "status", 200),
+                            content_type=ctype,
+                            content_bytes=data,
+                        )
+                except TimeoutError as exc:
+                    last_resp = FetchResponse(
+                        url=url,
+                        requested_url=url,
+                        final_url="UNKNOWN",
+                        retrieval_method="SCRAPERAPI",
+                        status_code=0,
+                        error_status=ExtractionStatus.TIMEOUT,
+                        error_message=self._redact(f"ScraperAPI request timed out after {timeout_seconds}s: {exc}"),
+                    )
+                    if attempt < max_attempts and self.retry_backoff_seconds > 0:
+                        self._sleep_fn(self.retry_backoff_seconds * attempt)
+                        continue
+                    return last_resp
+                except urllib.error.HTTPError as exc:
+                    code = exc.code
+                    reason_str = self._redact(str(exc.reason))
+                    if code in (401, 403):
+                        return FetchResponse(
+                            url=url,
+                            requested_url=url,
+                            final_url="UNKNOWN",
+                            retrieval_method="SCRAPERAPI",
+                            status_code=code,
+                            error_status=ExtractionStatus.UNAVAILABLE,
+                            error_message=f"ScraperAPI authentication/quota failed (HTTP {code}: {reason_str}).",
+                        )
+                    last_resp = FetchResponse(
+                        url=url,
+                        requested_url=url,
+                        final_url="UNKNOWN",
+                        retrieval_method="SCRAPERAPI",
+                        status_code=code,
+                        error_status=ExtractionStatus.FETCH_FAILED,
+                        error_message=f"ScraperAPI HTTP {code}: {reason_str}",
+                    )
+                    if (code == 429 or 500 <= code < 600) and attempt < max_attempts:
+                        if self.retry_backoff_seconds > 0:
+                            self._sleep_fn(self.retry_backoff_seconds * attempt)
+                        continue
+                    return last_resp
+                except urllib.error.URLError as exc:
+                    err_str = self._redact(str(exc.reason))
+                    is_timeout = "timed out" in err_str.lower()
+                    last_resp = FetchResponse(
+                        url=url,
+                        requested_url=url,
+                        final_url="UNKNOWN",
+                        retrieval_method="SCRAPERAPI",
+                        status_code=0,
+                        error_status=ExtractionStatus.TIMEOUT if is_timeout else ExtractionStatus.FETCH_FAILED,
+                        error_message=f"ScraperAPI network error: {err_str}",
+                    )
+                    if attempt < max_attempts and self.retry_backoff_seconds > 0:
+                        self._sleep_fn(self.retry_backoff_seconds * attempt)
+                        continue
+                    return last_resp
+
+        return last_resp or FetchResponse(
+            url=url,
+            requested_url=url,
+            final_url="UNKNOWN",
+            retrieval_method="SCRAPERAPI",
+            status_code=0,
+            error_status=ExtractionStatus.FETCH_FAILED,
+            error_message="ScraperAPI request failed.",
+        )
+
+
+_BOT_BLOCK_MARKERS = (
+    "just a moment...",
+    "enable javascript and cookies to continue",
+    "attention required! | cloudflare",
+    "cf-browser-verification",
+    "access denied - GoDaddy",
+    "please verify you are a human",
+)
+
+
+def _is_usable_fetch_response(resp: FetchResponse) -> bool:
+    """Return True if a direct HTTP FetchResponse succeeded and contains usable non-challenge content."""
+    if resp.error_status is not None:
+        return False
+    if not (200 <= resp.status_code < 300):
+        return False
+    if not resp.content_bytes or not resp.content_bytes.strip():
+        return False
+
+    ctype = (resp.content_type or "").lower()
+    if ctype == "application/pdf" or resp.content_bytes.lstrip().startswith(b"%PDF-"):
+        return True
+
+    if "html" in ctype or not ctype:
+        sample_lower = resp.content_bytes[:8192].decode("utf-8", errors="ignore").lower()
+        if any(marker.lower() in sample_lower for marker in _BOT_BLOCK_MARKERS):
+            return False
+        _, cleaned_text, _, status = HTMLTextExtractor.extract(resp.content_bytes)
+        if status != ExtractionStatus.EXTRACTED or len(cleaned_text.strip()) < 20:
+            return False
+
+    return True
+
+
+class ResilientPublicFetchAdapter(ContentFetchAdapter):
+    """Two-tier public webpage/PDF fetcher: direct HTTP first, ScraperAPI fallback when needed."""
+
+    def __init__(
+        self,
+        direct_adapter: Optional[ContentFetchAdapter] = None,
+        scraperapi_adapter: Optional[ScraperAPIFetchAdapter] = None,
+        *,
+        enable_cache: bool = True,
+    ) -> None:
+        self.direct_adapter: ContentFetchAdapter = direct_adapter or UrllibPublicFetchAdapter()
+        self.scraperapi_adapter: Optional[ScraperAPIFetchAdapter] = scraperapi_adapter
+        self.enable_cache = enable_cache
+        self._cache: dict[str, FetchResponse] = {}
+        self.telemetry: dict[str, int] = {
+            "direct_attempts": 0,
+            "direct_successes": 0,
+            "scraperapi_attempts": 0,
+            "scraperapi_successes": 0,
+            "cache_hits": 0,
+            "failures": 0,
+        }
+
+    def is_configured(self) -> tuple[bool, str]:
+        direct_ok, direct_msg = self.direct_adapter.is_configured()
+        scraper_ok = False
+        if self.scraperapi_adapter is not None:
+            scraper_ok, _ = self.scraperapi_adapter.is_configured()
+        if direct_ok and scraper_ok:
+            return True, "Direct HTTP fetch + ScraperAPI fallback configured."
+        if direct_ok:
+            return True, "Direct HTTP fetch ready (ScraperAPI fallback not configured)."
+        if scraper_ok:
+            return True, "ScraperAPI retrieval ready."
+        return False, direct_msg
+
+    def fetch(self, url: str, *, timeout_seconds: float = 10.0, max_bytes: int = 2_000_000) -> FetchResponse:
+        ok, reason = validate_safe_public_url(url)
+        if not ok:
+            return FetchResponse(
+                url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                retrieval_method="DIRECT_HTTP",
+                status_code=0,
+                error_status=ExtractionStatus.BLOCKED_UNSAFE_URL,
+                error_message=reason,
+            )
+
+        cache_key = canonicalize_url(url) or url
+        if self.enable_cache and cache_key in self._cache:
+            self.telemetry["cache_hits"] += 1
+            return self._cache[cache_key]
+
+        # 1. Try direct HTTP fetch first
+        self.telemetry["direct_attempts"] += 1
+        direct_resp = self.direct_adapter.fetch(url, timeout_seconds=timeout_seconds, max_bytes=max_bytes)
+        if direct_resp.error_status == ExtractionStatus.BLOCKED_UNSAFE_URL:
+            self.telemetry["failures"] += 1
+            return direct_resp
+
+        if _is_usable_fetch_response(direct_resp):
+            self.telemetry["direct_successes"] += 1
+            if self.enable_cache:
+                self._cache[cache_key] = direct_resp
+            return direct_resp
+
+        # 2. Fall back to ScraperAPI if configured
+        if self.scraperapi_adapter is not None:
+            scraper_ok, _ = self.scraperapi_adapter.is_configured()
+            if scraper_ok:
+                self.telemetry["scraperapi_attempts"] += 1
+                scraper_resp = self.scraperapi_adapter.fetch(
+                    url,
+                    timeout_seconds=max(timeout_seconds, 20.0),
+                    max_bytes=max_bytes,
+                )
+                if scraper_resp.error_status is None and scraper_resp.content_bytes.strip():
+                    self.telemetry["scraperapi_successes"] += 1
+                    if self.enable_cache:
+                        self._cache[cache_key] = scraper_resp
+                    return scraper_resp
+                self.telemetry["failures"] += 1
+                return scraper_resp
+
+        self.telemetry["failures"] += 1
+        return direct_resp
+
+
+def build_fetch_adapter_from_env(
+    *,
+    env: Optional[dict[str, str]] = None,
+    allow_live_direct: bool = True,
+    load_dotenv: bool = True,
+) -> ContentFetchAdapter:
+    """Instantiate a ContentFetchAdapter using environment settings (direct HTTP + optional ScraperAPI fallback)."""
+    if env is None:
+        if load_dotenv:
+            from meridian_assessment.config.env_loader import load_dotenv_if_present
+
+            load_dotenv_if_present()
+        environ = os.environ
+    else:
+        environ = env
+
+    scraper_key = (environ.get("MERIDIAN_SCRAPERAPI_KEY") or "").strip()
+    scraper_adapter = ScraperAPIFetchAdapter(api_key=scraper_key) if scraper_key else None
+
+    if not allow_live_direct and scraper_adapter is None:
+        return DisabledOfflineFetchAdapter()
+
+    direct_adapter: ContentFetchAdapter = (
+        UrllibPublicFetchAdapter() if allow_live_direct else DisabledOfflineFetchAdapter()
+    )
+    return ResilientPublicFetchAdapter(
+        direct_adapter=direct_adapter,
+        scraperapi_adapter=scraper_adapter,
+    )
 
 
 # ─── Extraction & Evidence Record Construction Service ────────────────────────
@@ -599,6 +1181,10 @@ class OSINTExtractionService:
                 vendor_id=vendor_id,
                 url=url,
                 canonical_url=canon_url,
+                requested_url=url,
+                final_response_url="UNKNOWN",
+                retrieval_method="BLOCKED_UNSAFE_URL",
+                source_integrity_status="BLOCKED_UNSAFE_URL",
                 source_class=source_class,
                 content_type="unknown",
                 retrieved_at=now_iso,
@@ -610,12 +1196,31 @@ class OSINTExtractionService:
             )
 
         resp = self.fetch_adapter.fetch(url, timeout_seconds=self.timeout_seconds, max_bytes=self.max_bytes)
+        final_resp_url = getattr(resp, "final_url", None) or (resp.url if resp.url != url else "UNKNOWN")
+        retrieval_method = (
+            "SYNTHETIC_SAMPLE"
+            if is_synthetic_fixture
+            else getattr(resp, "retrieval_method", "DIRECT_HTTP")
+        )
+        redirect_chain = list(getattr(resp, "redirect_chain", []) or [])
+        resolved_canon = (
+            canonicalize_url(final_resp_url)
+            if final_resp_url and final_resp_url != "UNKNOWN"
+            else canon_url
+        ) or canon_url
+
         if resp.error_status is not None:
             return ExtractedDocument(
                 document_id=doc_id,
                 vendor_id=vendor_id,
                 url=url,
-                canonical_url=canonicalize_url(resp.url) or canon_url,
+                canonical_url=resolved_canon,
+                requested_url=url,
+                final_response_url=final_resp_url,
+                http_status=resp.status_code,
+                redirect_chain=redirect_chain,
+                retrieval_method=retrieval_method,
+                source_integrity_status="FETCH_ERROR",
                 source_class=source_class,
                 content_type=resp.content_type or "unknown",
                 retrieved_at=now_iso,
@@ -641,11 +1246,27 @@ class OSINTExtractionService:
 
         if is_pdf:
             title, cleaned_text, page_texts, status, limits = PDFDocumentExtractor.extract(content_bytes)
+            integrity_ok, integrity_status, integrity_warnings = validate_source_integrity(
+                requested_url=url,
+                final_response_url=final_resp_url,
+                content_type="application/pdf",
+                page_title=title,
+            )
+            if not integrity_ok:
+                status = ExtractionStatus.SOURCE_IDENTITY_MISMATCH
+                limits = list(limits) + list(integrity_warnings)
             return ExtractedDocument(
                 document_id=doc_id,
                 vendor_id=vendor_id,
                 url=url,
-                canonical_url=canonicalize_url(resp.url) or canon_url,
+                canonical_url=resolved_canon if integrity_ok else canon_url,
+                requested_url=url,
+                final_response_url=final_resp_url,
+                http_status=resp.status_code,
+                redirect_chain=redirect_chain,
+                retrieval_method=retrieval_method,
+                source_integrity_status=integrity_status,
+                source_integrity_warnings=integrity_warnings,
                 source_class=source_class,
                 content_type="application/pdf",
                 title=title,
@@ -668,7 +1289,13 @@ class OSINTExtractionService:
                 document_id=doc_id,
                 vendor_id=vendor_id,
                 url=url,
-                canonical_url=canonicalize_url(resp.url) or canon_url,
+                canonical_url=resolved_canon,
+                requested_url=url,
+                final_response_url=final_resp_url,
+                http_status=resp.status_code,
+                redirect_chain=redirect_chain,
+                retrieval_method=retrieval_method,
+                source_integrity_status="UNSUPPORTED_FORMAT",
                 source_class=source_class,
                 content_type=ctype,
                 content_sha256=sha256_hex,
@@ -683,13 +1310,35 @@ class OSINTExtractionService:
             )
 
         raw_html = content_bytes.decode("utf-8", errors="replace")
-        title, cleaned_text, _, status = HTMLTextExtractor.extract(raw_html)
+        title, cleaned_text, _, status, decl_canon, decl_og = HTMLTextExtractor.extract_with_metadata(raw_html)
         limits = [] if status == ExtractionStatus.EXTRACTED else ["HTML document contained no extractable body text."]
+
+        integrity_ok, integrity_status, integrity_warnings = validate_source_integrity(
+            requested_url=url,
+            final_response_url=final_resp_url,
+            content_type=ctype or "text/html",
+            declared_canonical_url=decl_canon,
+            declared_og_url=decl_og,
+            page_title=title,
+        )
+        if not integrity_ok:
+            status = ExtractionStatus.SOURCE_IDENTITY_MISMATCH
+            limits = list(limits) + list(integrity_warnings)
+
         return ExtractedDocument(
             document_id=doc_id,
             vendor_id=vendor_id,
             url=url,
-            canonical_url=canonicalize_url(resp.url) or canon_url,
+            canonical_url=resolved_canon if integrity_ok else canon_url,
+            requested_url=url,
+            final_response_url=final_resp_url,
+            http_status=resp.status_code,
+            redirect_chain=redirect_chain,
+            declared_canonical_url=decl_canon,
+            declared_og_url=decl_og,
+            retrieval_method=retrieval_method,
+            source_integrity_status=integrity_status,
+            source_integrity_warnings=integrity_warnings,
             source_class=source_class,
             content_type=ctype or "text/html",
             title=title,
@@ -718,13 +1367,18 @@ class OSINTExtractionService:
         """Construct traceable EvidenceRecord items from an ExtractedDocument.
 
         Every `verbatim_excerpt` is an exact substring of `doc.cleaned_text` with recorded
-        `char_start` and `char_end` offsets. Never fabricates text for failed/empty extractions.
+        `char_start` and `char_end` offsets. Never fabricates text for failed/empty extractions
+        or documents flagged with `SOURCE_IDENTITY_MISMATCH`.
         """
         s_def = self.source_registry.get_source(doc.source_class)
         grade = s_def.default_evidence_grade if s_def else "C"
         rel_rating = s_def.reliability_rating if s_def else 2
 
-        if doc.extraction_status != ExtractionStatus.EXTRACTED or not doc.cleaned_text.strip():
+        if (
+            doc.extraction_status != ExtractionStatus.EXTRACTED
+            or doc.source_integrity_status == "SOURCE_IDENTITY_MISMATCH"
+            or not doc.cleaned_text.strip()
+        ):
             return []
 
         records: list[EvidenceRecord] = []
@@ -778,6 +1432,9 @@ class OSINTExtractionService:
                     source_class=doc.source_class,
                     canonical_url=doc.canonical_url,
                     original_url=doc.url,
+                    final_url=doc.final_response_url,
+                    retrieval_method=doc.retrieval_method,
+                    source_integrity_status=doc.source_integrity_status,
                     retrieved_at=doc.retrieved_at,
                     page_title=doc.title,
                     section_heading=current_heading,

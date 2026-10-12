@@ -2,14 +2,28 @@
 # Defines execution bounds, supported API search backends, and conservative URL canonicalization rules.
 
 execution:
-  default_provider: "serpapi"
+  default_provider: "serper"
   timeout_seconds: 10.0
   max_results_per_query: 10
   max_retries: 2
   retry_backoff_seconds: 0.5
   max_queries_per_run: 50
 
+retrieval:
+  direct_timeout_seconds: 10.0
+  scraperapi_endpoint: "https://api.scraperapi.com"
+  scraperapi_env_var: "MERIDIAN_SCRAPERAPI_KEY"
+  scraperapi_max_concurrency: 5
+  scraperapi_timeout_seconds: 20.0
+  scraperapi_max_retries: 1
+  scraperapi_render_js_default: false
+
 providers:
+  serper:
+    name: "Serper Google Search API"
+    endpoint: "https://google.serper.dev/search"
+    env_vars:
+      api_key: "MERIDIAN_SERPER_API_KEY"
   google_cse:
     name: "Google Custom Search JSON API"
     endpoint: "https://www.googleapis.com/customsearch/v1"

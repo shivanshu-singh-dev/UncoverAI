@@ -370,8 +370,187 @@ def test_exports_json_csv_markdown_html_contain_required_sections_and_no_secrets
     assert "https://trust.www.fiserv.com/subprocessors-and-ai-policy" in html_out
 
 
+from meridian_assessment.services.classification import (
+    OllamaClassificationAdapter,
+    UnconfiguredOllamaAdapter,
+)
+from meridian_assessment.services.readiness_and_exports import (
+    AssessmentReportExporter,
+    CANONICAL_NINE_LEVEL_NAMES,
+    SystemReadinessInspector,
+    build_nine_level_stage_tracker,
+    format_analyst_stage_tracker,
+    format_analyst_unavailable_integrations,
+    format_plain_status,
+    validate_vendor_assessment_input,
+)
+
+
+def test_no_contradictory_llm_status_between_readiness_and_pipeline() -> None:
+    """Verify SystemReadinessInspector and MeridianEndToEndPipeline never produce contradictory Ollama/Mistral status claims."""
+
+    def online_both_models(url: str, timeout: float) -> dict[str, Any]:
+        return {
+            "models": [
+                {"name": "llama3.2:latest"},
+                {"name": "mistral:latest"},
+            ]
+        }
+
+    base_env = {
+        "MERIDIAN_OLLAMA_ENABLED": "true",
+        "MERIDIAN_ENABLE_LOCAL_LLM": "true",
+        "MERIDIAN_OLLAMA_ENDPOINT": "http://localhost:11434",
+        "MERIDIAN_OLLAMA_TRIAGE_MODEL": "llama3.2:latest",
+        "MERIDIAN_OLLAMA_ANALYSIS_MODEL": "mistral:latest",
+        "MERIDIAN_OLLAMA_SUMMARY_MODEL": "mistral:latest",
+    }
+
+    # Case A: Server online + both models installed + enabled -> Ready in both readiness & pipeline
+    rep_ready = SystemReadinessInspector.check_system_readiness(
+        env=base_env,
+        load_dotenv=False,
+        http_get_fn=online_both_models,
+    )
+    assert rep_ready.local_analysis_ready is True
+    assert rep_ready.local_triage_ready is True
+    assert rep_ready.local_classifier_ready is True
+    assert rep_ready.local_summary_ready is True
+    assert rep_ready.local_analysis_state == "READY"
+    assert rep_ready.local_analysis_label == "Local AI analysis ready"
+
+    pipe_ready = MeridianEndToEndPipeline(
+        enable_local_llm_from_env=True,
+        readiness=rep_ready,
+    )
+    assert pipe_ready.model_router.config.enabled is True
+    assert isinstance(pipe_ready.classification_service.llm_adapter, OllamaClassificationAdapter)
+    cls_ready, cls_msg = pipe_ready.classification_service.llm_adapter.is_configured()
+    assert cls_ready is True
+    assert "not configured" not in cls_msg.lower()
+
+    # Case B: Analyst explicitly selects deterministic / rule-based run -> Consistent disabled reason
+    rep_user_off = SystemReadinessInspector.check_system_readiness(
+        env=base_env,
+        load_dotenv=False,
+        http_get_fn=online_both_models,
+        local_analysis_override=False,
+    )
+    assert rep_user_off.local_analysis_ready is False
+    assert rep_user_off.local_analysis_state == "DISABLED_BY_USER"
+    assert rep_user_off.local_analysis_label == "Rule-based analysis only"
+
+    pipe_user_off = MeridianEndToEndPipeline(
+        enable_local_llm_from_env=False,
+        readiness=rep_user_off,
+    )
+    assert pipe_user_off.model_router.config.enabled is False
+    assert isinstance(pipe_user_off.classification_service.llm_adapter, UnconfiguredOllamaAdapter)
+    _, off_msg = pipe_user_off.classification_service.llm_adapter.is_configured()
+    assert "disabled for deterministic run" in off_msg.lower()
+    assert "set meridian_ollama_enabled=true" not in off_msg.lower()
+
+    # Case C: Enabled in .env, but Ollama server unreachable -> Both report unavailable
+    def offline_get(url: str, timeout: float) -> dict[str, Any]:
+        raise ConnectionRefusedError("Ollama offline")
+
+    rep_offline = SystemReadinessInspector.check_system_readiness(
+        env=base_env,
+        load_dotenv=False,
+        http_get_fn=offline_get,
+    )
+    assert rep_offline.local_analysis_ready is False
+    assert rep_offline.local_analysis_state == "SERVER_UNREACHABLE"
+    assert rep_offline.local_analysis_label == "Local analysis unavailable"
+
+    pipe_offline = MeridianEndToEndPipeline(
+        enable_local_llm_from_env=True,
+        readiness=rep_offline,
+    )
+    assert pipe_offline.model_router.config.enabled is False
+    _, offline_msg = pipe_offline.classification_service.llm_adapter.is_configured()
+    assert "unreachable" in offline_msg.lower()
+
+    # Case D: Ollama reachable & llama3.2 installed, but mistral missing -> Partial/Missing model
+    rep_no_mistral = SystemReadinessInspector.check_system_readiness(
+        env=base_env,
+        load_dotenv=False,
+        http_get_fn=lambda u, t: {"models": [{"name": "llama3.2:latest"}]},
+    )
+    assert rep_no_mistral.local_triage_ready is True
+    assert rep_no_mistral.local_classifier_ready is False
+    assert rep_no_mistral.local_analysis_ready is False
+    assert rep_no_mistral.local_analysis_state == "MODEL_MISSING"
+
+    pipe_no_mistral = MeridianEndToEndPipeline(
+        enable_local_llm_from_env=True,
+        readiness=rep_no_mistral,
+    )
+    assert pipe_no_mistral.triage_service.llm_provider is not None
+    assert isinstance(pipe_no_mistral.classification_service.llm_adapter, UnconfiguredOllamaAdapter)
+    _, no_mistral_msg = pipe_no_mistral.classification_service.llm_adapter.is_configured()
+    assert "not installed" in no_mistral_msg.lower()
+
+
+def test_plain_language_analyst_formatting_and_level_7_evidentiary_weighting(
+    tmp_path: Path,
+) -> None:
+    """Verify analyst stage tracker and notices use plain product language and preserve Level 7 as Evidentiary Weighting."""
+    assert CANONICAL_NINE_LEVEL_NAMES[7] == "Evidentiary Weighting"
+    assert format_plain_status("SCORING_POLICY_UNCONFIGURED") == "Calibrated numerical risk score unavailable"
+    assert format_plain_status("INCOMPLETE_ASSESSMENT") == "Incomplete Assessment"
+    assert format_plain_status("QUALIFYING_POSITIVE_EVIDENCE") == "Confirmed Positive Evidence"
+
+    vendors = {v.vendor_id: v for v in MeridianCSVVendorLoader().load(Path("data/input/meridian_vendors.csv"))}
+    fiserv = vendors["V-002"]
+    stub_search, stub_fetch = build_synthetic_demo_adapters_for_vendor(fiserv)
+
+    pipeline = MeridianEndToEndPipeline(
+        search_backend=stub_search,
+        fetch_adapter=stub_fetch,
+        evidence_repository=EvidenceRepository(
+            db_path=tmp_path / "plain.sqlite3",
+            artifact_dir=tmp_path / "plain_artifacts",
+        ),
+        enable_local_llm_from_env=False,
+    )
+    report = pipeline.run_vendor_assessment(
+        fiserv,
+        execute_searches=True,
+        execute_extraction=True,
+        mark_extracted_sources_reviewed=True,
+        reviewed_no_evidence_sources=["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12"],
+        persist_to_repository=True,
+    )
+
+    analyst_stages = format_analyst_stage_tracker(report)
+    assert len(analyst_stages) == 9
+    assert analyst_stages[6]["Stage"] == "7"
+    assert analyst_stages[6]["Assessment Stage"] == "Evidentiary Weighting"
+
+    forbidden_tokens = [
+        "MERIDIAN_SERPAPI_KEY",
+        "MERIDIAN_OLLAMA_ENABLED",
+        "MERIDIAN_ENABLE_RAG_EMBEDDINGS",
+        "llama3.2:latest",
+        "mistral:latest",
+        "sentence-transformers",
+        "SCORING_POLICY_UNCONFIGURED",
+        "StubSearchBackend",
+        "StubFetchAdapter",
+    ]
+    serialized_stages = str(analyst_stages)
+    for tok in forbidden_tokens:
+        assert tok not in serialized_stages
+
+    notices = format_analyst_unavailable_integrations(report)
+    assert "Calibrated numerical risk score unavailable" in notices
+    for tok in forbidden_tokens:
+        assert tok not in str(notices)
+
+
 def test_streamlit_app_renders_cleanly_without_exceptions() -> None:
-    """Smoke-test the full Streamlit application (`app.py`) using AppTest."""
+    """Smoke-test the full Streamlit application (`app.py`) across Portfolio, Assessments, Evidence, Reports, and Settings."""
     from streamlit.testing.v1 import AppTest
 
     app_path = str(Path(__file__).resolve().parents[2] / "app.py")
@@ -379,3 +558,23 @@ def test_streamlit_app_renders_cleanly_without_exceptions() -> None:
     at.run(timeout=30)
     assert not at.exception
 
+    # Navigate across all 5 top-level sections via top navigation buttons and verify zero exceptions
+    for nav_section in ["Assessments", "Evidence", "Reports", "Settings", "Portfolio"]:
+        at.button(key=f"uc_top_nav_{nav_section}").click()
+        at.run(timeout=30)
+        assert not at.exception
+        assert at.session_state["nav_section"] == nav_section
+
+    # Trigger sample walkthrough on Assessments and verify Evidence and Reports render populated views cleanly
+    at.button(key="uc_top_nav_Assessments").click()
+    at.run(timeout=30)
+    assert not at.exception
+    at.button(key="btn_execute_assessment_primary").click()
+    at.run(timeout=30)
+    assert not at.exception
+    assert at.session_state["e2e_report"] is not None
+
+    for nav_section in ["Evidence", "Reports", "Portfolio"]:
+        at.button(key=f"uc_top_nav_{nav_section}").click()
+        at.run(timeout=30)
+        assert not at.exception

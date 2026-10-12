@@ -1,2957 +1,2612 @@
-"""Meridian Vendor Risk Assessment — Streamlit Dashboard.
+"""Meridian Financial Services — UncoverAI Enterprise Third-Party AI Risk Governance Platform.
 
-Supports:
-  1. Meridian D/P/R/O/V Methodology (Case study dataset with full provenance tracking, O1-O4 safeguards, and O5 governance)
-  2. Standard Qualitative Mode (Legacy 5-dimension model)
-  3. Interactive Report Browser & Archival
-  4. Portfolio Risk Visualizations & Analytics
+Provides a cohesive enterprise analyst workspace across five top-level views:
+  - Portfolio: Risk dashboard, 5-KPI summary, filterable vendor inventory table with full text wrapping,
+    and structured selected-vendor dossier preview.
+  - Assessments: Three-stage assessment workspace (A. Setup -> B. Execution -> C. Results) supporting
+    both Live OSINT Assessments (Serper + Direct HTTP / ScraperAPI fallback) and explicitly labeled
+    Sample Assessments.
+  - Evidence: Point-of-capture evidence workbench with filters across Vendor, Source Class (S1–S12),
+    Evidence Strength, Scope, Gate (G1–G4), and Retrieval Method, plus source-integrity diagnostics.
+  - Reports: Executive-ready vendor assessment dossier and multi-format export center (HTML, Markdown,
+    Evidence CSV, JSON).
+  - Settings: Consolidated technical diagnostics for Serper, ScraperAPI, Source-Integrity Guard,
+    Ollama dual-model routing (llama3.2:latest + mistral:latest), Level 5 RAG embeddings, and Level 9
+    scoring policy calibration.
 """
 
-import sys
+from __future__ import annotations
+
+import html
 from pathlib import Path
-
-_SRC = Path(__file__).resolve().parent / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
-
-import datetime
-import json
-import tempfile
+import sys
 from typing import Any, Optional
 
-import altair as alt
-import pandas as pd
 import streamlit as st
 
-from meridian_assessment.config.env_loader import load_dotenv_if_present
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
-load_dotenv_if_present()
-
-from meridian_assessment.models.criticality import CriticalityAssessment, CriticalityTier
-
-from meridian_assessment.models.assessment import AssessmentDepth
-from meridian_assessment.models.factor_result import (
-    CriticalityLevel,
-    CriticalityResult,
-    DeterminationMethod,
-    HumanReviewRecord,
-    ScoreStatus,
-)
-from meridian_assessment.services.pipeline import AssessmentPipeline
-from meridian_assessment.services.meridian_criticality_engine import MeridianCriticalityEngine
 from meridian_assessment.ingestion.meridian_csv_loader import MeridianCSVVendorLoader
-from meridian_assessment.services.osint import (
-    OSINTCoverageTracker,
-    OSINTInvestigationPlanner,
-    OSINTSearchCollector,
-    OSINTSourceRegistry,
-    StopConditionEvaluator,
-    build_search_backend_from_env,
-)
-from meridian_assessment.models.osint_plan import (
-    AssessmentStopStatus,
-    CriticalityApprovalStatus,
-    CoverageState,
-    GateStatus,
-    OSINTInvestigationPlan,
-    SearchExecutionStatus,
-    TimerState,
-)
 from meridian_assessment.models.ai_risk import (
+    ExtractionStatus,
+    HumanValidationRecord,
     ScoringPolicyStatus,
     VendorEndToEndAssessmentReport,
+)
+from meridian_assessment.models.factor_result import (
+    CriticalityResult,
+    HumanReviewRecord,
 )
 from meridian_assessment.models.meridian_vendor import MeridianVendor
 from meridian_assessment.services.end_to_end_pipeline import (
     HumanValidationService,
     MeridianEndToEndPipeline,
 )
+from meridian_assessment.services.extraction import (
+    EvidenceRepository,
+    build_fetch_adapter_from_env,
+)
+from meridian_assessment.services.meridian_criticality_engine import MeridianCriticalityEngine
 from meridian_assessment.services.offline_demo_fixtures import (
     build_synthetic_demo_adapters_for_vendor,
+)
+from meridian_assessment.services.osint import (
+    OSINTInvestigationPlanner,
+    OSINTSourceRegistry,
+    build_search_backend_from_env,
 )
 from meridian_assessment.services.readiness_and_exports import (
     AssessmentReportExporter,
     CANONICAL_NINE_LEVEL_NAMES,
     SystemReadinessInspector,
+    SystemReadinessReport,
     build_nine_level_stage_tracker,
+    format_analyst_unavailable_integrations,
+    format_plain_status,
     gates_for_evidence,
     validate_vendor_assessment_input,
 )
 
-# ─── Page config ──────────────────────────────────────────────────────────────
+# ─── Page Configuration ───────────────────────────────────────────────────────
+
 st.set_page_config(
-    page_title="Meridian Financial | Third-Party AI Risk Assessment Console",
-    page_icon="M",
+    page_title="UncoverAI — Meridian Third-Party AI Risk Governance",
+    page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# ─── Enterprise Financial-Services Console Design System ──────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+_DEFAULT_VENDORS_CSV = Path("data/input/meridian_vendors.csv")
+_DEFAULT_DB_PATH = Path("data/state/evidence_repository.sqlite3")
+_DEFAULT_ARTIFACT_DIR = Path("data/state/artifacts")
 
-html, body, [class*="css"] {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    color: #0f172a;
-}
-
-#MainMenu, footer, header { visibility: hidden; }
-.block-container {
-    padding: 1.25rem 2rem 2.25rem 2rem;
-    max-width: 1520px;
-}
-
-.readiness-grid {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 0.65rem;
-    margin-bottom: 0.9rem;
-}
-.readiness-card {
-    background: #ffffff;
-    border: 1px solid #cbd5e1;
-    border-top: 3px solid #334155;
-    border-radius: 6px;
-    padding: 0.65rem 0.8rem;
-}
-.readiness-card.ok { border-top-color: #15803d; }
-.readiness-card.warn { border-top-color: #b45309; }
-.readiness-card.blocked { border-top-color: #b91c1c; }
-.readiness-title {
-    font-size: 0.68rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: #475569;
-    margin-bottom: 0.25rem;
-}
-.readiness-status {
-    font-size: 0.82rem;
-    font-weight: 700;
-    color: #0f172a;
-    margin-bottom: 0.2rem;
-}
-.readiness-detail {
-    font-size: 0.71rem;
-    color: #475569;
-    line-height: 1.38;
-}
-.console-banner {
-    padding: 0.65rem 0.95rem;
-    border-radius: 6px;
-    font-size: 0.78rem;
-    line-height: 1.45;
-    margin-bottom: 0.9rem;
-}
-.console-banner.synth {
-    background: #fffbeb;
-    border: 1px solid #f59e0b;
-    color: #78350f;
-}
-.console-banner.incomplete {
-    background: #fef2f2;
-    border: 1px solid #ef4444;
-    color: #7f1d1d;
-}
-.console-banner.real-ok {
-    background: #f0f9ff;
-    border: 1px solid #0284c7;
-    color: #0c4a6e;
-}
-.stage-badge {
-    display: inline-block;
-    padding: 0.14rem 0.48rem;
-    border-radius: 4px;
-    font-size: 0.66rem;
-    font-weight: 700;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
-}
-.stage-badge.completed { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
-.stage-badge.fallback { background: #e0f2fe; color: #075985; border: 1px solid #7dd3fc; }
-.stage-badge.blocked { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
-.stage-badge.review { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
-.stage-badge.skipped { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
+_NAV_PAGES = ("Portfolio", "Assessments", "Evidence", "Reports", "Settings")
+_TIER_SORT_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
 
 
-/* ── Top Bar ── */
-.topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding-bottom: 1.1rem;
-    border-bottom: 1px solid #e2e8f0;
-    margin-bottom: 1.25rem;
-}
-.topbar-brand {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-}
-.topbar-logo {
-    width: 36px;
-    height: 36px;
-    background: #0f172a;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1.05rem;
-    color: #ffffff;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-}
-.topbar-name {
-    font-size: 1.12rem;
-    font-weight: 700;
-    color: #0f172a;
-    letter-spacing: -0.02em;
-    line-height: 1.2;
-}
-.topbar-sub {
-    font-size: 0.75rem;
-    color: #64748b;
-    font-weight: 400;
-}
-.topbar-right {
-    font-size: 0.72rem;
-    color: #64748b;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    padding: 0.35rem 0.75rem;
-    border-radius: 6px;
-    font-weight: 500;
-}
-
-/* ── Stat Cards ── */
-.stat-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 0.85rem;
-    margin-bottom: 1.25rem;
-}
-.stat-card {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 0.9rem 1.15rem;
-    position: relative;
-    overflow: hidden;
-    transition: all 0.15s ease;
-}
-.stat-card:hover {
-    border-color: #cbd5e1;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-}
-.stat-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0;
-    width: 3px; height: 100%;
-}
-.stat-card.all::before      { background: #3b82f6; }
-.stat-card.critical::before { background: #dc2626; }
-.stat-card.high::before     { background: #ea580c; }
-.stat-card.medium::before   { background: #d97706; }
-.stat-card.low::before      { background: #16a34a; }
-
-.stat-label {
-    font-size: 0.68rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: #64748b;
-    margin-bottom: 0.25rem;
-}
-.stat-value {
-    font-size: 1.75rem;
-    font-weight: 700;
-    color: #0f172a;
-    line-height: 1;
-}
-.stat-sub {
-    font-size: 0.72rem;
-    color: #94a3b8;
-    margin-top: 0.25rem;
-}
-
-/* ── Section Headers ── */
-.sec-header {
-    font-size: 0.72rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: #475569;
-    margin: 1.1rem 0 0.5rem;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-}
-
-/* ── Criticality Pills ── */
-.pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    font-size: 0.72rem;
-    font-weight: 600;
-    padding: 0.18rem 0.55rem;
-    border-radius: 9999px;
-    letter-spacing: 0.02em;
-}
-.pill.critical { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
-.pill.high     { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; }
-.pill.medium   { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
-.pill.low      { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
-
-.pill-dot { width: 5px; height: 5px; border-radius: 50%; }
-.pill.critical .pill-dot { background: #dc2626; }
-.pill.high .pill-dot     { background: #ea580c; }
-.pill.medium .pill-dot   { background: #d97706; }
-.pill.low .pill-dot      { background: #16a34a; }
-
-/* ── Detail Panel ── */
-.detail-header {
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 1.1rem 1.25rem;
-    margin-bottom: 0.75rem;
-}
-.detail-vendor-name {
-    font-size: 1.15rem;
-    font-weight: 700;
-    color: #0f172a;
-    letter-spacing: -0.01em;
-    margin-bottom: 0.35rem;
-}
-.detail-meta {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    flex-wrap: wrap;
-}
-.detail-tag {
-    font-size: 0.72rem;
-    font-weight: 500;
-    color: #334155;
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 5px;
-    padding: 0.2rem 0.5rem;
-}
-
-/* ── Factor Cards ── */
-.factor-card {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 0.75rem 0.95rem;
-    margin-bottom: 0.5rem;
-}
-.factor-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 0.3rem;
-}
-.factor-title {
-    font-size: 0.74rem;
-    font-weight: 700;
-    color: #0f172a;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-}
-.factor-rationale {
-    font-size: 0.78rem;
-    color: #334155;
-    line-height: 1.45;
-    margin-bottom: 0.35rem;
-}
-.factor-meta {
-    font-size: 0.68rem;
-    color: #64748b;
-    border-top: 1px solid #f1f5f9;
-    padding-top: 0.3rem;
-}
-
-/* ── Score Meter ── */
-.score-meter {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-}
-.score-tick {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    border-radius: 4px;
-    font-size: 0.68rem;
-    font-weight: 600;
-}
-.score-tick.active-score {
-    background: #0f172a;
-    color: #ffffff;
-}
-.score-tick.filled {
-    background: #e2e8f0;
-    color: #475569;
-}
-.score-tick.empty {
-    background: #f8fafc;
-    color: #cbd5e1;
-    border: 1px dashed #cbd5e1;
-}
-.score-fraction {
-    font-size: 0.72rem;
-    font-weight: 600;
-    color: #64748b;
-    margin-left: 5px;
-}
-
-/* ── Override / Safeguard Box ── */
-.override-box {
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 6px;
-    padding: 0.65rem 0.85rem;
-    margin-bottom: 0.45rem;
-    font-size: 0.75rem;
-}
-.override-box.triggered {
-    background: #fff7ed;
-    border-color: #fdba74;
-}
-
-/* ── Report Card ── */
-.report-card {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 0.9rem 1.15rem;
-    margin-bottom: 1rem;
-}
-
-/* ── OSINT Gate Cards & Queries ── */
-.gate-card {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 0.85rem 1.05rem;
-    margin-bottom: 0.55rem;
-}
-.query-card {
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 6px;
-    padding: 0.6rem 0.85rem;
-    margin-bottom: 0.45rem;
-    font-size: 0.76rem;
-    color: #0f172a;
-}
-.advisory-box {
-    background: #fffbeb;
-    border: 1px solid #fde68a;
-    border-radius: 8px;
-    padding: 0.75rem 1rem;
-    margin-bottom: 0.55rem;
-    font-size: 0.76rem;
-    color: #92400e;
-}
-
-/* ── Empty State ── */
-.empty-state {
-    text-align: center;
-    padding: 2.5rem 1rem;
-    border: 1.5px dashed #e2e8f0;
-    border-radius: 8px;
-    color: #94a3b8;
-}
-.empty-icon { font-size: 1.5rem; margin-bottom: 0.4rem; }
-.empty-title { font-size: 0.88rem; font-weight: 600; color: #475569; margin-bottom: 0.2rem; }
-.empty-hint  { font-size: 0.75rem; color: #94a3b8; }
-
-section[data-testid="stSidebar"] {
-    background: #f8fafc;
-    border-right: 1px solid #e2e8f0;
-}
-section[data-testid="stSidebar"] .block-container {
-    padding: 1.25rem 1rem;
-}
-
-/* Clean tabs styling */
-div[data-baseweb="tab-list"] {
-    gap: 1.5rem;
-    border-bottom: 1px solid #e2e8f0;
-    padding-bottom: 0.15rem;
-    margin-bottom: 1.25rem;
-}
-button[data-baseweb="tab"] {
-    font-size: 0.82rem;
-    font-weight: 600;
-    padding: 0.4rem 0.6rem;
-    color: #64748b;
-    background: transparent !important;
-}
-button[data-baseweb="tab"][aria-selected="true"] {
-    color: #0f172a;
-    border-bottom: 2px solid #0f172a !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ─── Constants & Paths ────────────────────────────────────────────────────────
-MERIDIAN_DATASET_CSV = Path("data/input/meridian_vendors.csv")
-LEGACY_SAMPLE_CSV = Path("data/sample/sample_vendors.csv")
-CONFIG_PATH = Path("config/criticality.yaml")
-REPORTS_DIR = Path("data/output")
-
-DEPTH_LABEL = {
-    AssessmentDepth.COMPREHENSIVE: "Comprehensive Depth",
-    AssessmentDepth.TARGETED: "Targeted Depth",
-    AssessmentDepth.LIGHTWEIGHT: "Lightweight Depth",
-}
+# ─── Enterprise Visual Design System (CSS) ────────────────────────────────────
 
 
-def pill(val: str) -> str:
-    norm = str(val).lower().replace("tier 1 — ", "").replace("tier 2 — ", "").replace("tier 3 — ", "").strip()
-    css_class = "medium"
-    if "crit" in norm:
-        css_class = "critical"
-    elif "high" in norm:
-        css_class = "high"
-    elif "med" in norm:
-        css_class = "medium"
-    elif "low" in norm:
-        css_class = "low"
-    return f'<span class="pill {css_class}"><span class="pill-dot"></span>{val}</span>'
+def _inject_enterprise_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        /* Hide Streamlit default chrome and sidebar completely */
+        header[data-testid="stHeader"] {
+            display: none !important;
+        }
+        div[data-testid="stToolbar"] {
+            display: none !important;
+        }
+        section[data-testid="stSidebar"] {
+            display: none !important;
+        }
+        div[data-testid="collapsedControl"] {
+            display: none !important;
+        }
+        #MainMenu, footer {
+            visibility: hidden;
+        }
 
+        /* Application canvas & typography */
+        .stApp {
+            background-color: #F4F6F9;
+            color: #0F172A;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+        }
+        .block-container {
+            max-width: 1440px !important;
+            padding-top: 1.1rem !important;
+            padding-bottom: 3rem !important;
+            padding-left: 2rem !important;
+            padding-right: 2rem !important;
+        }
 
-def render_score_meter(score: Optional[int], max_score: int = 3) -> str:
-    if score is None:
-        return '<span style="font-size:0.7rem;font-weight:600;color:#94a3b8;background:#f1f5f9;padding:0.15rem 0.4rem;border-radius:4px;">UNKNOWN</span>'
-    ticks = []
-    for i in range(max_score + 1):
-        if i == score:
-            ticks.append(f'<span class="score-tick active-score">{i}</span>')
-        elif i < score:
-            ticks.append(f'<span class="score-tick filled">{i}</span>')
-        else:
-            ticks.append(f'<span class="score-tick empty">{i}</span>')
-    return f'<div class="score-meter">{"".join(ticks)} <span class="score-fraction">({score}/{max_score})</span></div>'
+        /* Enterprise Shell Header */
+        .uc-shell-header {
+            background: #0F172A;
+            color: #F8FAFC;
+            border-radius: 8px;
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+            border: 1px solid #1E293B;
+            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);
+            margin-bottom: 10px;
+        }
+        .uc-brand-group {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .uc-brand-mark {
+            background: #1D4ED8;
+            color: #FFFFFF;
+            font-weight: 800;
+            font-size: 0.82rem;
+            letter-spacing: 0.08em;
+            padding: 6px 10px;
+            border-radius: 5px;
+            text-transform: uppercase;
+        }
+        .uc-brand-title {
+            font-size: 1.05rem;
+            font-weight: 700;
+            color: #FFFFFF;
+            letter-spacing: -0.01em;
+            line-height: 1.2;
+        }
+        .uc-brand-subtitle {
+            font-size: 0.78rem;
+            color: #94A3B8;
+            margin-top: 2px;
+        }
+        .uc-header-pills {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .uc-header-pill {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: #1E293B;
+            color: #E2E8F0;
+            border: 1px solid #334155;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .uc-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .uc-dot-green { background: #10B981; }
+        .uc-dot-amber { background: #F59E0B; }
+        .uc-dot-blue { background: #3B82F6; }
 
+        /* Page Header Banner */
+        .uc-page-header {
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 8px;
+            padding: 14px 20px;
+            margin-top: 6px;
+            margin-bottom: 14px;
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+        }
+        h1.uc-page-title, .uc-page-title {
+            font-size: 1.32rem !important;
+            font-weight: 700 !important;
+            color: #0F172A !important;
+            margin: 0 0 3px 0 !important;
+            padding: 0 !important;
+            line-height: 1.25 !important;
+            letter-spacing: -0.015em !important;
+        }
+        p.uc-page-desc, .uc-page-desc {
+            font-size: 0.85rem !important;
+            color: #475569 !important;
+            margin: 0 !important;
+            line-height: 1.45 !important;
+        }
 
-def run_meridian_methodology(csv_bytes: bytes) -> list[CriticalityResult]:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb") as tmp:
-        tmp.write(csv_bytes)
-        tmp_path = Path(tmp.name)
-    loader = MeridianCSVVendorLoader()
-    engine = MeridianCriticalityEngine()
-    vendors = loader.load(tmp_path)
-    return [engine.evaluate(v) for v in vendors]
+        /* KPI Metric Cards */
+        .uc-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        @media (max-width: 1100px) {
+            .uc-kpi-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        .uc-kpi-card {
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-top: 3px solid #CBD5E1;
+            border-radius: 8px;
+            padding: 13px 16px;
+            min-height: 92px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+        }
+        .uc-kpi-blue { border-top-color: #1D4ED8; }
+        .uc-kpi-green { border-top-color: #059669; }
+        .uc-kpi-red { border-top-color: #DC2626; }
+        .uc-kpi-amber { border-top-color: #D97706; }
+        .uc-kpi-slate { border-top-color: #475569; }
+        .uc-kpi-label {
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: #475569;
+        }
+        .uc-kpi-value {
+            font-size: 1.55rem;
+            font-weight: 700;
+            color: #0F172A;
+            line-height: 1.15;
+            margin: 5px 0 3px 0;
+        }
+        .uc-kpi-sub {
+            font-size: 0.75rem;
+            color: #64748B;
+        }
 
+        /* Content Panels & Section Headings */
+        .uc-panel {
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin-bottom: 14px;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+        }
+        .uc-section-header {
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-left: 4px solid #1D4ED8;
+            border-radius: 6px;
+            padding: 11px 16px;
+            margin-top: 8px;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.02);
+        }
+        .uc-panel .uc-section-header {
+            background: transparent;
+            border: none;
+            border-bottom: 1px solid #E2E8F0;
+            border-radius: 0;
+            padding: 0 0 10px 0;
+            margin-top: 0;
+            margin-bottom: 12px;
+            box-shadow: none;
+        }
+        h2.uc-section-title, h3.uc-section-title, .uc-section-title {
+            font-size: 0.98rem !important;
+            font-weight: 700 !important;
+            color: #0F172A !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            line-height: 1.3 !important;
+        }
+        p.uc-section-subtitle, .uc-section-subtitle {
+            font-size: 0.79rem !important;
+            color: #64748B !important;
+            margin: 2px 0 0 0 !important;
+            line-height: 1.35 !important;
+        }
 
-def run_legacy_pipeline(csv_bytes: bytes) -> list[CriticalityAssessment]:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb") as tmp:
-        tmp.write(csv_bytes)
-        tmp_path = Path(tmp.name)
-    pipeline = AssessmentPipeline(config_path=CONFIG_PATH)
-    return pipeline.run_from_source(tmp_path)
+        /* Semantic Badges */
+        .uc-badge {
+            display: inline-block;
+            padding: 3px 9px;
+            border-radius: 4px;
+            font-size: 0.73rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            line-height: 1.3;
+            white-space: nowrap;
+        }
+        .uc-badge-critical { background: #FEF2F2; color: #991B1B; border: 1px solid #FECACA; }
+        .uc-badge-high { background: #FFFBEB; color: #92400E; border: 1px solid #FDE68A; }
+        .uc-badge-medium { background: #EFF6FF; color: #1E40AF; border: 1px solid #BFDBFE; }
+        .uc-badge-low { background: #F8FAFC; color: #334155; border: 1px solid #CBD5E1; }
+        .uc-badge-success { background: #ECFDF5; color: #065F46; border: 1px solid #A7F3D0; }
+        .uc-badge-neutral { background: #F1F5F9; color: #475569; border: 1px solid #CBD5E1; }
+        .uc-badge-purple { background: #F5F3FF; color: #5B21B6; border: 1px solid #DDD6FE; }
 
+        /* Enterprise Data Tables (Wrapped, Non-Clipped) */
+        .uc-table-wrap {
+            width: 100%;
+            overflow-x: auto;
+            border: 1px solid #E2E8F0;
+            border-radius: 8px;
+            background: #FFFFFF;
+            margin-bottom: 14px;
+        }
+        table.uc-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.84rem;
+            color: #0F172A;
+        }
+        table.uc-table th {
+            background: #F8FAFC;
+            color: #334155;
+            font-weight: 600;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            padding: 10px 12px;
+            border-bottom: 1px solid #E2E8F0;
+            text-align: left;
+            vertical-align: middle;
+        }
+        table.uc-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #F1F5F9;
+            vertical-align: top;
+            line-height: 1.45;
+            white-space: normal;
+            word-break: break-word;
+        }
+        table.uc-table tr:last-child td {
+            border-bottom: none;
+        }
+        table.uc-table tr:hover td {
+            background: #F8FAFC;
+        }
+        table.uc-table tr.uc-row-selected td {
+            background: #EFF6FF;
+        }
+        .uc-mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.78rem;
+            color: #1E293B;
+            background: #F1F5F9;
+            padding: 2px 5px;
+            border-radius: 4px;
+        }
 
-def load_and_normalize_report(file_path: Path) -> list[dict[str, Any]]:
-    """Normalize any saved report JSON into a standardized structure."""
-    try:
-        content = json.loads(file_path.read_text(encoding="utf-8"))
-        if not isinstance(content, list):
-            return []
-        normalized: list[dict[str, Any]] = []
-        for item in content:
-            if "factors" in item:
-                # Meridian format
-                crit = item.get("final_criticality") or item.get("proposed_criticality") or "Unknown"
-                score = item.get("base_score")
-                factors = item.get("factors", {})
-                d = factors.get("D", {}).get("score")
-                p = factors.get("P", {}).get("score")
-                r = factors.get("R", {}).get("score")
-                o = factors.get("O", {}).get("score")
-                v = factors.get("V", {}).get("score")
-                safeguards = any(ov.get("triggered") for ov in item.get("overrides_evaluated", []))
-                normalized.append({
-                    "id": item.get("vendor_id", ""),
-                    "name": item.get("vendor_name", ""),
-                    "criticality": crit,
-                    "score": score,
-                    "depth": item.get("assessment_depth", "Targeted"),
-                    "D": d, "P": p, "R": r, "O": o, "V": v,
-                    "safeguards_triggered": safeguards,
-                    "raw": item,
-                })
-            elif "criteria" in item:
-                # Legacy format
-                tier_map = {"TIER_1": "Critical", "TIER_2": "Medium", "TIER_3": "Low"}
-                crit = tier_map.get(item.get("criticality_tier", ""), item.get("criticality_tier", ""))
-                score = item.get("criticality_score")
-                crit_dict = item.get("criteria", {})
-                normalized.append({
-                    "id": item.get("vendor_id", ""),
-                    "name": item.get("vendor_name", ""),
-                    "criticality": crit,
-                    "score": score,
-                    "depth": str(item.get("assessment_depth", "TARGETED")).capitalize(),
-                    "D": crit_dict.get("data_sensitivity", {}).get("score"),
-                    "P": crit_dict.get("payment_flows", {}).get("score"),
-                    "R": crit_dict.get("regulatory_exposure", {}).get("score"),
-                    "O": crit_dict.get("operational_dependency", {}).get("score"),
-                    "V": crit_dict.get("customer_data_volume", {}).get("score"),
-                    "safeguards_triggered": False,
-                    "raw": item,
-                })
-        return normalized
-    except Exception as e:
-        st.error(f"Error loading report: {e}")
-        return []
+        /* Callout Banners */
+        .uc-callout {
+            padding: 12px 16px;
+            border-radius: 6px;
+            font-size: 0.84rem;
+            line-height: 1.45;
+            margin-bottom: 14px;
+            border-left: 4px solid #CBD5E1;
+        }
+        .uc-callout-info {
+            background: #EFF6FF;
+            border: 1px solid #BFDBFE;
+            border-left: 4px solid #1D4ED8;
+            color: #1E3A8A;
+        }
+        .uc-callout-warn {
+            background: #FFFBEB;
+            border: 1px solid #FDE68A;
+            border-left: 4px solid #D97706;
+            color: #78350F;
+        }
+        .uc-callout-danger {
+            background: #FEF2F2;
+            border: 1px solid #FECACA;
+            border-left: 4px solid #DC2626;
+            color: #7F1D1D;
+        }
+        .uc-callout-success {
+            background: #ECFDF5;
+            border: 1px solid #A7F3D0;
+            border-left: 4px solid #059669;
+            color: #064E3B;
+        }
 
+        /* Key-Value Metadata Grid */
+        .uc-kv-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .uc-kv-box {
+            background: #F8FAFC;
+            border: 1px solid #E2E8F0;
+            border-radius: 6px;
+            padding: 10px 12px;
+        }
+        .uc-kv-label {
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: #64748B;
+            margin-bottom: 3px;
+        }
+        .uc-kv-val {
+            font-size: 0.88rem;
+            font-weight: 600;
+            color: #0F172A;
+            word-break: break-word;
+        }
 
-# ─── Top Brand Bar ────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="topbar">
-    <div class="topbar-brand">
-        <div class="topbar-logo">M</div>
-        <div>
-            <div class="topbar-name">Meridian Financial &nbsp;|&nbsp; Third-Party AI Risk Assessment Console</div>
-            <div class="topbar-sub">Nine-Level Deterministic Governance, Point-of-Capture OSINT Evidence &amp; Dual-Model Local Analysis</div>
-        </div>
-    </div>
-    <div class="topbar-right">Levels 1–9 &nbsp;·&nbsp; Deterministic Scoring &amp; Verdict Guardrails</div>
-</div>
-""", unsafe_allow_html=True)
+        /* Empty State */
+        .uc-empty-state {
+            background: #FFFFFF;
+            border: 1px dashed #CBD5E1;
+            border-radius: 8px;
+            padding: 28px 24px;
+            text-align: center;
+            color: #475569;
+            margin: 12px 0;
+        }
+        .uc-empty-title {
+            font-size: 0.98rem;
+            font-weight: 700;
+            color: #0F172A;
+            margin-bottom: 6px;
+        }
+        .uc-empty-desc {
+            font-size: 0.84rem;
+            color: #64748B;
+            max-width: 560px;
+            margin: 0 auto;
+        }
 
-# ─── Sidebar ──────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("#### Criticality Methodology")
-    engine_mode = st.radio(
-        "Engine Selection",
-        ["Meridian D/P/R/O/V (Primary)", "Standard Qualitative (Legacy)"],
-        label_visibility="collapsed",
+        /* Button styling refinements */
+        div.stButton > button {
+            border-radius: 6px !important;
+            font-weight: 600 !important;
+            font-size: 0.83rem !important;
+            padding: 0.42rem 0.9rem !important;
+            transition: all 0.12s ease-in-out !important;
+        }
+        div.stButton > button[kind="primary"] {
+            background-color: #1D4ED8 !important;
+            border-color: #1D4ED8 !important;
+            color: #FFFFFF !important;
+        }
+        div.stButton > button[kind="primary"]:hover {
+            background-color: #1E40AF !important;
+            border-color: #1E40AF !important;
+        }
+        div.stButton > button[kind="secondary"] {
+            background-color: #FFFFFF !important;
+            border-color: #CBD5E1 !important;
+            color: #1E293B !important;
+        }
+        div.stButton > button[kind="secondary"]:hover {
+            background-color: #F8FAFC !important;
+            border-color: #94A3B8 !important;
+            color: #0F172A !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    st.markdown("#### Vendor Dataset")
-    if "Primary" in engine_mode:
-        data_source = st.radio(
-            "Source",
-            ["Meridian Case Study (6 Vendors)", "Upload Meridian CSV"],
-            label_visibility="collapsed",
+
+# ─── Badge & Formatting Helpers ───────────────────────────────────────────────
+
+
+def _tier_badge(tier: Optional[str]) -> str:
+    t = (tier or "Unknown").strip()
+    cls_map = {
+        "Critical": "uc-badge-critical",
+        "High": "uc-badge-high",
+        "Medium": "uc-badge-medium",
+        "Low": "uc-badge-low",
+    }
+    cls = cls_map.get(t, "uc-badge-neutral")
+    return f'<span class="uc-badge {cls}">{html.escape(t)}</span>'
+
+
+def _status_badge(label: str, variant: str = "neutral") -> str:
+    cls_map = {
+        "critical": "uc-badge-critical",
+        "high": "uc-badge-high",
+        "medium": "uc-badge-medium",
+        "low": "uc-badge-low",
+        "success": "uc-badge-success",
+        "neutral": "uc-badge-neutral",
+        "purple": "uc-badge-purple",
+    }
+    cls = cls_map.get(variant, "uc-badge-neutral")
+    return f'<span class="uc-badge {cls}">{html.escape(label)}</span>'
+
+
+def _verdict_badge(verdict_val: str) -> str:
+    v = (verdict_val or "").upper()
+    if v == "YES":
+        return _status_badge("Confirmed AI Use (YES)", "critical")
+    if v == "INCONCLUSIVE":
+        return _status_badge("Indicative / Inconclusive", "high")
+    if v == "NO":
+        return _status_badge("No AI Identified (NO)", "success")
+    if v == "INCOMPLETE_ASSESSMENT":
+        return _status_badge("Incomplete Assessment", "high")
+    return _status_badge(format_plain_status(v), "neutral")
+
+
+def _severity_badge(sev: str) -> str:
+    s = (sev or "").capitalize()
+    if s == "Critical":
+        return _status_badge("Critical", "critical")
+    if s == "High":
+        return _status_badge("High", "high")
+    if s == "Medium":
+        return _status_badge("Medium", "medium")
+    if s == "Low":
+        return _status_badge("Low", "low")
+    return _status_badge(s or "Unresolved", "neutral")
+
+
+def _format_short_date(iso_str: Optional[str]) -> str:
+    if not iso_str:
+        return "—"
+    s = str(iso_str).strip()
+    if len(s) >= 16:
+        return s[:16].replace("T", " ") + " UTC"
+    return s
+
+
+# ─── Session State & Data Initialization ──────────────────────────────────────
+
+
+def _init_session_state() -> None:
+    repo = EvidenceRepository(db_path=_DEFAULT_DB_PATH, artifact_dir=_DEFAULT_ARTIFACT_DIR)
+    st.session_state["evidence_repo"] = repo
+
+    if "vendors_by_id" not in st.session_state:
+        vendors = MeridianCSVVendorLoader().load(_DEFAULT_VENDORS_CSV)
+        st.session_state["vendors_by_id"] = {v.vendor_id: v for v in vendors}
+
+    if "criticality_engine" not in st.session_state:
+        st.session_state["criticality_engine"] = MeridianCriticalityEngine()
+
+    if "criticality_by_id" not in st.session_state:
+        engine: MeridianCriticalityEngine = st.session_state["criticality_engine"]
+        st.session_state["criticality_by_id"] = {
+            vid: engine.evaluate(v) for vid, v in st.session_state["vendors_by_id"].items()
+        }
+
+    if "human_crit_overrides" not in st.session_state:
+        st.session_state["human_crit_overrides"] = {}
+
+    if "reports_by_vendor" not in st.session_state:
+        # Load only genuine live OSINT assessment reports by default so synthetic fixtures
+        # are never silently presented as completed real assessments on first load.
+        persisted = repo.load_latest_reports_by_vendor()
+        live_reports = {
+            vid: rpt for vid, rpt in persisted.items() if not rpt.is_synthetic_evidence_run
+        }
+        st.session_state["reports_by_vendor"] = live_reports
+
+    if "selected_vendor_id" not in st.session_state:
+        vids = sorted(st.session_state["vendors_by_id"].keys())
+        st.session_state["selected_vendor_id"] = "V-002" if "V-002" in vids else (vids[0] if vids else "V-002")
+
+    if "nav_section" not in st.session_state:
+        st.session_state["nav_section"] = "Portfolio"
+
+    if "portfolio_search" not in st.session_state:
+        st.session_state["portfolio_search"] = ""
+    if "portfolio_tier" not in st.session_state:
+        st.session_state["portfolio_tier"] = "All Tiers"
+    if "portfolio_status" not in st.session_state:
+        st.session_state["portfolio_status"] = "All Statuses"
+    if "portfolio_sort" not in st.session_state:
+        st.session_state["portfolio_sort"] = "Criticality (High → Low)"
+
+
+def _navigate_to(page: str, vendor_id: Optional[str] = None) -> None:
+    if vendor_id and vendor_id in st.session_state.get("vendors_by_id", {}):
+        st.session_state["selected_vendor_id"] = vendor_id
+    if page in _NAV_PAGES:
+        st.session_state["nav_section"] = page
+
+
+def _get_vendor_assessment_status(
+    vid: str,
+    crit: CriticalityResult,
+    report: Optional[VendorEndToEndAssessmentReport],
+) -> tuple[str, str, bool]:
+    """Return `(status_label, badge_variant, is_completed_real_assessment)`."""
+    if report is None:
+        if crit.requires_review:
+            return "Awaiting Tier Review", "high", False
+        return "Not Started", "neutral", False
+
+    if report.is_synthetic_evidence_run:
+        return "Sample Walkthrough", "purple", False
+
+    verdict_val = report.ai_use_verdict.verdict.value
+    if verdict_val == "INCOMPLETE_ASSESSMENT" or not report.ai_use_verdict.depth_completed:
+        return "Incomplete (Blocked)", "high", False
+
+    if report.human_Review_required:
+        return "Awaiting Analyst Review", "high", True
+
+    return "Completed", "success", True
+
+
+def _execute_vendor_assessment(
+    vendor: MeridianVendor,
+    *,
+    mode: str,
+    enable_local_llm: bool,
+    human_crit_override: Optional[HumanReviewRecord] = None,
+    analyst_gate_overrides: Optional[dict[str, tuple[str, str]]] = None,
+    human_validations: Optional[list[HumanValidationRecord]] = None,
+    progress_callback: Optional[Any] = None,
+) -> VendorEndToEndAssessmentReport:
+    """Execute the 9-level assessment pipeline in either Live OSINT or Sample Fixture mode."""
+    repo: EvidenceRepository = st.session_state["evidence_repo"]
+    readiness: SystemReadinessReport = st.session_state["system_readiness"]
+    crit_engine: MeridianCriticalityEngine = st.session_state["criticality_engine"]
+    all_sources = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12"]
+
+    if mode == "SAMPLE":
+        stub_search, stub_fetch = build_synthetic_demo_adapters_for_vendor(vendor)
+        pipeline = MeridianEndToEndPipeline(
+            criticality_engine=crit_engine,
+            search_backend=stub_search,
+            fetch_adapter=stub_fetch,
+            evidence_repository=repo,
+            enable_local_llm_from_env=enable_local_llm,
+            readiness=readiness,
+        )
+        report = pipeline.run_vendor_assessment(
+            vendor,
+            human_criticality_override=human_crit_override,
+            execute_searches=True,
+            execute_extraction=True,
+            mark_extracted_sources_reviewed=True,
+            reviewed_no_evidence_sources=all_sources,
+            analyst_gate_overrides=analyst_gate_overrides,
+            human_validations=human_validations,
+            persist_to_repository=True,
+            progress_callback=progress_callback,
         )
     else:
-        data_source = st.radio(
-            "Source",
-            ["Sample Dataset", "Upload CSV"],
-            label_visibility="collapsed",
+        live_search = build_search_backend_from_env()
+        live_fetch = build_fetch_adapter_from_env(allow_live_direct=True)
+        pipeline = MeridianEndToEndPipeline(
+            criticality_engine=crit_engine,
+            search_backend=live_search,
+            fetch_adapter=live_fetch,
+            evidence_repository=repo,
+            enable_local_llm_from_env=enable_local_llm,
+            readiness=readiness,
+        )
+        report = pipeline.run_vendor_assessment(
+            vendor,
+            human_criticality_override=human_crit_override,
+            execute_searches=True,
+            execute_extraction=True,
+            mark_extracted_sources_reviewed=False,
+            analyst_gate_overrides=analyst_gate_overrides,
+            human_validations=human_validations,
+            persist_to_repository=True,
+            progress_callback=progress_callback,
         )
 
-    uploaded_file = None
-    if "Upload" in data_source:
-        uploaded_file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
-
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1:
-        run_btn = st.button("Load Inventory", type="primary", use_container_width=True)
-    with col_btn2:
-        reset_btn = st.button("Reset State", use_container_width=True)
-
-    st.divider()
-    st.markdown("""
-    <div style="font-size:0.72rem;color:#475569;line-height:1.55">
-    <strong style="color:#0f172a">Nine-Level Framework</strong><br>
-    1. Criticality Tiering (D/P/R/O/V + O1–O5)<br>
-    2. Assessment Depth Scoping (S1–S12)<br>
-    3. Source Identification &amp; Recon (3B Triage)<br>
-    4. Data Scraping &amp; Point-of-Capture<br>
-    5. Semantic Filtering &amp; RAG Chunking<br>
-    6. Signal Classification (E14 Guard)<br>
-    7. Evidentiary Weighting (E1–E14, G1–G4)<br>
-    8. Risk Surfacing &amp; Summarization (R1–R8)<br>
-    9. Deterministic Risk Rating<br><br>
-    <strong style="color:#0f172a">Criticality Formula</strong><br>
-    <code>C = 0.30D + 0.20P + 0.20R + 0.20O + 0.10V</code>
-    </div>
-    """, unsafe_allow_html=True)
-
-# ─── Session State Initialization ─────────────────────────────────────────────
-if "results" not in st.session_state:
-    st.session_state.results = []
-if "mode_used" not in st.session_state:
-    st.session_state.mode_used = ""
-if "selected_id" not in st.session_state:
-    st.session_state.selected_id = None
-if "error_msg" not in st.session_state:
-    st.session_state.error_msg = None
-if "human_overrides" not in st.session_state:
-    st.session_state.human_overrides = {}
-if "osint_plans" not in st.session_state:
-    st.session_state.osint_plans = OSINTInvestigationPlanner.load_all_saved_plans(pause_if_running=True)
-if "filter_tier" not in st.session_state:
-    st.session_state.filter_tier = "All"
-if "show_raw_json" not in st.session_state:
-    st.session_state.show_raw_json = False
-if "e2e_reports" not in st.session_state:
-    st.session_state.e2e_reports = {}
-if "custom_vendors" not in st.session_state:
-    st.session_state.custom_vendors = {}
-if "system_readiness" not in st.session_state:
-    st.session_state.system_readiness = None
-
-# Auto-load case study on startup if empty
-if not st.session_state.results and MERIDIAN_DATASET_CSV.exists():
-    try:
-        st.session_state.results = run_meridian_methodology(MERIDIAN_DATASET_CSV.read_bytes())
-        st.session_state.mode_used = "meridian"
-        if st.session_state.results:
-            st.session_state.selected_id = st.session_state.results[0].vendor_id
-    except Exception:
-        pass
-
-if reset_btn:
-    st.session_state.results = []
-    st.session_state.selected_id = None
-    st.session_state.human_overrides = {}
-    st.session_state.osint_plans = {}
-    st.session_state.e2e_reports = {}
-    st.session_state.custom_vendors = {}
-    st.session_state.system_readiness = None
-    st.session_state.filter_tier = "All"
-    st.rerun()
-
-if run_btn:
-    st.session_state.error_msg = None
-    st.session_state.selected_id = None
-    st.session_state.human_overrides = {}
-    st.session_state.osint_plans = {}
-    st.session_state.e2e_reports = {}
-    try:
-        if "Primary" in engine_mode:
-            st.session_state.mode_used = "meridian"
-            if data_source == "Meridian Case Study (6 Vendors)":
-                st.session_state.results = run_meridian_methodology(MERIDIAN_DATASET_CSV.read_bytes())
-            elif uploaded_file:
-                st.session_state.results = run_meridian_methodology(uploaded_file.read())
-            else:
-                st.session_state.error_msg = "Please upload a CSV file."
-        else:
-            st.session_state.mode_used = "legacy"
-            if data_source == "Sample Dataset":
-                st.session_state.results = run_legacy_pipeline(LEGACY_SAMPLE_CSV.read_bytes())
-            elif uploaded_file:
-                st.session_state.results = run_legacy_pipeline(uploaded_file.read())
-            else:
-                st.session_state.error_msg = "Please upload a CSV file."
-        if st.session_state.results:
-            st.session_state.selected_id = st.session_state.results[0].vendor_id
-    except Exception as e:
-        st.session_state.error_msg = str(e)
-
-if st.session_state.error_msg:
-    st.error(st.session_state.error_msg)
-
-# ─── Navigation Tabs ──────────────────────────────────────────────────────────
-tab_assess, tab_osint, tab_e2e, tab_reports, tab_analytics = st.tabs([
-    "Criticality Tiering (Level 1)",
-    "OSINT Investigation Planner (Levels 2–3)",
-    "End-to-End AI Risk & Governance (Levels 1–9)",
-    "Assessment Archive",
-    "Portfolio Analytics",
-])
-
-
-# ==============================================================================
-# TAB 1: LIVE ASSESSMENT CONSOLE
-# ==============================================================================
-with tab_assess:
-    results = st.session_state.results
-    is_meridian = st.session_state.mode_used == "meridian"
-
-    if not results:
-        st.markdown("""
-        <div class="empty-state">
-            <div class="empty-icon">🛡️</div>
-            <div class="empty-title">No assessment loaded</div>
-            <div class="empty-hint">Select a dataset in the sidebar and click <strong>▶ Run</strong>.</div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        # Stat cards calculation
-        crit_count = sum(1 for r in results if (getattr(r, "final_criticality", "") == CriticalityLevel.CRITICAL or getattr(r, "criticality_tier", "") == CriticalityTier.TIER_1))
-        high_count = sum(1 for r in results if getattr(r, "final_criticality", "") == CriticalityLevel.HIGH)
-        med_count  = sum(1 for r in results if (getattr(r, "final_criticality", "") == CriticalityLevel.MEDIUM or getattr(r, "criticality_tier", "") == CriticalityTier.TIER_2))
-        low_count  = sum(1 for r in results if (getattr(r, "final_criticality", "") == CriticalityLevel.LOW or getattr(r, "criticality_tier", "") == CriticalityTier.TIER_3))
-
-        st.markdown(f"""
-        <div class="stat-grid">
-            <div class="stat-card all">
-                <div class="stat-label">Total Assessed</div>
-                <div class="stat-value">{len(results)}</div>
-                <div class="stat-sub">vendors in scope</div>
-            </div>
-            <div class="stat-card high">
-                <div class="stat-label">Critical / High</div>
-                <div class="stat-value">{crit_count + high_count}</div>
-                <div class="stat-sub">Comprehensive assessment depth</div>
-            </div>
-            <div class="stat-card medium">
-                <div class="stat-label">Medium Risk</div>
-                <div class="stat-value">{med_count}</div>
-                <div class="stat-sub">Targeted assessment depth</div>
-            </div>
-            <div class="stat-card low">
-                <div class="stat-label">Low Risk</div>
-                <div class="stat-value">{low_count}</div>
-                <div class="stat-sub">Lightweight assessment depth</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Quick Filter Pills
-        filter_col, action_col = st.columns([7, 3])
-        with filter_col:
-            selected_filter = st.pills(
-                "Filter Tier",
-                ["All", "Critical", "High", "Medium", "Low"],
-                default=st.session_state.filter_tier,
-                label_visibility="collapsed",
-            )
-            st.session_state.filter_tier = selected_filter or "All"
-
-        with action_col:
-            # Action button to archive current run to reports directory
-            if st.button("💾 Archive Run to Reports", use_container_width=True, key="btn_archive_live"):
-                REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-                timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                archive_filename = f"meridian_assessment_{timestamp_str}.json"
-                archive_path = REPORTS_DIR / archive_filename
-                
-                engine = MeridianCriticalityEngine() if is_meridian else None
-                if is_meridian and engine:
-                    archive_records = []
-                    for r in results:
-                        trail = engine.generate_audit_trail(r)
-                        h_rev = st.session_state.human_overrides.get(r.vendor_id)
-                        if h_rev:
-                            trail["human_review"] = h_rev.model_dump()
-                            trail["final_criticality"] = h_rev.final_criticality
-                        archive_records.append(trail)
-                else:
-                    archive_records = [r.model_dump(mode="json") for r in results]
-                
-                with open(archive_path, "w", encoding="utf-8") as f:
-                    json.dump(archive_records, f, indent=2)
-                st.toast(f"Archived to {archive_filename}!", icon="💾")
-
-        # Two-column layout: Inventory vs Detail
-        col_left, col_right = st.columns([5, 5], gap="large")
-
-        with col_left:
-            st.markdown('<div class="sec-header"><span>Vendor Inventory</span></div>', unsafe_allow_html=True)
-
-            # Build rows
-            rows = []
-            for r in results:
-                if is_meridian:
-                    h_rev = st.session_state.human_overrides.get(r.vendor_id)
-                    final_c = h_rev.final_criticality if h_rev else r.final_criticality
-                    
-                    # Apply tier filter
-                    if st.session_state.filter_tier != "All" and str(final_c).lower() != st.session_state.filter_tier.lower():
-                        continue
-                        
-                    rows.append({
-                        "ID": r.vendor_id,
-                        "Vendor": r.vendor_name,
-                        "Criticality": str(final_c),
-                        "Base Score": f"{r.base_score:.2f}" if r.base_score is not None else "UNKNOWN",
-                        "D": str(r.D.score) if r.D.score is not None else "UNKNOWN",
-                        "P": str(r.P.score) if r.P.score is not None else "UNKNOWN",
-                        "R": str(r.R.score) if r.R.score is not None else "UNKNOWN",
-                        "O": str(r.O.score) if r.O.score is not None else "UNKNOWN",
-                        "V": str(r.V.score) if r.V.score is not None else "UNKNOWN",
-                        "Safeguards": "Triggered" if r.automatic_override_applied else "None",
-                    })
-                else:
-                    tier_str = str(r.criticality_tier)
-                    if st.session_state.filter_tier != "All" and st.session_state.filter_tier.lower() not in tier_str.lower():
-                        continue
-                    rows.append({
-                        "ID": r.vendor_id,
-                        "Vendor": r.vendor_name,
-                        "Criticality": tier_str,
-                        "Score": f"{r.criticality_score:.2f}",
-                        "Depth": str(r.assessment_depth),
-                    })
-
-            if not rows:
-                st.info(f"No vendors match filter: '{st.session_state.filter_tier}'")
-            else:
-                df = pd.DataFrame(rows)
-
-                def _crit_style(val: str) -> str:
-                    s = str(val).lower()
-                    if "critical" in s or "tier_1" in s:
-                        return "background-color:#fee2e2;color:#991b1b;font-weight:700;"
-                    if "high" in s:
-                        return "background-color:#fff7ed;color:#c2410c;font-weight:600;"
-                    if "medium" in s or "tier_2" in s:
-                        return "background-color:#fffbeb;color:#92400e;font-weight:600;"
-                    return "background-color:#f0fdf4;color:#166534;font-weight:600;"
-
-                styled = df.style.map(_crit_style, subset=["Criticality"])
-                ev = st.dataframe(
-                    styled,
-                    use_container_width=True,
-                    hide_index=True,
-                    on_select="rerun",
-                    selection_mode="single-row",
-                    key="live_inventory_table",
-                )
-
-                if ev.selection and ev.selection.rows:
-                    selected_idx = ev.selection.rows[0]
-                    st.session_state.selected_id = rows[selected_idx]["ID"]
-
-            # Download full audit trail
-            export_engine = MeridianCriticalityEngine() if is_meridian else None
-            if is_meridian and export_engine:
-                full_export = []
-                for r in results:
-                    trail = export_engine.generate_audit_trail(r)
-                    h_rev = st.session_state.human_overrides.get(r.vendor_id)
-                    if h_rev:
-                        trail["human_review"] = h_rev.model_dump()
-                        trail["final_criticality"] = h_rev.final_criticality
-                    full_export.append(trail)
-            else:
-                full_export = [r.model_dump(mode="json") for r in results]
-
-            json_out = json.dumps(full_export, indent=2)
-            st.download_button(
-                "⬇ Download Complete Audit JSON",
-                data=json_out,
-                file_name="meridian_assessment_audit.json",
-                mime="application/json",
-                use_container_width=True,
-                key="btn_download_full_json",
-            )
-
-        with col_right:
-            sel_id = st.session_state.selected_id
-            sel = next((r for r in results if r.vendor_id == sel_id), None)
-
-            if sel is None:
-                st.markdown('<div class="sec-header"><span>Vendor Dossier</span></div>', unsafe_allow_html=True)
-                st.markdown("""
-                <div class="empty-state">
-                    <div class="empty-icon">←</div>
-                    <div class="empty-title">Select a vendor to inspect</div>
-                    <div class="empty-hint">Click any row in the inventory to review factor provenance, safeguards, and sign off governance.</div>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                if is_meridian:
-                    r: CriticalityResult = sel
-                    user_override = st.session_state.human_overrides.get(r.vendor_id)
-                    current_final_crit = user_override.final_criticality if user_override else r.final_criticality
-
-                    # Panel Quick Actions Toolbar
-                    btn_c1, btn_c2, btn_c3 = st.columns([3, 4, 3])
-                    with btn_c1:
-                        # Raw JSON toggle
-                        if st.button("📋 Raw JSON", use_container_width=True, key=f"btn_toggle_raw_{r.vendor_id}"):
-                            st.session_state.show_raw_json = not st.session_state.show_raw_json
-                    with btn_c2:
-                        # Download Single Dossier
-                        single_engine = MeridianCriticalityEngine()
-                        single_trail = single_engine.generate_audit_trail(r)
-                        if user_override:
-                            single_trail["human_review"] = user_override.model_dump()
-                            single_trail["final_criticality"] = user_override.final_criticality
-                        st.download_button(
-                            "⬇ Export Dossier",
-                            data=json.dumps(single_trail, indent=2),
-                            file_name=f"{r.vendor_id}_{r.vendor_name.replace(' ', '_')}.json",
-                            mime="application/json",
-                            use_container_width=True,
-                            key=f"btn_dl_dossier_{r.vendor_id}",
-                        )
-                    with btn_c3:
-                        if user_override:
-                            if st.button("🔄 Reset Review", use_container_width=True, key=f"btn_clear_ov_{r.vendor_id}"):
-                                del st.session_state.human_overrides[r.vendor_id]
-                                st.rerun()
-
-                    # Collapsible Raw JSON view
-                    if st.session_state.show_raw_json:
-                        with st.expander("Audit Trail JSON Inspector", expanded=True):
-                            st.json(single_trail)
-
-                    # 1. Vendor Header
-                    st.markdown(f"""
-                    <div class="detail-header">
-                        <div class="detail-vendor-name">{r.vendor_name} ({r.vendor_id})</div>
-                        <div class="detail-meta">
-                            {pill(current_final_crit or 'Low')}
-                            <span class="detail-tag">Base: <strong>{r.base_score if r.base_score is not None else 'UNKNOWN'}</strong></span>
-                            <span class="detail-tag">Status: <strong>{r.score_status.value}</strong></span>
-                            <span class="detail-tag">Depth: <strong>{r.assessment_depth}</strong></span>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # 2. Factor Scores (D / P / R / O / V)
-                    st.markdown('<div class="sec-header"><span>1. Factor Scores &amp; Provenance</span></div>', unsafe_allow_html=True)
-                    factors_to_show = [
-                        ("D — Data Sensitivity", r.D),
-                        ("P — Payment Flow Exposure", r.P),
-                        ("R — Regulatory Exposure", r.R),
-                        ("O — Operational Dependency", r.O),
-                        ("V — Annual Data Volume", r.V),
-                    ]
-                    for label, f in factors_to_show:
-                        contrib_str = f"{f.weighted_contribution:.2f}" if f.weighted_contribution is not None else "N/A"
-                        weight_str = f"{int(f.weight * 100)}%" if f.weight is not None else ""
-                        st.markdown(f"""
-                        <div class="factor-card">
-                            <div class="factor-header">
-                                <span class="factor-title">{label} ({weight_str})</span>
-                                {render_score_meter(f.score, 3)}
-                            </div>
-                            <div class="factor-rationale">{f.rationale}</div>
-                            <div class="factor-meta">
-                                Method: <code>{f.determination_method.value}</code> &nbsp;·&nbsp; Contrib: <strong>{contrib_str}</strong> &nbsp;·&nbsp; Input: "{f.raw_input or 'None'}"
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    # 3. Weighted Calculation
-                    st.markdown('<div class="sec-header"><span>2. Weighted Calculation</span></div>', unsafe_allow_html=True)
-                    st.markdown(f"""
-                    <div class="factor-card" style="font-size:0.78rem;line-height:1.6">
-                        <strong>Formula:</strong> <code>0.30D + 0.20P + 0.20R + 0.20O + 0.10V</code><br>
-                        <strong>Base Score:</strong> <strong>{r.base_score}</strong> &nbsp;·&nbsp;
-                        <strong>Provisional Criticality:</strong> {pill(r.provisional_criticality or 'Low')}
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # 4. Automatic Safeguards (O1–O4)
-                    st.markdown('<div class="sec-header"><span>3. Automatic Safeguards (O1–O4)</span></div>', unsafe_allow_html=True)
-                    for o in r.overrides_evaluated:
-                        trig_cls = "triggered" if o.triggered else ""
-                        status_badge = f"<strong style='color:#c2410c;'>TRIGGERED (Floor: {o.resulting_floor})</strong>" if o.triggered else "<span style='color:#64748b;'>Cleared</span>"
-                        st.markdown(f"""
-                        <div class="override-box {trig_cls}">
-                            <strong>[{o.override_id}] {o.description}</strong> — {status_badge}<br>
-                            <span style="color:#64748b">Condition: {o.condition_evaluated} &nbsp;·&nbsp; Evidence: {o.evidence}</span><br>
-                            <span style="color:#334155">{o.rationale}</span>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    st.markdown(f"""
-                    <div style="font-size:0.8rem;margin:0.4rem 0 0.8rem">
-                        <strong>Proposed Criticality (Post-Safeguards):</strong> {pill(r.proposed_criticality or 'Low')}
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # 5. Governance & Human Review (O5)
-                    st.markdown('<div class="sec-header"><span>4. Human Review &amp; Governance (O5)</span></div>', unsafe_allow_html=True)
-                    with st.container(border=True):
-                        choice = st.radio(
-                            "Governance Action",
-                            [f"Confirm Proposed ({r.proposed_criticality})", "Change Criticality"],
-                            horizontal=True,
-                            key=f"gov_choice_{r.vendor_id}",
-                        )
-
-                        if "Change" in choice:
-                            new_val = st.selectbox(
-                                "Override Tier Selection",
-                                [CriticalityLevel.LOW, CriticalityLevel.MEDIUM, CriticalityLevel.HIGH, CriticalityLevel.CRITICAL],
-                                index=2,
-                                key=f"new_crit_{r.vendor_id}",
-                            )
-                            rationale_input = st.text_area(
-                                "Mandatory Written Rationale",
-                                placeholder="State regulatory justification or committee approval rationale...",
-                                key=f"gov_rat_{r.vendor_id}",
-                            )
-                            if st.button("Apply Controlled Override", type="primary", key=f"btn_save_gov_{r.vendor_id}"):
-                                if not rationale_input.strip():
-                                    st.error("A written rationale is required when altering the automated criticality.")
-                                else:
-                                    st.session_state.human_overrides[r.vendor_id] = HumanReviewRecord(
-                                        user_decision="CHANGE_CRITICALITY",
-                                        original_criticality=r.proposed_criticality or "Low",
-                                        final_criticality=new_val,
-                                        rationale=rationale_input.strip(),
-                                    )
-                                    existing_plan = st.session_state.osint_plans.get(r.vendor_id)
-                                    if existing_plan is not None:
-                                        updated_plan = OSINTInvestigationPlanner().plan_investigation(
-                                            vendor=r,
-                                            criticality_input=r,
-                                            human_review=st.session_state.human_overrides[r.vendor_id],
-                                            existing_plan=existing_plan,
-                                        )
-                                        st.session_state.osint_plans[r.vendor_id] = updated_plan
-                                        OSINTInvestigationPlanner.save_plan_state(updated_plan)
-                                    st.success(f"Overridden to {new_val} by analyst.")
-                                    st.rerun()
-                        else:
-                            if st.button("Confirm Proposed Criticality", key=f"btn_confirm_gov_{r.vendor_id}"):
-                                st.session_state.human_overrides[r.vendor_id] = HumanReviewRecord(
-                                    user_decision="KEEP_PROPOSED",
-                                    original_criticality=r.proposed_criticality or "Low",
-                                    final_criticality=r.proposed_criticality or "Low",
-                                    rationale="Analyst confirmed proposed automated criticality.",
-                                )
-                                existing_plan = st.session_state.osint_plans.get(r.vendor_id)
-                                if existing_plan is not None:
-                                    updated_plan = OSINTInvestigationPlanner().plan_investigation(
-                                        vendor=r,
-                                        criticality_input=r,
-                                        human_review=st.session_state.human_overrides[r.vendor_id],
-                                        existing_plan=existing_plan,
-                                    )
-                                    st.session_state.osint_plans[r.vendor_id] = updated_plan
-                                    OSINTInvestigationPlanner.save_plan_state(updated_plan)
-                                st.info("Automated criticality confirmed.")
-                                st.rerun()
-
-                        if user_override:
-                            st.markdown(f"""
-                            <div style="font-size:0.75rem;background:#f1f5f9;border-radius:6px;padding:0.45rem 0.65rem;margin-top:0.4rem">
-                                <strong>Logged Decision:</strong> <code>{user_override.user_decision}</code> &nbsp;·&nbsp;
-                                Final: <strong>{user_override.final_criticality}</strong><br>
-                                <em>"{user_override.rationale}"</em>
-                            </div>
-                            """, unsafe_allow_html=True)
-                else:
-                    # Legacy qualitative view
-                    a: CriticalityAssessment = sel
-                    st.markdown(f"""
-                    <div class="detail-header">
-                        <div class="detail-vendor-name">{a.vendor_name}</div>
-                        <div class="detail-meta">
-                            {pill(str(a.criticality_tier))}
-                            <span class="detail-tag">Score: <strong>{a.criticality_score:.2f}</strong></span>
-                            <span class="detail-tag">{DEPTH_LABEL.get(a.assessment_depth, str(a.assessment_depth))}</span>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.markdown('<div class="sec-header"><span>Assessment Reasoning</span></div>', unsafe_allow_html=True)
-                    for reason in a.reasoning:
-                        st.markdown(f"• {reason}")
-
-
-# ==============================================================================
-# TAB 2: OSINT INVESTIGATION PLANNER
-# ==============================================================================
-with tab_osint:
-    st.markdown('<div class="sec-header"><span>OSINT Depth &amp; Investigation Planner</span></div>', unsafe_allow_html=True)
-
-    # Gather available vendors
-    active_vendors = st.session_state.results
-    vendor_lookup = {}
-    if active_vendors:
-        for v in active_vendors:
-            vendor_lookup[f"{v.vendor_name} ({v.vendor_id})"] = v
-    else:
-        # Load from meridian_vendors.csv if no active run
-        if MERIDIAN_DATASET_CSV.exists():
-            loader = MeridianCSVVendorLoader()
-            for v in loader.load(MERIDIAN_DATASET_CSV):
-                vendor_lookup[f"{v.vendor_name} ({v.vendor_id})"] = v
-
-    if not vendor_lookup:
-        st.info("No vendors available. Please load a dataset in the sidebar.")
-    else:
-        # Vendor selector
-        default_idx = 0
-        if st.session_state.selected_id:
-            for idx, k in enumerate(vendor_lookup.keys()):
-                if f"({st.session_state.selected_id})" in k:
-                    default_idx = idx
-                    break
-
-        selected_v_key = st.selectbox(
-            "Select Vendor to Inspect OSINT Plan",
-            options=list(vendor_lookup.keys()),
-            index=default_idx,
-            key="osint_vendor_selector",
-        )
-
-        selected_vendor_obj = vendor_lookup[selected_v_key]
-        v_id = getattr(selected_vendor_obj, "vendor_id", "UNKNOWN")
-
-        # Determine criticality and human override if available
-        osint_crit = None
-        osint_h_rev = None
-        if isinstance(selected_vendor_obj, CriticalityResult):
-            osint_crit = selected_vendor_obj
-            osint_h_rev = st.session_state.human_overrides.get(v_id)
-        elif hasattr(selected_vendor_obj, "vendor_id"):
-            osint_h_rev = st.session_state.human_overrides.get(v_id)
-            for r in st.session_state.results:
-                if getattr(r, "vendor_id", None) == v_id:
-                    osint_crit = r
-                    break
-
-        planner = OSINTInvestigationPlanner()
-        eff_crit, eff_status = planner.resolve_effective_criticality(osint_crit, osint_h_rev)
-
-        cached_plan = st.session_state.osint_plans.get(v_id)
-        if cached_plan is None:
-            cached_plan = OSINTInvestigationPlanner.load_plan_state(v_id, pause_if_running=True)
-            if cached_plan is not None:
-                st.session_state.osint_plans[v_id] = cached_plan
-
-        if (
-            cached_plan is None
-            or cached_plan.input_criticality != eff_crit
-            or cached_plan.approval_status != eff_status
-        ):
-            cached_plan = planner.plan_investigation(
-                vendor=selected_vendor_obj,
-                criticality_input=osint_crit,
-                human_review=osint_h_rev,
-                existing_plan=cached_plan,
-            )
-            st.session_state.osint_plans[v_id] = cached_plan
-            OSINTInvestigationPlanner.save_plan_state(cached_plan)
-
-        plan = cached_plan
-        if plan.timebox.timer_state == TimerState.RUNNING:
-            OSINTCoverageTracker.refresh_timer(plan)
-            OSINTInvestigationPlanner.save_plan_state(plan)
-
-        # ── Executive Header ──
-        approval_badge_color = "#16a34a" if plan.approval_status == CriticalityApprovalStatus.APPROVED_BY_ANALYST else "#d97706"
-        approval_bg = "#f0fdf4" if plan.approval_status == CriticalityApprovalStatus.APPROVED_BY_ANALYST else "#fffbeb"
-        st.markdown(f"""
-        <div class="detail-header" style="margin-top:0.5rem">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start">
-                <div>
-                    <div class="detail-vendor-name">{plan.vendor_name} ({plan.vendor_id})</div>
-                    <div style="font-size:0.75rem;color:#64748b;margin-bottom:0.4rem">
-                        Domain: <code>{plan.domain or 'No domain provided'}</code> &nbsp;·&nbsp;
-                        Service: <em>"{plan.service_product_provided or 'N/A'}"</em>
-                    </div>
-                </div>
-                <div style="text-align:right">
-                    <span style="font-size:0.7rem;font-weight:700;color:{approval_badge_color};background:{approval_bg};padding:0.25rem 0.6rem;border-radius:20px;border:1px solid {approval_badge_color}33">
-                        {plan.approval_status.value.replace('_', ' ')}
-                    </span>
-                </div>
-            </div>
-            <div class="detail-meta">
-                {pill(plan.input_criticality)}
-                <span class="detail-tag">OSINT Depth: <strong>{plan.selected_depth_profile}</strong></span>
-                <span class="detail-tag">POC Timebox: <strong>{plan.timebox.planning_target}</strong> (Effort: {plan.timebox.actual_analyst_effort_minutes:.1f}m · Wall: {plan.timebox.elapsed_wall_clock_minutes:.1f}m · {plan.timebox.timer_state.value})</span>
-                <span class="detail-tag">Reviewers: <strong>{'Analyst + 2nd Reviewer' if plan.reviewer_requirements.get('second_reviewer') else 'Primary Analyst'}</strong></span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # ── KPI Stat Cards ──
-        st.markdown(f"""
-        <div class="stat-grid">
-            <div class="stat-card all">
-                <div class="stat-label">Required Sources</div>
-                <div class="stat-value">{len(plan.required_source_classes)}</div>
-                <div class="stat-sub">+{len(plan.conditional_source_classes)} conditional · {len(plan.corroborative_source_classes)} corroborative</div>
-            </div>
-            <div class="stat-card high">
-                <div class="stat-label">Planned Queries</div>
-                <div class="stat-value">{len(plan.planned_queries)}</div>
-                <div class="stat-sub">deduplicated templates</div>
-            </div>
-            <div class="stat-card medium">
-                <div class="stat-label">Discovery Tools</div>
-                <div class="stat-value">{len(plan.associated_discovery_resources)}</div>
-                <div class="stat-sub">mapped research resources</div>
-            </div>
-            <div class="stat-card low">
-                <div class="stat-label">POC Timebox</div>
-                <div class="stat-value">{plan.timebox.planned_minutes:.0f}m</div>
-                <div class="stat-sub">Effort: {plan.timebox.actual_analyst_effort_minutes:.1f}m · Wall: {plan.timebox.elapsed_wall_clock_minutes:.1f}m</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # ── Two-Column Layout ──
-        osint_left, osint_right = st.columns([5, 5], gap="large")
-
-        with osint_left:
-            # 1. Stopping Condition Monitor
-            st.markdown('<div class="sec-header"><span>1. Rulebook Stopping Condition &amp; POC Timebox</span></div>', unsafe_allow_html=True)
-            stop_badge_color = (
-                "#16a34a" if plan.stop_status == AssessmentStopStatus.COMPLETED_CONDITION_MET
-                else "#dc2626" if plan.stop_status == AssessmentStopStatus.TIMEBOX_EXHAUSTED_INCOMPLETE
-                else "#2563eb"
-            )
-            stop_badge_bg = (
-                "#f0fdf4" if plan.stop_status == AssessmentStopStatus.COMPLETED_CONDITION_MET
-                else "#fef2f2" if plan.stop_status == AssessmentStopStatus.TIMEBOX_EXHAUSTED_INCOMPLETE
-                else "#eff6ff"
-            )
-            st.markdown(f"""
-            <div class="factor-card" style="line-height:1.5">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.35rem">
-                    <strong style="color:#0f172a;font-size:0.8rem">[{plan.stopping_rule_id}]</strong>
-                    <span style="font-size:0.7rem;font-weight:700;color:{stop_badge_color};background:{stop_badge_bg};padding:0.15rem 0.5rem;border-radius:4px">
-                        {plan.stop_status.value.replace('_', ' ')}
-                    </span>
-                </div>
-                <div style="font-size:0.76rem;color:#334155;margin-bottom:0.35rem">
-                    {plan.stopping_rule_description}
-                </div>
-                <div style="font-size:0.73rem;color:#0f172a;background:#f8fafc;padding:0.35rem 0.55rem;border-radius:4px;margin-bottom:0.35rem">
-                    <strong>Evaluator Status:</strong> {plan.stop_progress_notes}
-                </div>
-                <div style="font-size:0.7rem;color:#64748b;border-top:1px solid #f1f5f9;padding-top:0.35rem">
-                    <strong>Planned Timebox:</strong> {plan.timebox.planning_target} ({plan.timebox.planned_minutes:.0f} min) &nbsp;·&nbsp;
-                    <strong>Active Analyst Effort (Controlling):</strong> {plan.timebox.actual_analyst_effort_minutes:.2f} min &nbsp;·&nbsp;
-                    <strong>Elapsed Wall-Clock:</strong> {plan.timebox.elapsed_wall_clock_minutes:.2f} min &nbsp;·&nbsp;
-                    <strong>Timer State:</strong> <code>{plan.timebox.timer_state.value}</code>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            # Active Timer Controls (Start / Pause / Resume / Finish)
-            tm_col1, tm_col2, tm_col3 = st.columns(3)
-            with tm_col1:
-                if plan.timebox.timer_state == TimerState.NOT_STARTED:
-                    if st.button("▶ Start Timer", key=f"btn_tm_start_{v_id}", use_container_width=True, type="primary"):
-                        OSINTCoverageTracker.start_timer(plan)
-                        OSINTInvestigationPlanner.save_plan_state(plan)
-                        st.rerun()
-                elif plan.timebox.timer_state in (TimerState.PAUSED, TimerState.STOPPED):
-                    if st.button("▶ Resume Timer", key=f"btn_tm_resume_{v_id}", use_container_width=True, type="primary"):
-                        OSINTCoverageTracker.resume_timer(plan)
-                        OSINTInvestigationPlanner.save_plan_state(plan)
-                        st.rerun()
-                else:
-                    if st.button("🔄 Refresh Elapsed", key=f"btn_tm_refresh_{v_id}", use_container_width=True):
-                        OSINTCoverageTracker.refresh_timer(plan)
-                        OSINTInvestigationPlanner.save_plan_state(plan)
-                        st.rerun()
-            with tm_col2:
-                if st.button(
-                    "⏸ Pause Timer",
-                    key=f"btn_tm_pause_{v_id}",
-                    use_container_width=True,
-                    disabled=(plan.timebox.timer_state != TimerState.RUNNING),
-                ):
-                    OSINTCoverageTracker.pause_timer(plan)
-                    OSINTInvestigationPlanner.save_plan_state(plan)
-                    st.rerun()
-            with tm_col3:
-                if st.button(
-                    "⏹ Finish Timer",
-                    key=f"btn_tm_stop_{v_id}",
-                    use_container_width=True,
-                    disabled=(plan.timebox.timer_state in (TimerState.NOT_STARTED, TimerState.STOPPED)),
-                ):
-                    OSINTCoverageTracker.stop_timer(plan)
-                    OSINTInvestigationPlanner.save_plan_state(plan)
-                    st.rerun()
-
-            with st.expander("⏱️ Manual Timebox & Effort Adjustment", expanded=False):
-                tb_c1, tb_c2 = st.columns(2)
-                with tb_c1:
-                    new_wall_min = st.number_input(
-                        "Elapsed Wall-Clock (minutes)",
-                        min_value=0.0,
-                        value=float(plan.timebox.elapsed_wall_clock_minutes),
-                        step=1.0,
-                        key=f"tb_wall_{v_id}",
-                    )
-                with tb_c2:
-                    new_effort_min = st.number_input(
-                        "Actual Analyst Effort (minutes)",
-                        min_value=0.0,
-                        value=float(plan.timebox.actual_analyst_effort_minutes),
-                        step=1.0,
-                        key=f"tb_effort_{v_id}",
-                    )
-                if st.button("Update Timebox & Evaluate Stopping Rule", key=f"btn_tb_{v_id}", use_container_width=True):
-                    OSINTCoverageTracker.update_plan_timebox(
-                        plan,
-                        elapsed_wall_clock_minutes=new_wall_min,
-                        actual_analyst_effort_minutes=new_effort_min,
-                    )
-                    OSINTInvestigationPlanner.save_plan_state(plan)
-                    st.rerun()
-
-            # 2. Downstream G1–G4 Investigation Checklist
-            st.markdown('<div class="sec-header"><span>2. Downstream G1–G4 Gates Checklist</span></div>', unsafe_allow_html=True)
-            for g in plan.gate_checklist:
-                st.markdown(f"""
-                <div class="factor-card">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.25rem">
-                        <strong style="font-size:0.78rem;color:#0f172a">[{g.gate_id}] {g.title}</strong>
-                        <span style="font-size:0.68rem;font-weight:600;color:#64748b;background:#f8fafc;padding:0.15rem 0.45rem;border-radius:4px;border:1px solid #e2e8f0">
-                            {g.status.value.replace('_', ' ')}
-                        </span>
-                    </div>
-                    <div style="font-size:0.75rem;color:#334155;margin-bottom:0.35rem">
-                        <em>"{g.question}"</em>
-                    </div>
-                    <div style="font-size:0.7rem;color:#64748b">
-                        <strong>Objectives:</strong> {', '.join(g.investigative_objectives[:2])}<br>
-                        <strong>Qualifying Criteria:</strong> {g.qualifying_criteria}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with st.expander("🔍 Update G1–G4 Gate Status", expanded=False):
-                gate_ids = [g.gate_id for g in plan.gate_checklist]
-                sel_gate_id = st.selectbox("Select Gate", options=gate_ids, key=f"sel_gate_{v_id}")
-                target_gate = next(g for g in plan.gate_checklist if g.gate_id == sel_gate_id)
-                gate_states = [s.value for s in GateStatus]
-                cur_gate_idx = gate_states.index(target_gate.status.value)
-                new_gate_state = st.selectbox(
-                    "Gate Status",
-                    options=gate_states,
-                    index=cur_gate_idx,
-                    key=f"sel_gate_status_{v_id}_{sel_gate_id}",
-                )
-                if st.button("Save Gate Status", key=f"btn_save_gate_{v_id}", use_container_width=True):
-                    OSINTCoverageTracker.update_plan_gate(
-                        plan,
-                        gate_id=sel_gate_id,
-                        new_status=GateStatus(new_gate_state),
-                    )
-                    OSINTInvestigationPlanner.save_plan_state(plan)
-                    st.rerun()
-
-        with osint_right:
-            # 1. Planned Source Classes & Interactive Coverage Tracker
-            st.markdown('<div class="sec-header"><span>3. Unified Source Coverage &amp; Discovery Catalog</span></div>', unsafe_allow_html=True)
-
-            with st.expander("📝 Record Source Coverage Outcome", expanded=False):
-                source_options = list(plan.coverage_records.keys())
-                sel_src_id = st.selectbox(
-                    "Source Class",
-                    options=source_options,
-                    format_func=lambda sid: f"[{sid}] {plan.coverage_records[sid].source_name}",
-                    key=f"cov_src_sel_{v_id}",
-                )
-                cur_rec = plan.coverage_records[sel_src_id]
-                cov_states = [s.value for s in CoverageState]
-                cur_cov_idx = cov_states.index(cur_rec.status.value)
-                new_cov_state = st.selectbox(
-                    "Coverage Outcome",
-                    options=cov_states,
-                    index=cur_cov_idx,
-                    key=f"cov_state_sel_{v_id}_{sel_src_id}",
-                )
-                c_url1, c_url2 = st.columns(2)
-                with c_url1:
-                    cand_urls = st.number_input(
-                        "Candidate URLs Found",
-                        min_value=0,
-                        value=int(cur_rec.candidate_urls_count),
-                        step=1,
-                        key=f"cov_cand_{v_id}_{sel_src_id}",
-                    )
-                with c_url2:
-                    rev_urls = st.number_input(
-                        "URLs Reviewed",
-                        min_value=0,
-                        value=int(cur_rec.reviewed_urls_count),
-                        step=1,
-                        key=f"cov_rev_{v_id}_{sel_src_id}",
-                    )
-                prod_ev = st.checkbox(
-                    "Produced New Qualifying Evidence",
-                    value=bool(cur_rec.produced_new_evidence),
-                    key=f"cov_prod_{v_id}_{sel_src_id}",
-                )
-                ev_refs_raw = st.text_input(
-                    "Evidence References (URLs or IDs, comma-separated)",
-                    value=", ".join(cur_rec.evidence_references),
-                    placeholder="https://vendor.com/trust, EV-001",
-                    key=f"cov_refs_{v_id}_{sel_src_id}",
-                )
-                cov_notes = st.text_input(
-                    "Analyst Coverage Notes",
-                    value=cur_rec.notes,
-                    placeholder="Reason if unavailable, or summary of findings...",
-                    key=f"cov_notes_{v_id}_{sel_src_id}",
-                )
-                if st.button("Save Source Coverage Outcome", type="primary", key=f"btn_save_cov_{v_id}", use_container_width=True):
-                    parsed_refs = [x.strip() for x in ev_refs_raw.split(",") if x.strip()]
-                    tracker = OSINTCoverageTracker(plan.coverage_records)
-                    tracker.update_source_status(
-                        source_id=sel_src_id,
-                        new_state=CoverageState(new_cov_state),
-                        candidate_urls=int(cand_urls),
-                        reviewed_urls=int(rev_urls),
-                        produced_new_evidence=bool(prod_ev),
-                        evidence_references=parsed_refs,
-                        notes=cov_notes.strip(),
-                    )
-                    tracker.sync_plan_stop_status(plan)
-                    OSINTInvestigationPlanner.save_plan_state(plan)
-                    st.rerun()
-
-            with st.expander(f"View All {len(plan.coverage_records)} Planned Source Classes", expanded=True):
-                for s_id, s_rec in plan.coverage_records.items():
-                    s_def = planner.source_registry.get_source(s_id)
-                    grade = s_def.default_evidence_grade if s_def else "C"
-                    rel = s_def.reliability_rating if s_def else 3
-                    nature = s_def.source_nature if s_def else "HYBRID"
-                    if s_rec.is_required:
-                        req_badge = "<span style='color:#dc2626;font-weight:700'>REQUIRED</span>"
-                    elif s_rec.is_conditional:
-                        req_badge = "<span style='color:#d97706;font-weight:700'>CONDITIONAL</span>"
-                    else:
-                        req_badge = "<span style='color:#64748b'>CORROBORATIVE</span>"
-
-                    state_color = (
-                        "#16a34a" if s_rec.status in (CoverageState.REVIEWED_EVIDENCE_RECORDED, CoverageState.REVIEWED_NO_EVIDENCE)
-                        else "#d97706" if s_rec.status in (CoverageState.SEARCH_ATTEMPTED, CoverageState.REQUIRES_MANUAL_REVIEW)
-                        else "#dc2626" if s_rec.status == CoverageState.UNAVAILABLE
-                        else "#64748b"
-                    )
-                    cond_line = f"<div style='color:#b45309;font-size:0.68rem;margin-top:0.15rem'><em>Trigger: {s_rec.condition}</em></div>" if s_rec.condition else ""
-                    refs_line = f"<div style='color:#15803d;font-size:0.68rem;margin-top:0.15rem'><strong>Evidence Refs:</strong> {', '.join(s_rec.evidence_references)}</div>" if s_rec.evidence_references else ""
-                    notes_line = f"<div style='color:#334155;font-size:0.68rem;margin-top:0.15rem'><strong>Notes:</strong> {s_rec.notes}</div>" if s_rec.notes else ""
-                    st.markdown(f"""
-                    <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:6px;padding:0.55rem 0.75rem;margin-bottom:0.4rem;font-size:0.75rem">
-                        <div style="display:flex;justify-content:space-between;align-items:center">
-                            <strong>[{s_id}] {s_rec.source_name}</strong>
-                            <span style="font-size:0.68rem">Grade {grade} (★{rel}) &nbsp;·&nbsp; {req_badge} &nbsp;·&nbsp; <span style="color:{state_color};font-weight:700">{s_rec.status.value}</span></span>
-                        </div>
-                        <div style="color:#64748b;font-size:0.7rem;margin-top:0.2rem">
-                            Nature: <code>{nature}</code> &nbsp;·&nbsp; Tools: {', '.join(s_def.discovery_resources[:4]) if s_def else 'General Search'}
-                        </div>
-                        {cond_line}{refs_line}{notes_line}
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            # 2. Targeted Search Queries & Bounded Search Execution
-            st.markdown('<div class="sec-header"><span>4. Generated Search Queries &amp; Bounded Search Execution</span></div>', unsafe_allow_html=True)
-
-            q_planned = sum(1 for q in plan.planned_queries if q.execution_status == SearchExecutionStatus.PLANNED)
-            q_executed = sum(1 for q in plan.planned_queries if q.execution_status == SearchExecutionStatus.EXECUTED)
-            q_failed = sum(1 for q in plan.planned_queries if q.execution_status == SearchExecutionStatus.FAILED)
-            q_unavail = sum(1 for q in plan.planned_queries if q.execution_status == SearchExecutionStatus.UNAVAILABLE)
-
-            active_backend = build_search_backend_from_env()
-            backend_ok, backend_msg = active_backend.is_configured()
-
-            st.caption(
-                f"{len(plan.planned_queries)} queries total · "
-                f"PLANNED: {q_planned} · EXECUTED: {q_executed} · FAILED: {q_failed} · UNAVAILABLE: {q_unavail} · "
-                f"Candidate URLs: {len(plan.candidate_urls)} | "
-                f"Backend ({active_backend.provider_name}): {'Ready' if backend_ok else 'Unconfigured'}"
-            )
-
-            exec_col1, exec_col2 = st.columns([6, 4])
-            with exec_col1:
-                retry_failed_opt = st.checkbox(
-                    "Retry FAILED / UNAVAILABLE queries",
-                    value=False,
-                    key=f"chk_retry_search_{v_id}",
-                )
-            with exec_col2:
-                if st.button(
-                    "🔍 Execute Planned Searches",
-                    key=f"btn_exec_searches_{v_id}",
-                    use_container_width=True,
-                    type="primary",
-                    disabled=(q_planned == 0 and not (retry_failed_opt and (q_failed > 0 or q_unavail > 0))),
-                ):
-                    collector = OSINTSearchCollector(backend=active_backend)
-                    collector.execute_planned_queries(
-                        plan,
-                        retry_failed=retry_failed_opt,
-                        retry_unavailable=retry_failed_opt,
-                        persist=True,
-                    )
-                    st.rerun()
-
-            if not backend_ok and q_unavail > 0:
-                st.warning(backend_msg)
-
-            query_search_term = st.text_input("Filter Queries", placeholder="Filter by keyword (e.g. Bedrock, DPA, LLM)...", label_visibility="collapsed")
-            
-            displayed_queries = plan.planned_queries
-            if query_search_term.strip():
-                displayed_queries = [
-                    q for q in displayed_queries
-                    if query_search_term.lower() in q.rendered_query.lower() or any(query_search_term.lower() in s.lower() for s in q.source_classes)
-                ]
-
-            with st.container(height=320):
-                for q in displayed_queries:
-                    q_status_color = (
-                        "#16a34a" if q.execution_status == SearchExecutionStatus.EXECUTED
-                        else "#dc2626" if q.execution_status == SearchExecutionStatus.FAILED
-                        else "#d97706" if q.execution_status == SearchExecutionStatus.UNAVAILABLE
-                        else "#64748b"
-                    )
-                    exec_meta_parts = []
-                    if q.provider:
-                        exec_meta_parts.append(f"Provider: <code>{q.provider}</code>")
-                    if q.executed_at:
-                        exec_meta_parts.append(f"Results: <strong>{q.result_count}</strong>")
-                        exec_meta_parts.append(f"At: {q.executed_at[:19].replace('T', ' ')} UTC")
-                    exec_meta_line = (
-                        f"<div style='font-size:0.66rem;color:#475569;margin-top:0.2rem'>{' &nbsp;·&nbsp; '.join(exec_meta_parts)}</div>"
-                        if exec_meta_parts else ""
-                    )
-                    err_line = (
-                        f"<div style='font-size:0.66rem;color:#dc2626;margin-top:0.15rem'><strong>Error:</strong> {q.error_message}</div>"
-                        if q.error_message else ""
-                    )
-                    st.markdown(f"""
-                    <div class="query-card">
-                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.2rem">
-                            <span style="font-size:0.68rem;font-weight:700;color:#2563eb">[{', '.join(q.source_classes)}]</span>
-                            <span style="font-size:0.65rem;font-weight:700;color:{q_status_color}">STATUS: {q.execution_status.value}</span>
-                        </div>
-                        <code>{q.rendered_query}</code>
-                        <div style="font-size:0.68rem;color:#64748b;margin-top:0.25rem">
-                            Targets: {', '.join(q.expected_evidence_targets[:2])}
-                        </div>
-                        {exec_meta_line}{err_line}
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            # 3. Collected Candidate URLs (Unreviewed Candidates)
-            with st.expander(f"🔗 Collected Candidate URLs ({len(plan.candidate_urls)} deduplicated — Pending Analyst Review)", expanded=bool(plan.candidate_urls)):
-                if not plan.candidate_urls:
-                    st.caption("No candidate URLs collected yet. Click '🔍 Execute Planned Searches' with a configured search provider to collect candidate URLs.")
-                else:
-                    for cand in plan.candidate_urls:
-                        src_badges = ", ".join(cand.source_classes or ([cand.source_class] if cand.source_class else []))
-                        q_badges = ", ".join(cand.query_ids or ([cand.query_id] if cand.query_id else []))
-                        rank_str = f"#{cand.rank}" if cand.rank is not None else "N/A"
-                        st.markdown(f"""
-                        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:6px;padding:0.5rem 0.7rem;margin-bottom:0.35rem;font-size:0.73rem">
-                            <div style="display:flex;justify-content:space-between;align-items:center">
-                                <strong>{rank_str} · {cand.title or cand.url}</strong>
-                                <span style="font-size:0.65rem;color:#2563eb;font-weight:700">[{src_badges}] · {cand.triage_status.value}</span>
-                            </div>
-                            <div style="font-size:0.69rem;color:#0f172a;word-break:break-all;margin-top:0.15rem">
-                                <code>{cand.url}</code>
-                            </div>
-                            <div style="font-size:0.68rem;color:#475569;margin-top:0.15rem">
-                                {cand.snippet or '<em>No snippet provided</em>'}
-                            </div>
-                            <div style="font-size:0.64rem;color:#64748b;margin-top:0.2rem">
-                                Queries: <code>{q_badges}</code> &nbsp;·&nbsp; Provider: <code>{cand.provider or 'N/A'}</code> &nbsp;·&nbsp; Retrieved: {(cand.retrieved_at or '')[:19].replace('T', ' ')}
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-            # 4. Export Plan Action Button
-            plan_json = json.dumps(plan.model_dump(mode="json"), indent=2)
-            st.download_button(
-                "⬇ Export Investigation Plan (JSON)",
-                data=plan_json,
-                file_name=f"OSINT_Plan_{plan.vendor_id}_{plan.vendor_name.replace(' ', '_')}.json",
-                mime="application/json",
-                use_container_width=True,
-                key=f"btn_dl_osint_plan_{plan.vendor_id}",
-            )
-
-
-# ==============================================================================
-# TAB 3: REPORT BROWSER & ARCHIVE
-# ==============================================================================
-with tab_reports:
-    st.markdown('<div class="sec-header"><span>Report Discovery &amp; Inspection</span></div>', unsafe_allow_html=True)
-
-    # Discover reports on disk
-    report_files = sorted(list(REPORTS_DIR.glob("*.json")), key=lambda p: p.stat().st_mtime, reverse=True)
-
-    top_rep_col1, top_rep_col2 = st.columns([7, 3])
-
-    with top_rep_col1:
-        report_options = {}
-        for rf in report_files:
-            mtime = datetime.datetime.fromtimestamp(rf.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            size_kb = rf.stat().st_size / 1024
-            try:
-                item_count = len(json.loads(rf.read_text(encoding="utf-8")))
-            except Exception:
-                item_count = "?"
-            label = f"{rf.name} ({item_count} vendors · {size_kb:.1f} KB · {mtime})"
-            report_options[label] = rf
-
-        selected_report_label = st.selectbox(
-            "Select Saved Assessment Report",
-            options=list(report_options.keys()),
-            index=0 if report_options else None,
-            label_visibility="collapsed",
-        )
-
-    with top_rep_col2:
-        uploaded_report = st.file_uploader("Or Upload JSON Report", type=["json"], label_visibility="collapsed")
-
-    active_report_data: list[dict[str, Any]] = []
-    report_source_name = ""
-
-    if uploaded_report:
-        try:
-            raw_up = json.loads(uploaded_report.read().decode("utf-8"))
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w", encoding="utf-8") as tmp:
-                json.dump(raw_up, tmp)
-                active_report_data = load_and_normalize_report(Path(tmp.name))
-            report_source_name = uploaded_report.name
-        except Exception as e:
-            st.error(f"Failed to read uploaded report: {e}")
-    elif selected_report_label and report_options:
-        target_path = report_options[selected_report_label]
-        active_report_data = load_and_normalize_report(target_path)
-        report_source_name = target_path.name
-
-    if not active_report_data:
-        st.markdown("""
-        <div class="empty-state">
-            <div class="empty-icon">📁</div>
-            <div class="empty-title">No reports available</div>
-            <div class="empty-hint">Generate an assessment or archive a run to view saved audit reports.</div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        # Report Executive Header
-        rep_crit = sum(1 for v in active_report_data if "crit" in str(v.get("criticality", "")).lower())
-        rep_high = sum(1 for v in active_report_data if "high" in str(v.get("criticality", "")).lower())
-        rep_med  = sum(1 for v in active_report_data if "med" in str(v.get("criticality", "")).lower())
-        rep_low  = sum(1 for v in active_report_data if "low" in str(v.get("criticality", "")).lower())
-        valid_scores = [v["score"] for v in active_report_data if v["score"] is not None]
-        avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
-
-        st.markdown(f"""
-        <div class="stat-grid" style="margin-top:0.5rem">
-            <div class="stat-card all">
-                <div class="stat-label">Report Archive</div>
-                <div class="stat-value">{len(active_report_data)}</div>
-                <div class="stat-sub">{report_source_name}</div>
-            </div>
-            <div class="stat-card high">
-                <div class="stat-label">Critical / High</div>
-                <div class="stat-value">{rep_crit + rep_high}</div>
-                <div class="stat-sub">Elevated exposure</div>
-            </div>
-            <div class="stat-card medium">
-                <div class="stat-label">Medium / Low</div>
-                <div class="stat-value">{rep_med + rep_low}</div>
-                <div class="stat-sub">Standard monitoring</div>
-            </div>
-            <div class="stat-card low">
-                <div class="stat-label">Average Score</div>
-                <div class="stat-value">{avg_score:.2f}</div>
-                <div class="stat-sub">Across assessed portfolio</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # ── Visual Graphs for Report ──
-        st.markdown('<div class="sec-header"><span>Report Visual Distribution &amp; Risk Profiles</span></div>', unsafe_allow_html=True)
-        g_col1, g_col2 = st.columns([4, 6], gap="medium")
-
-        with g_col1:
-            # 1. Criticality Tier Breakdown Chart
-            tier_df = pd.DataFrame([
-                {"Tier": "Critical", "Count": rep_crit},
-                {"Tier": "High", "Count": rep_high},
-                {"Tier": "Medium", "Count": rep_med},
-                {"Tier": "Low", "Count": rep_low},
-            ])
-            tier_chart = alt.Chart(tier_df).mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4, height=22).encode(
-                x=alt.X("Count:Q", title="Number of Vendors", axis=alt.Axis(tickMinStep=1, grid=False)),
-                y=alt.Y("Tier:N", sort=["Critical", "High", "Medium", "Low"], title=""),
-                color=alt.Color(
-                    "Tier:N",
-                    scale=alt.Scale(
-                        domain=["Critical", "High", "Medium", "Low"],
-                        range=["#dc2626", "#ea580c", "#d97706", "#16a34a"],
-                    ),
-                    legend=None,
-                ),
-                tooltip=["Tier", "Count"],
-            ).properties(title="Portfolio Tier Distribution", height=160)
-            st.altair_chart(tier_chart, use_container_width=True)
-
-        with g_col2:
-            # 2. Base Score Comparison vs Provisional Thresholds
-            score_rows = [
-                {"Vendor": v["name"], "Score": v["score"] or 0, "Tier": v["criticality"]}
-                for v in active_report_data
-            ]
-            score_df = pd.DataFrame(score_rows).sort_values("Score", ascending=True)
-
-            score_chart = alt.Chart(score_df).mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4, height=18).encode(
-                x=alt.X("Score:Q", title="Base Score (0 - 3 scale)", scale=alt.Scale(domain=[0, 3])),
-                y=alt.Y("Vendor:N", sort="-x", title=""),
-                color=alt.Color(
-                    "Tier:N",
-                    scale=alt.Scale(
-                        domain=["Critical", "High", "Medium", "Low"],
-                        range=["#dc2626", "#ea580c", "#d97706", "#16a34a"],
-                    ),
-                    legend=None,
-                ),
-                tooltip=["Vendor", "Score", "Tier"],
-            ).properties(title="Ranked Vendor Base Scores", height=160)
-            st.altair_chart(score_chart, use_container_width=True)
-
-        # ── Interactive Report Table & Deep Dive ──
-        st.markdown('<div class="sec-header"><span>Assessed Vendors in Report</span></div>', unsafe_allow_html=True)
-        r_table_rows = []
-        for v in active_report_data:
-            r_table_rows.append({
-                "ID": v["id"],
-                "Vendor": v["name"],
-                "Criticality": v["criticality"],
-                "Base Score": f"{v['score']:.2f}" if v["score"] is not None else "N/A",
-                "D": v["D"] if v["D"] is not None else "?",
-                "P": v["P"] if v["P"] is not None else "?",
-                "R": v["R"] if v["R"] is not None else "?",
-                "O": v["O"] if v["O"] is not None else "?",
-                "V": v["V"] if v["V"] is not None else "?",
-                "Safeguards": "Triggered" if v["safeguards_triggered"] else "None",
-                "Depth": v.get("depth", ""),
-            })
-
-        rep_df = pd.DataFrame(r_table_rows)
-
-        def _rep_crit_style(val: str) -> str:
-            s = str(val).lower()
-            if "critical" in s or "tier_1" in s:
-                return "background-color:#fee2e2;color:#991b1b;font-weight:700;"
-            if "high" in s:
-                return "background-color:#fff7ed;color:#c2410c;font-weight:600;"
-            if "medium" in s or "tier_2" in s:
-                return "background-color:#fffbeb;color:#92400e;font-weight:600;"
-            return "background-color:#f0fdf4;color:#065f46;font-weight:600;"
-
-        rep_styled = rep_df.style.map(_rep_crit_style, subset=["Criticality"])
-        r_ev = st.dataframe(
-            rep_styled,
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="report_inventory_table",
-        )
-
-        # Inspector for selected vendor from report
-        selected_rep_idx = r_ev.selection.rows[0] if (r_ev.selection and r_ev.selection.rows) else 0
-        if 0 <= selected_rep_idx < len(active_report_data):
-            inspected_vendor = active_report_data[selected_rep_idx]
-            raw_v = inspected_vendor["raw"]
-
-            st.markdown(f'<div class="sec-header"><span>Vendor Audit Record: {inspected_vendor["name"]} ({inspected_vendor["id"]})</span></div>', unsafe_allow_html=True)
-            with st.container(border=True):
-                i_col1, i_col2, i_col3 = st.columns(3)
-                with i_col1:
-                    st.markdown(f"**Final Criticality:** {pill(inspected_vendor['criticality'])}", unsafe_allow_html=True)
-                with i_col2:
-                    st.markdown(f"**Base Score:** `{'%.2f' % inspected_vendor['score'] if inspected_vendor['score'] is not None else 'N/A'}`")
-                with i_col3:
-                    st.markdown(f"**Safeguards Triggered:** `{'Yes' if inspected_vendor['safeguards_triggered'] else 'No'}`")
-
-                # If factors dict exists, show rationale
-                if "factors" in raw_v:
-                    st.markdown("**Factor Provenance:**")
-                    f_cols = st.columns(5)
-                    for idx, (f_key, f_data) in enumerate(raw_v["factors"].items()):
-                        with f_cols[idx]:
-                            st.markdown(f"**{f_key}** (Score: `{f_data.get('score', '?')}`)")
-                            st.caption(f_data.get("rationale", ""))
-                
-                with st.expander("View Full Raw Audit JSON for Vendor"):
-                    st.json(raw_v)
-
-
-# ==============================================================================
-# TAB 4: PORTFOLIO ANALYTICS & INSIGHTS
-# ==============================================================================
-with tab_analytics:
-    st.markdown('<div class="sec-header"><span>Multi-Factor Risk Analytics</span></div>', unsafe_allow_html=True)
-
-    curr_results = st.session_state.results
-    if not curr_results or st.session_state.mode_used != "meridian":
-        # Fall back to meridian_diagnostic.json if live session has no meridian data
-        diag_path = REPORTS_DIR / "meridian_diagnostic.json"
-        if diag_path.exists():
-            analytics_data = load_and_normalize_report(diag_path)
-        else:
-            analytics_data = []
-    else:
-        analytics_data = []
-        for r in curr_results:
-            h_rev = st.session_state.human_overrides.get(r.vendor_id)
-            final_c = h_rev.final_criticality if h_rev else r.final_criticality
-            analytics_data.append({
-                "id": r.vendor_id,
-                "name": r.vendor_name,
-                "criticality": final_c,
-                "score": r.base_score,
-                "D": r.D.score,
-                "P": r.P.score,
-                "R": r.R.score,
-                "O": r.O.score,
-                "V": r.V.score,
-                "D_contrib": r.D.weighted_contribution or 0,
-                "P_contrib": r.P.weighted_contribution or 0,
-                "R_contrib": r.R.weighted_contribution or 0,
-                "O_contrib": r.O.weighted_contribution or 0,
-                "V_contrib": r.V.weighted_contribution or 0,
-                "safeguards_triggered": r.automatic_override_applied,
-            })
-
-    if not analytics_data:
-        st.info("Run an assessment in Meridian mode to generate portfolio analytics.")
-    else:
-        # Chart 1: Factor Intensity Heatmap Matrix
-        heatmap_rows = []
-        for v in analytics_data:
-            for factor_key in ["D", "P", "R", "O", "V"]:
-                heatmap_rows.append({
-                    "Vendor": v["name"],
-                    "Factor": factor_key,
-                    "Score": v[factor_key] if v[factor_key] is not None else 0,
-                })
-        hm_df = pd.DataFrame(heatmap_rows)
-
-        base_hm = alt.Chart(hm_df).encode(
-            x=alt.X("Factor:N", title="Factor", sort=["D", "P", "R", "O", "V"]),
-            y=alt.Y("Vendor:N", title=""),
-        )
-        rect_hm = base_hm.mark_rect(cornerRadius=3).encode(
-            color=alt.Color(
-                "Score:Q",
-                scale=alt.Scale(domain=[0, 3], range=["#f8fafc", "#3b82f6"]),
-                title="Score (0-3)",
-            ),
-            tooltip=["Vendor", "Factor", "Score"],
-        )
-        text_hm = base_hm.mark_text(baseline="middle", fontWeight="bold").encode(
-            text=alt.Text("Score:Q"),
-            color=alt.condition(alt.datum.Score > 1.5, alt.value("#ffffff"), alt.value("#0f172a")),
-        )
-        heatmap_chart = (rect_hm + text_hm).properties(title="Factor Score Heatmap (0 - 3 Scale)", height=220)
-
-        # Chart 2: Stacked Factor Weighted Contribution
-        contrib_rows = []
-        for v in analytics_data:
-            d_val = v.get("D_contrib", (v["D"] or 0) * 0.30)
-            p_val = v.get("P_contrib", (v["P"] or 0) * 0.20)
-            r_val = v.get("R_contrib", (v["R"] or 0) * 0.20)
-            o_val = v.get("O_contrib", (v["O"] or 0) * 0.20)
-            v_val = v.get("V_contrib", (v["V"] or 0) * 0.10)
-            contrib_rows.extend([
-                {"Vendor": v["name"], "Factor": "D (30%)", "Contribution": d_val},
-                {"Vendor": v["name"], "Factor": "P (20%)", "Contribution": p_val},
-                {"Vendor": v["name"], "Factor": "R (20%)", "Contribution": r_val},
-                {"Vendor": v["name"], "Factor": "O (20%)", "Contribution": o_val},
-                {"Vendor": v["name"], "Factor": "V (10%)", "Contribution": v_val},
-            ])
-        contrib_df = pd.DataFrame(contrib_rows)
-
-        stacked_chart = alt.Chart(contrib_df).mark_bar(height=20).encode(
-            y=alt.Y("Vendor:N", title=""),
-            x=alt.X("Contribution:Q", title="Base Score Contribution", stack="zero"),
-            color=alt.Color(
-                "Factor:N",
-                scale=alt.Scale(
-                    domain=["D (30%)", "P (20%)", "R (20%)", "O (20%)", "V (10%)"],
-                    range=["#3b82f6", "#06b6d4", "#10b981", "#f59e0b", "#8b5cf6"],
-                ),
-                title="Factor Weight",
-            ),
-            tooltip=["Vendor", "Factor", alt.Tooltip("Contribution:Q", format=".2f")],
-        ).properties(title="Weighted Factor Composition", height=220)
-
-        a_col1, a_col2 = st.columns(2, gap="large")
-        with a_col1:
-            st.altair_chart(heatmap_chart, use_container_width=True)
-        with a_col2:
-            st.altair_chart(stacked_chart, use_container_width=True)
-
-        # Safeguard Impact Summary
-        st.markdown('<div class="sec-header"><span>Safeguard Protection Impact</span></div>', unsafe_allow_html=True)
-        safeguard_vendors = [v for v in analytics_data if v.get("safeguards_triggered")]
-        if safeguard_vendors:
-            st.markdown(f"**{len(safeguard_vendors)} vendor(s)** elevated to a higher criticality tier by automated policy safeguards (O1–O4):")
-            for sv in safeguard_vendors:
-                st.markdown(f"• **{sv['name']} ({sv['id']})** — Elevated to **{sv['criticality']}** (Base Score: `{sv['score']:.2f}`)")
-        else:
-            st.markdown("No vendors in the current dataset required safeguard elevation.")
-
-
-# ==============================================================================
-# TAB 5: END-TO-END AI RISK & GOVERNANCE CONSOLE (LEVELS 1–9)
-# ==============================================================================
-with tab_e2e:
-    # ── 1. Honest Pre-Search & Model Readiness Panel ──
-    rd_hdr_c1, rd_hdr_c2 = st.columns([8, 2])
-    with rd_hdr_c1:
-        st.markdown(
-            '<div class="sec-header"><span>System &amp; Integration Readiness (Pre-Search Status)</span></div>',
-            unsafe_allow_html=True,
-        )
-    with rd_hdr_c2:
-        if st.button("Refresh Readiness Check", use_container_width=True, key="btn_refresh_readiness"):
-            st.session_state.system_readiness = SystemReadinessInspector.check_system_readiness()
-
-    if st.session_state.system_readiness is None:
-        st.session_state.system_readiness = SystemReadinessInspector.check_system_readiness()
-    readiness = st.session_state.system_readiness
-
-    ollama_cls = "ok" if (readiness.ollama_reachable and readiness.llama3_2_installed and readiness.mistral_installed) else "warn"
-    ollama_lbl = (
-        "ONLINE · 2/2 Models Ready"
-        if (readiness.ollama_reachable and readiness.llama3_2_installed and readiness.mistral_installed)
-        else ("ONLINE · Model Missing" if readiness.ollama_reachable else "OFFLINE · Deterministic Fallback")
+    st.session_state["vendors_by_id"][vendor.vendor_id] = vendor
+    st.session_state["criticality_by_id"][vendor.vendor_id] = crit_engine.evaluate(
+        vendor, human_review=human_crit_override
     )
-    routing_cls = "ok" if readiness.llm_routing_enabled_in_env else "warn"
-    search_cls = "ok" if readiness.search_configured else "blocked"
-    rag_cls = "ok" if readiness.rag_active_mode == "SEMANTIC_VECTOR_RETRIEVAL" else "warn"
-    score_cls = "ok" if readiness.scoring_policy_ready else "blocked"
+    st.session_state["reports_by_vendor"][vendor.vendor_id] = report
+    st.session_state["e2e_report"] = report
+    st.session_state["selected_vendor_id"] = vendor.vendor_id
+    return report
+
+
+# ─── Application Shell (Header + Top Navigation Bar) ──────────────────────────
+
+
+def _render_app_shell(readiness: SystemReadinessReport) -> str:
+    selected_vid = st.session_state.get("selected_vendor_id", "V-002")
+    vendors_by_id: dict[str, MeridianVendor] = st.session_state.get("vendors_by_id", {})
+    active_vendor = vendors_by_id.get(selected_vid)
+    active_vendor_str = (
+        f"{active_vendor.vendor_id} · {active_vendor.vendor_name}"
+        if active_vendor
+        else selected_vid
+    )
+
+    ext_dot = "uc-dot-green" if readiness.external_research_ready else "uc-dot-amber"
+    ext_txt = "Serper Live Search Ready" if readiness.external_research_ready else "External Search Unconfigured"
+
+    llm_dot = "uc-dot-green" if readiness.local_analysis_ready else "uc-dot-blue"
+    llm_txt = "Local AI Models Ready" if readiness.local_analysis_ready else "Deterministic Rule Engine"
 
     st.markdown(
         f"""
-        <div class="readiness-grid">
-            <div class="readiness-card {ollama_cls}">
-                <div class="readiness-title">1. Local Ollama Server</div>
-                <div class="readiness-status">{ollama_lbl}</div>
-                <div class="readiness-detail">
-                    Endpoint: <code>{readiness.ollama_endpoint}</code><br>
-                    <code>llama3.2:latest</code>: <strong>{'INSTALLED' if readiness.llama3_2_installed else 'MISSING'}</strong> ·
-                    <code>mistral:latest</code>: <strong>{'INSTALLED' if readiness.mistral_installed else 'MISSING'}</strong>
+        <div class="uc-shell-header">
+            <div class="uc-brand-group">
+                <span class="uc-brand-mark">UncoverAI</span>
+                <div>
+                    <div class="uc-brand-title">Meridian Financial Services — Third-Party AI Risk Governance</div>
+                    <div class="uc-brand-subtitle">Vendor Criticality, Public OSINT Reconnaissance &amp; Point-of-Capture Evidentiary Risk Assessment</div>
                 </div>
             </div>
-            <div class="readiness-card {routing_cls}">
-                <div class="readiness-title">2. Dual-Model Routing (6 GB VRAM)</div>
-                <div class="readiness-status">{'ENABLED IN .ENV' if readiness.llm_routing_enabled_in_env else 'DISABLED'}</div>
-                <div class="readiness-detail">
-                    L3B Triage: <code>{readiness.triage_model}</code><br>
-                    L6 &amp; L8 Analysis: <code>{readiness.analysis_model}</code><br>
-                    Unload on switch (<code>keep_alive=0</code>): <strong>{'ON' if readiness.unload_on_model_switch else 'OFF'}</strong>
-                </div>
-            </div>
-            <div class="readiness-card {search_cls}">
-                <div class="readiness-title">3. External OSINT Search API</div>
-                <div class="readiness-status">{'CONFIGURED' if readiness.search_configured else 'NOT CONFIGURED'} ({readiness.search_provider})</div>
-                <div class="readiness-detail">
-                    {readiness.search_status_message}
-                </div>
-            </div>
-            <div class="readiness-card {rag_cls}">
-                <div class="readiness-title">4. Level 5 RAG &amp; Embeddings</div>
-                <div class="readiness-status">{'SEMANTIC ACTIVE' if readiness.rag_active_mode == 'SEMANTIC_VECTOR_RETRIEVAL' else 'CHUNK-ONLY PASSTHROUGH'}</div>
-                <div class="readiness-detail">
-                    <code>MERIDIAN_ENABLE_RAG_EMBEDDINGS={'true' if readiness.rag_embeddings_enabled_in_env else 'false'}</code> ·
-                    <code>sentence-transformers</code>: <strong>{'INSTALLED' if readiness.sentence_transformers_installed else 'NOT INSTALLED'}</strong><br>
-                    All extracted evidence passes directly to Level 6.
-                </div>
-            </div>
-            <div class="readiness-card {score_cls}">
-                <div class="readiness-title">5. Level 9 Risk-Scoring Policy</div>
-                <div class="readiness-status">{readiness.scoring_policy_status}</div>
-                <div class="readiness-detail">
-                    Final calibrated Level 9 numerical risk score is withheld until Meridian's approved scoring policy is supplied.
-                </div>
+            <div class="uc-header-pills">
+                <span class="uc-header-pill"><span class="uc-dot {ext_dot}"></span>{html.escape(ext_txt)}</span>
+                <span class="uc-header-pill"><span class="uc-dot {llm_dot}"></span>{html.escape(llm_txt)}</span>
+                <span class="uc-header-pill">Active Vendor: <strong>{html.escape(active_vendor_str)}</strong></span>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # ── 2. Vendor Inventory & Custom Single-Vendor Input Flow ──
-    meridian_vendor_map: dict[str, MeridianVendor] = {}
-    if MERIDIAN_DATASET_CSV.exists():
-        for mv in MeridianCSVVendorLoader().load(MERIDIAN_DATASET_CSV):
-            meridian_vendor_map[mv.vendor_id] = mv
-    for cust_id, cust_v in st.session_state.custom_vendors.items():
-        meridian_vendor_map[cust_id] = cust_v
+    current_nav = st.session_state.get("nav_section", "Portfolio")
+    if current_nav not in _NAV_PAGES:
+        current_nav = "Portfolio"
+        st.session_state["nav_section"] = "Portfolio"
 
-    with st.expander("Single-Vendor Scope Input & Custom Vendor Validator (Add or Edit Vendor Inputs)", expanded=False):
-        st.caption(
-            "Enter or modify a vendor's contractual scope and D/P/R/O/V inputs. Unknown fields are preserved as "
-            "`UNKNOWN` (never coerced to zero) and evaluated transparently against deterministic rules and O1–O5 safeguards."
+    nav_cols = st.columns(len(_NAV_PAGES), gap="small")
+    for idx, page_name in enumerate(_NAV_PAGES):
+        is_active = page_name == current_nav
+        if nav_cols[idx].button(
+            page_name,
+            key=f"uc_top_nav_{page_name}",
+            type="primary" if is_active else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["nav_section"] = page_name
+            st.rerun()
+
+    return st.session_state["nav_section"]
+
+
+# ─── Page 1: Portfolio Risk Dashboard ─────────────────────────────────────────
+
+
+def _render_portfolio_page(readiness: SystemReadinessReport) -> None:
+    vendors_by_id: dict[str, MeridianVendor] = st.session_state["vendors_by_id"]
+    crit_by_id: dict[str, CriticalityResult] = st.session_state["criticality_by_id"]
+    reports_by_id: dict[str, VendorEndToEndAssessmentReport] = st.session_state["reports_by_vendor"]
+
+    st.markdown(
+        """
+        <div class="uc-page-header">
+            <div>
+                <h1 class="uc-page-title">Third-Party Vendor Portfolio</h1>
+                <p class="uc-page-desc">Monitor inherent vendor criticality (D/P/R/O/V &amp; O1–O5 safeguards), AI-risk assessment progress, and surfaced governance findings across Meridian's vendor inventory.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Compute the 5 non-redundant portfolio KPIs from real data
+    total_vendors = len(vendors_by_id)
+    completed_assessments = 0
+    critical_vendors = 0
+    high_risk_vendors = 0
+    awaiting_review = 0
+
+    for vid, v in vendors_by_id.items():
+        crit = crit_by_id[vid]
+        rpt = reports_by_id.get(vid)
+        _, _, is_completed = _get_vendor_assessment_status(vid, crit, rpt)
+        if is_completed:
+            completed_assessments += 1
+        final_tier = str(crit.final_criticality or "Unknown")
+        if final_tier == "Critical":
+            critical_vendors += 1
+        elif final_tier == "High":
+            high_risk_vendors += 1
+        if crit.requires_review or (rpt is not None and rpt.human_Review_required):
+            awaiting_review += 1
+
+    st.markdown(
+        f"""
+        <div class="uc-kpi-grid">
+            <div class="uc-kpi-card uc-kpi-blue">
+                <div class="uc-kpi-label">Total Vendors</div>
+                <div class="uc-kpi-value">{total_vendors}</div>
+                <div class="uc-kpi-sub">Active third-party relationships</div>
+            </div>
+            <div class="uc-kpi-card uc-kpi-green">
+                <div class="uc-kpi-label">Completed AI-Risk Assessments</div>
+                <div class="uc-kpi-value">{completed_assessments} / {total_vendors}</div>
+                <div class="uc-kpi-sub">Verified live OSINT assessments</div>
+            </div>
+            <div class="uc-kpi-card uc-kpi-red">
+                <div class="uc-kpi-label">Critical Vendors</div>
+                <div class="uc-kpi-value">{critical_vendors}</div>
+                <div class="uc-kpi-sub">Comprehensive OSINT depth required</div>
+            </div>
+            <div class="uc-kpi-card uc-kpi-amber">
+                <div class="uc-kpi-label">High-Risk Vendors</div>
+                <div class="uc-kpi-value">{high_risk_vendors}</div>
+                <div class="uc-kpi-sub">Enhanced OSINT depth required</div>
+            </div>
+            <div class="uc-kpi-card uc-kpi-slate">
+                <div class="uc-kpi-label">Assessments Awaiting Review</div>
+                <div class="uc-kpi-value">{awaiting_review}</div>
+                <div class="uc-kpi-sub">Pending analyst governance sign-off</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Filter & Sort Bar
+    st.markdown(
+        """
+        <div class="uc-section-header">
+            <div>
+                <h2 class="uc-section-title">Vendor Risk Inventory</h2>
+                <p class="uc-section-subtitle">Filter by criticality tier, AI-risk assessment status, or keyword search. Service descriptions wrap in full without clipping.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    f_col1, f_col2, f_col3, f_col4 = st.columns([2.2, 1.2, 1.4, 1.4], gap="small")
+    search_query = f_col1.text_input(
+        "Search Vendor ID, Name, Domain, or Service",
+        value=st.session_state["portfolio_search"],
+        placeholder="e.g., Fiserv, DNA Core Banking, V-002...",
+        key="portfolio_search_input",
+    )
+    st.session_state["portfolio_search"] = search_query
+
+    tier_options = ["All Tiers", "Critical", "High", "Medium", "Low"]
+    tier_filter = f_col2.selectbox(
+        "Final Criticality Tier",
+        options=tier_options,
+        index=tier_options.index(st.session_state["portfolio_tier"]) if st.session_state["portfolio_tier"] in tier_options else 0,
+        key="portfolio_tier_select",
+    )
+    st.session_state["portfolio_tier"] = tier_filter
+
+    status_options = [
+        "All Statuses",
+        "Completed",
+        "Awaiting Analyst Review",
+        "Incomplete (Blocked)",
+        "Sample Walkthrough",
+        "Awaiting Tier Review",
+        "Not Started",
+    ]
+    status_filter = f_col3.selectbox(
+        "AI-Risk Assessment Status",
+        options=status_options,
+        index=status_options.index(st.session_state["portfolio_status"]) if st.session_state["portfolio_status"] in status_options else 0,
+        key="portfolio_status_select",
+    )
+    st.session_state["portfolio_status"] = status_filter
+
+    sort_options = [
+        "Criticality (High → Low)",
+        "Base Score (High → Low)",
+        "Vendor ID (A → Z)",
+        "Vendor Name (A → Z)",
+    ]
+    sort_by = f_col4.selectbox(
+        "Sort Inventory By",
+        options=sort_options,
+        index=sort_options.index(st.session_state["portfolio_sort"]) if st.session_state["portfolio_sort"] in sort_options else 0,
+        key="portfolio_sort_select",
+    )
+    st.session_state["portfolio_sort"] = sort_by
+
+    # Apply filters
+    filtered_rows: list[tuple[MeridianVendor, CriticalityResult, Optional[VendorEndToEndAssessmentReport], str, str]] = []
+    q_low = search_query.strip().lower()
+
+    for vid, v in vendors_by_id.items():
+        crit = crit_by_id[vid]
+        rpt = reports_by_id.get(vid)
+        status_lbl, status_var, _ = _get_vendor_assessment_status(vid, crit, rpt)
+
+        if tier_filter != "All Tiers" and str(crit.final_criticality or "") != tier_filter:
+            continue
+        if status_filter != "All Statuses" and status_lbl != status_filter:
+            continue
+        if q_low:
+            haystack = " ".join([
+                v.vendor_id,
+                v.vendor_name,
+                v.domain or "",
+                v.category or "",
+                v.service_product_provided or "",
+                v.business_process_supported or "",
+            ]).lower()
+            if q_low not in haystack:
+                continue
+
+        filtered_rows.append((v, crit, rpt, status_lbl, status_var))
+
+    # Apply sorting
+    if sort_by == "Criticality (High → Low)":
+        filtered_rows.sort(
+            key=lambda item: (
+                _TIER_SORT_ORDER.get(str(item[1].final_criticality or "Unknown"), 9),
+                -(item[1].base_score or 0.0),
+                item[0].vendor_id,
+            )
         )
-        vf_c1, vf_c2, vf_c3 = st.columns(3)
-        with vf_c1:
-            in_vid = st.text_input("Vendor ID *", value="V-007", key="cust_vid")
-            in_vname = st.text_input("Vendor Legal Name *", value="Acme FinTech AI Corp", key="cust_vname")
-            in_domain = st.text_input("Primary Domain", value="acmefintech.example.com", key="cust_domain")
-        with vf_c2:
-            in_service = st.text_input(
-                "Service Purchased by Meridian (P & R input)",
-                value="Automated customer dispute triage and statement notice generation",
-                key="cust_service",
-            )
-            in_bproc = st.text_input(
-                "Business Process Supported (P & R input)",
-                value="Retail banking dispute resolution and regulatory notice fulfilment",
-                key="cust_bproc",
-            )
-            in_cat = st.text_input("Vendor Category (Contextual)", value="Financial Operations SaaS", key="cust_cat")
-        with vf_c3:
-            in_d = st.text_input(
-                "Data Classification Accessed (D input)",
-                value="Customer PII, account numbers, and transaction dispute records",
-                key="cust_d",
-            )
-            in_o = st.selectbox(
-                "Operational Dependency (O input)",
-                options=["Critical", "High", "Moderate", "Low", "UNKNOWN"],
-                index=1,
-                key="cust_o",
-            )
-            in_v = st.text_input(
-                "Annual Data Volume (V input)",
-                value="4.5 million records annually",
-                key="cust_v",
-            )
-            in_sole = st.checkbox("Sole-Source Provider (Evaluated under O2 Safeguard)", value=False, key="cust_sole")
-
-        val_col1, val_col2 = st.columns([3, 7])
-        with val_col1:
-            save_custom_btn = st.button(
-                "Validate & Register Vendor for Assessment",
-                type="secondary",
-                use_container_width=True,
-                key="btn_validate_custom_vendor",
-            )
-        if save_custom_btn:
-            cand_vendor, v_errors, v_warnings = validate_vendor_assessment_input(
-                vendor_id=in_vid,
-                vendor_name=in_vname,
-                domain=in_domain,
-                category=in_cat,
-                service_product_provided=in_service,
-                business_process_supported=in_bproc,
-                data_classification_accessed=in_d,
-                operational_dependency=in_o,
-                data_volume_annual=in_v,
-                is_sole_source=in_sole,
-            )
-            for err in v_errors:
-                st.error(err)
-            for warn in v_warnings:
-                st.warning(warn)
-            if cand_vendor is not None:
-                st.session_state.custom_vendors[cand_vendor.vendor_id] = cand_vendor
-                meridian_vendor_map[cand_vendor.vendor_id] = cand_vendor
-                preview_crit = MeridianCriticalityEngine().evaluate(cand_vendor)
-                st.success(
-                    f"Registered {cand_vendor.vendor_name} ({cand_vendor.vendor_id}) — "
-                    f"Deterministic Base Score: {preview_crit.base_score if preview_crit.base_score is not None else 'UNKNOWN'}, "
-                    f"Final Criticality: {preview_crit.final_criticality} "
-                    f"(Status: {preview_crit.score_status.value}). Select it below to run Levels 1–9."
-                )
-
-    if not meridian_vendor_map:
-        st.info("Meridian vendor dataset (`data/input/meridian_vendors.csv`) not found.")
+    elif sort_by == "Base Score (High → Low)":
+        filtered_rows.sort(key=lambda item: (-(item[1].base_score or 0.0), item[0].vendor_id))
+    elif sort_by == "Vendor Name (A → Z)":
+        filtered_rows.sort(key=lambda item: (item[0].vendor_name.lower(), item[0].vendor_id))
     else:
+        filtered_rows.sort(key=lambda item: item[0].vendor_id)
+
+    if not filtered_rows:
         st.markdown(
-            '<div class="sec-header"><span>Assessment Execution Controls (Single-Vendor &amp; Portfolio Batch)</span></div>',
+            """
+            <div class="uc-empty-state">
+                <div class="uc-empty-title">No Vendors Match Current Filters</div>
+                <div class="uc-empty-desc">No vendors in Meridian's portfolio matched your search or filter criteria. Reset the filters below to view the full vendor inventory.</div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
-        e2e_top_c1, e2e_top_c2, e2e_top_c3, e2e_top_c4 = st.columns([3.4, 4.2, 1.2, 1.2])
-        with e2e_top_c1:
-            e2e_vid = st.selectbox(
-                "Target Vendor",
-                options=list(meridian_vendor_map.keys()),
-                format_func=lambda vid: f"{meridian_vendor_map[vid].vendor_name} ({vid}) — {meridian_vendor_map[vid].domain or 'no-domain'}",
-                key="e2e_vendor_select",
+        if st.button("Clear All Filters", key="btn_clear_portfolio_filters", type="primary"):
+            st.session_state["portfolio_search"] = ""
+            st.session_state["portfolio_tier"] = "All Tiers"
+            st.session_state["portfolio_status"] = "All Statuses"
+            st.rerun()
+    else:
+        selected_vid = st.session_state.get("selected_vendor_id", filtered_rows[0][0].vendor_id)
+        table_rows_html: list[str] = []
+        for v, crit, rpt, status_lbl, status_var in filtered_rows:
+            row_cls = "uc-row-selected" if v.vendor_id == selected_vid else ""
+            base_score_str = f"{crit.base_score:.2f}" if crit.base_score is not None else "Unknown"
+            prov_str = str(crit.provisional_criticality or "Unknown")
+            final_str = str(crit.final_criticality or "Unknown")
+            prov_note = (
+                f'<div style="font-size:0.73rem;color:#64748B;margin-top:2px;">Base: {html.escape(prov_str)}</div>'
+                if prov_str != final_str
+                else ""
             )
-        with e2e_top_c2:
-            e2e_exec_mode = st.selectbox(
-                "Assessment Data Source & Model Routing Mode",
-                options=[
-                    "Real OSINT Mode — Dual-Model Local Ollama (llama3.2:latest + mistral:latest)",
-                    "Real OSINT Mode — Deterministic Rules Only",
-                    "Synthetic Fixture Demo Mode — Dual-Model Local Ollama (llama3.2:latest + mistral:latest)",
-                    "Synthetic Fixture Demo Mode — Deterministic Rules Only",
-                ],
-                index=3,
-                key="e2e_exec_mode_select",
-            )
-        with e2e_top_c3:
-            st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
-            run_e2e_btn = st.button("Run Vendor", type="primary", use_container_width=True, key="btn_run_e2e")
-        with e2e_top_c4:
-            st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
-            run_batch_btn = st.button("Run All (Batch)", use_container_width=True, key="btn_run_e2e_batch")
-
-        selected_mv = meridian_vendor_map[e2e_vid]
-        is_synthetic_demo = e2e_exec_mode.startswith("Synthetic Fixture Demo Mode")
-        use_dual_ollama = "Dual-Model Local Ollama" in e2e_exec_mode
-        mode_tag = (
-            "synth_ollama"
-            if (is_synthetic_demo and use_dual_ollama)
-            else "synth_det"
-            if is_synthetic_demo
-            else "real_ollama"
-            if use_dual_ollama
-            else "real_det"
-        )
-        cache_key = f"{e2e_vid}::{mode_tag}"
-
-        def _execute_single_vendor_pipeline(
-            target_vendor: MeridianVendor,
-            *,
-            synthetic_mode: bool,
-            dual_ollama_mode: bool,
-            status_container: Optional[Any] = None,
-        ) -> VendorEndToEndAssessmentReport:
-            h_rev = st.session_state.human_overrides.get(target_vendor.vendor_id)
-            all_source_ids = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12"]
-
-            def _on_progress(lvl_num: int, stage_title: str, detail: str) -> None:
-                if status_container is not None:
-                    status_container.write(f"**[{lvl_num}/9] {stage_title}** — {detail}")
-
-            if synthetic_mode:
-                stub_search, stub_fetch = build_synthetic_demo_adapters_for_vendor(target_vendor)
-                pipeline = MeridianEndToEndPipeline(
-                    search_backend=stub_search,
-                    fetch_adapter=stub_fetch,
-                    enable_local_llm_from_env=dual_ollama_mode,
-                )
-                return pipeline.run_vendor_assessment(
-                    target_vendor,
-                    human_criticality_override=h_rev,
-                    execute_searches=True,
-                    execute_extraction=True,
-                    mark_extracted_sources_reviewed=True,
-                    reviewed_no_evidence_sources=all_source_ids,
-                    persist_to_repository=True,
-                    progress_callback=_on_progress,
+            last_date = _format_short_date(rpt.generated_at) if rpt else "—"
+            verdict_sub = ""
+            if rpt:
+                verdict_sub = (
+                    f'<div style="font-size:0.74rem;color:#475569;margin-top:3px;">'
+                    f'Verdict: <strong>{html.escape(format_plain_status(rpt.ai_use_verdict.verdict))}</strong> '
+                    f'({len(rpt.risk_findings)} finding(s))</div>'
                 )
 
-            pipeline = MeridianEndToEndPipeline(
-                enable_local_llm_from_env=dual_ollama_mode,
+            table_rows_html.append(
+                f'<tr class="{row_cls}">'
+                f'<td style="width:85px;"><span class="uc-mono">{html.escape(v.vendor_id)}</span></td>'
+                f'<td style="width:190px;"><strong>{html.escape(v.vendor_name)}</strong>'
+                f'<div style="font-size:0.76rem;color:#64748B;">{html.escape(v.domain or "No domain")} · {html.escape(v.category or "Vendor")}</div></td>'
+                f'<td style="min-width:260px;"><strong>{html.escape(v.service_product_provided or "UNKNOWN")}</strong>'
+                f'<div style="font-size:0.77rem;color:#475569;margin-top:2px;">Process: {html.escape(v.business_process_supported or "UNKNOWN")}</div></td>'
+                f'<td style="width:130px;">{_tier_badge(final_str)}{prov_note}</td>'
+                f'<td style="width:95px;"><span class="uc-mono">{html.escape(base_score_str)}</span></td>'
+                f'<td style="width:195px;">{_status_badge(status_lbl, status_var)}{verdict_sub}</td>'
+                f'<td style="width:140px;font-size:0.78rem;color:#475569;">{html.escape(last_date)}</td>'
+                f'</tr>'
             )
-            return pipeline.run_vendor_assessment(
-                target_vendor,
-                human_criticality_override=h_rev,
-                execute_searches=True,
-                execute_extraction=True,
-                persist_to_repository=True,
-                progress_callback=_on_progress,
-            )
-
-        if run_batch_btn:
-            with st.status(
-                f"Executing batch 9-level assessment across {len(meridian_vendor_map)} vendors ({e2e_exec_mode})...",
-                expanded=True,
-            ) as batch_status:
-                for idx_v, (b_vid, b_mv) in enumerate(meridian_vendor_map.items(), start=1):
-                    batch_status.write(f"Assessing vendor {idx_v}/{len(meridian_vendor_map)}: **{b_mv.vendor_name} ({b_vid})**...")
-                    b_rep = _execute_single_vendor_pipeline(
-                        b_mv,
-                        synthetic_mode=is_synthetic_demo,
-                        dual_ollama_mode=use_dual_ollama,
-                        status_container=None,
-                    )
-                    st.session_state.e2e_reports[f"{b_vid}::{mode_tag}"] = b_rep
-                batch_status.update(
-                    label=f"Batch assessment completed for {len(meridian_vendor_map)} vendors.",
-                    state="complete",
-                    expanded=False,
-                )
-
-        if run_e2e_btn or cache_key not in st.session_state.e2e_reports:
-            with st.status(
-                f"Running 9-Level Assessment for {selected_mv.vendor_name} ({selected_mv.vendor_id})...",
-                expanded=run_e2e_btn,
-            ) as run_status:
-                rep = _execute_single_vendor_pipeline(
-                    selected_mv,
-                    synthetic_mode=is_synthetic_demo,
-                    dual_ollama_mode=use_dual_ollama,
-                    status_container=run_status,
-                )
-                st.session_state.e2e_reports[cache_key] = rep
-                run_status.update(
-                    label=(
-                        f"Completed 9-level execution for {selected_mv.vendor_name} "
-                        f"(Verdict: {rep.ai_use_verdict.verdict.value} | "
-                        f"Criticality: {rep.criticality_summary.get('final_criticality')})"
-                    ),
-                    state="complete",
-                    expanded=False,
-                )
-
-        e2e_rep: VendorEndToEndAssessmentReport = st.session_state.e2e_reports[cache_key]
-
-        # Batch comparison table if multiple vendors have been run in this mode
-        batch_keys_for_mode = [
-            f"{vid}::{mode_tag}"
-            for vid in meridian_vendor_map
-            if f"{vid}::{mode_tag}" in st.session_state.e2e_reports
-        ]
-        if len(batch_keys_for_mode) > 1:
-            with st.expander(f"Portfolio Batch Comparison ({len(batch_keys_for_mode)} Vendors Assessed in Current Mode)", expanded=False):
-                b_rows = []
-                for bk in batch_keys_for_mode:
-                    brep: VendorEndToEndAssessmentReport = st.session_state.e2e_reports[bk]
-                    b_rows.append({
-                        "Vendor ID": brep.vendor_id,
-                        "Vendor": brep.legal_entity,
-                        "Criticality": brep.criticality_summary.get("final_criticality", "UNKNOWN"),
-                        "Base Score": brep.criticality_summary.get("base_score"),
-                        "OSINT Depth": brep.osint_plan_summary.get("selected_depth_profile", ""),
-                        "Depth Completed": brep.ai_use_verdict.depth_completed,
-                        "Evidence Items": len(brep.evidence_records),
-                        "AI-Use Verdict": brep.ai_use_verdict.verdict.value,
-                        "Determined Scope": brep.determined_scope,
-                        "R1–R8 Findings": len(brep.risk_findings),
-                        "Level 9 Status": brep.deterministic_risk_score.policy_status.value,
-                    })
-                st.dataframe(pd.DataFrame(b_rows), use_container_width=True, hide_index=True)
-
-        # ── 3. Explicit Data-Provenance & Assessment Completeness Banner ──
-        verdict_val = e2e_rep.ai_use_verdict.verdict.value if e2e_rep.ai_use_verdict else "INCOMPLETE_ASSESSMENT"
-        if e2e_rep.is_synthetic_evidence_run or is_synthetic_demo:
-            st.markdown(
-                """
-                <div class="console-banner synth">
-                    <strong>SYNTHETIC FIXTURE / DEMO WALKTHROUGH MODE ACTIVE — NOT REAL VENDOR EVIDENCE:</strong>
-                    Candidate URLs, HTML/PDF documents, and verbatim excerpts in this run come from labelled offline synthetic test fixtures
-                    used to verify Levels 1–9 end-to-end (including prompt-injection isolation under E14 and dual-model routing).
-                    Switch to <strong>Real OSINT Mode</strong> for production vendor reconnaissance.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        elif not readiness.search_configured:
-            unavail_q = e2e_rep.osint_plan_summary.get("unavailable_queries_count", 0)
-            plan_q = e2e_rep.osint_plan_summary.get("planned_queries_count", 0)
-            st.markdown(
-                f"""
-                <div class="console-banner incomplete">
-                    <strong>REAL OSINT MODE BLOCKED BY UNCONFIGURED SEARCH — ASSESSMENT INCOMPLETE (NOT A 'NO AI' VERDICT):</strong>
-                    Levels 1 and 2 completed deterministically, and {plan_q} targeted OSINT queries were planned.
-                    However, all {unavail_q}/{plan_q} search queries returned <code>UNAVAILABLE</code> because
-                    <code>MERIDIAN_SERPAPI_KEY</code> is not configured in the local <code>.env</code> file.
-                    In accordance with the rulebook, an unexecuted search cannot support a <code>NO</code> AI-use verdict;
-                    the assessment status is <strong><code>{verdict_val}</code></strong>.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"""
-                <div class="console-banner real-ok">
-                    <strong>REAL OSINT ASSESSMENT MODE:</strong>
-                    Run ID <code>{e2e_rep.report_id}</code> · Generated <code>{e2e_rep.generated_at}</code> ·
-                    AI-Use Verdict: <strong><code>{verdict_val}</code></strong>.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        # ── 4. Top-Level KPI Strip ──
-        score_status_val = (
-            e2e_rep.deterministic_risk_score.policy_status.value
-            if e2e_rep.deterministic_risk_score
-            else "SCORING_POLICY_UNCONFIGURED"
-        )
-        crit_tier_str = e2e_rep.criticality_summary.get("final_criticality", "Unknown")
-        base_score_val = e2e_rep.criticality_summary.get("base_score")
-        base_score_str = f"{base_score_val:.2f}" if isinstance(base_score_val, (int, float)) else "UNKNOWN"
-        depth_str = e2e_rep.osint_plan_summary.get("selected_depth_profile", "Unknown")
-        timebox_str = e2e_rep.osint_plan_summary.get("timebox", {}).get("planning_target", "N/A")
 
         st.markdown(
             f"""
-            <div class="stat-grid">
-                <div class="stat-card all">
-                    <div class="stat-label">Level 1–2 Criticality &amp; Depth</div>
-                    <div class="stat-value" style="font-size:1.2rem">{crit_tier_str} <span style="font-size:0.85rem;font-weight:500;color:#475569">(Base: {base_score_str})</span></div>
-                    <div class="stat-sub">Depth: {depth_str} · POC Timebox: {timebox_str}</div>
+            <div class="uc-table-wrap">
+                <table class="uc-table">
+                    <thead>
+                        <tr>
+                            <th>Vendor ID</th>
+                            <th>Vendor Name &amp; Domain</th>
+                            <th>Purchased Service &amp; Business Process</th>
+                            <th>Final Tier</th>
+                            <th>Base Score</th>
+                            <th>AI-Risk Assessment Status</th>
+                            <th>Last Assessed</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {"".join(table_rows_html)}
+                    </tbody>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ── Selected Vendor Detail & Action Bar ──
+    all_vids = sorted(vendors_by_id.keys())
+    current_vid = st.session_state.get("selected_vendor_id", all_vids[0])
+    if current_vid not in vendors_by_id:
+        current_vid = all_vids[0]
+
+    sel_col, act_col1, act_col2, act_col3 = st.columns([2.4, 1.2, 1.2, 1.2], gap="small")
+    chosen_vid = sel_col.selectbox(
+        "Inspect Selected Vendor Profile & Governance Breakdown",
+        options=all_vids,
+        index=all_vids.index(current_vid),
+        format_func=lambda vid: f"{vid} — {vendors_by_id[vid].vendor_name} ({crit_by_id[vid].final_criticality or 'Unknown'})",
+        key="portfolio_vendor_selector",
+    )
+    st.session_state["selected_vendor_id"] = chosen_vid
+
+    sel_vendor = vendors_by_id[chosen_vid]
+    sel_crit = crit_by_id[chosen_vid]
+    sel_rpt = reports_by_id.get(chosen_vid)
+
+    st.write("")
+    if act_col1.button("Open Assessment Workspace", key="btn_port_open_assess", type="primary", use_container_width=True):
+        _navigate_to("Assessments", chosen_vid)
+        st.rerun()
+    if act_col2.button("Inspect Evidence Register", key="btn_port_open_ev", type="secondary", use_container_width=True):
+        _navigate_to("Evidence", chosen_vid)
+        st.rerun()
+    if act_col3.button("View Assessment Dossier", key="btn_port_open_rpt", type="secondary", use_container_width=True):
+        _navigate_to("Reports", chosen_vid)
+        st.rerun()
+
+    detail_left, detail_right = st.columns([1.25, 1.0], gap="medium")
+
+    with detail_left:
+        overrides_trig = [ov.override_id for ov in sel_crit.overrides_evaluated if ov.triggered]
+        ov_summary = ", ".join(overrides_trig) if overrides_trig else "None triggered"
+        st.markdown(
+            f"""
+            <div class="uc-section-header" style="margin-top:6px;">
+                <div>
+                    <h3 class="uc-section-title">{html.escape(sel_vendor.vendor_name)} ({html.escape(sel_vendor.vendor_id)}) — Criticality &amp; Factor Provenance</h3>
+                    <p class="uc-section-subtitle">Weighted Formula: 0.30·D + 0.20·P + 0.20·R + 0.20·O + 0.10·V with O1–O5 Override Governance</p>
                 </div>
-                <div class="stat-card high">
-                    <div class="stat-label">Level 3–6 OSINT &amp; Evidence</div>
-                    <div class="stat-value" style="font-size:1.2rem">{len(e2e_rep.evidence_records)} Evidence Items</div>
-                    <div class="stat-sub">{len(e2e_rep.url_triage_decisions)} URLs triaged · {e2e_rep.extracted_documents_count} docs fetched</div>
+            </div>
+            <div class="uc-kv-grid">
+                <div class="uc-kv-box">
+                    <div class="uc-kv-label">Primary Domain</div>
+                    <div class="uc-kv-val">{html.escape(sel_vendor.domain or "UNKNOWN")}</div>
                 </div>
-                <div class="stat-card medium">
-                    <div class="stat-label">Level 7 AI-Use Verdict</div>
-                    <div class="stat-value" style="font-size:1.1rem">{verdict_val}</div>
-                    <div class="stat-sub">Scope: {e2e_rep.determined_scope} · Depth Complete: {e2e_rep.ai_use_verdict.depth_completed}</div>
+                <div class="uc-kv-box">
+                    <div class="uc-kv-label">Base Score &amp; Provisional Tier</div>
+                    <div class="uc-kv-val">{f"{sel_crit.base_score:.2f}" if sel_crit.base_score is not None else "Unknown"} ({html.escape(str(sel_crit.provisional_criticality or "Unknown"))})</div>
                 </div>
-                <div class="stat-card low">
-                    <div class="stat-label">Level 8–9 Risk &amp; Rating</div>
-                    <div class="stat-value" style="font-size:1.1rem">{len(e2e_rep.risk_findings)} R1–R8 Findings</div>
-                    <div class="stat-sub">{score_status_val}</div>
+                <div class="uc-kv-box">
+                    <div class="uc-kv-label">Final Criticality Tier</div>
+                    <div class="uc-kv-val">{_tier_badge(str(sel_crit.final_criticality or "Unknown"))}</div>
+                </div>
+                <div class="uc-kv-box">
+                    <div class="uc-kv-label">O1–O5 Overrides Triggered</div>
+                    <div class="uc-kv-val">{html.escape(ov_summary)}</div>
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        # ── 5. Canonical Nine-Level Stage Execution Tracker (Levels 1–9 + Level 3B Substep) ──
+        # D/P/R/O/V Factor Table
+        factor_rows_html: list[str] = []
+        factor_names = {
+            "D": "Data Sensitivity (0.30)",
+            "P": "Process Criticality (0.20)",
+            "R": "Regulatory Scope (0.20)",
+            "O": "Operational Dependency (0.20)",
+            "V": "Data Volume (0.10)",
+        }
+        for f_code, f_obj in (
+            ("D", sel_crit.D),
+            ("P", sel_crit.P),
+            ("R", sel_crit.R),
+            ("O", sel_crit.O),
+            ("V", sel_crit.V),
+        ):
+            sc_txt = str(f_obj.score) if f_obj.score is not None else "UNKNOWN"
+            wc_txt = f"{f_obj.weighted_contribution:.2f}" if f_obj.weighted_contribution is not None else "—"
+            factor_rows_html.append(
+                f"<tr>"
+                f"<td><strong>{html.escape(f_code)}</strong> — {html.escape(factor_names[f_code])}</td>"
+                f"<td><span class='uc-mono'>{html.escape(sc_txt)}</span></td>"
+                f"<td><span class='uc-mono'>{html.escape(wc_txt)}</span></td>"
+                f"<td>{html.escape(format_plain_status(f_obj.determination_method.value))}</td>"
+                f"<td>{html.escape(f_obj.rationale)}</td>"
+                f"</tr>"
+            )
+
         st.markdown(
-            '<div class="sec-header"><span>Canonical Nine-Level Framework Stage Tracker</span></div>',
+            f"""
+            <div class="uc-table-wrap">
+                <table class="uc-table">
+                    <thead>
+                        <tr>
+                            <th>Factor</th>
+                            <th>Score</th>
+                            <th>Weighted</th>
+                            <th>Provenance</th>
+                            <th>Analytical Rationale</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {"".join(factor_rows_html)}
+                    </tbody>
+                </table>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
-        tracker_rows = build_nine_level_stage_tracker(e2e_rep)
-        stage_table_data: list[dict[str, str]] = []
-        for tr in tracker_rows:
-            stage_table_data.append({
-                "Stage": f"{tr.level_label}",
-                "Framework Level Name": tr.level_name,
-                "Status": tr.badge_label,
-                "Execution Method": tr.execution_method,
-                "Relevant Counts": tr.relevant_counts,
-                "Concise Output / Blocker": tr.blocker if tr.blocker else tr.concise_output,
-            })
-            for sub in tr.substeps:
-                stage_table_data.append({
-                    "Stage": f"↳ {sub['substep_id']}",
-                    "Framework Level Name": sub["substep_name"],
-                    "Status": sub["status"],
-                    "Execution Method": "Substep of Level 3",
-                    "Relevant Counts": "—",
-                    "Concise Output / Blocker": sub["detail"],
-                })
-        st.dataframe(pd.DataFrame(stage_table_data), use_container_width=True, hide_index=True)
 
-        # ── 6. Analyst-Friendly Results Area (Six Structured Sub-Tabs) ──
-        res_tab1, res_tab2, res_tab3, res_tab4, res_tab5, res_tab6 = st.tabs([
-            "1. Executive Summary & Status",
-            "2. Criticality & Overrides (Levels 1–2)",
-            "3. AI-Use Verdict & Gates G1–G4 (Level 7)",
-            "4. Evidence Register (Levels 3–6, E1–E14)",
-            "5. Risk Findings & Follow-Up (Levels 8–9, R1–R8)",
-            "6. Stage Audit, Telemetry, Sign-Off & Exports",
-        ])
+    with detail_right:
+        st.markdown(
+            """
+            <div class="uc-section-header" style="margin-top:6px;">
+                <div>
+                    <h3 class="uc-section-title">AI-Risk Assessment Status &amp; Key Findings</h3>
+                    <p class="uc-section-subtitle">Current OSINT investigation status, G1–G4 gate determination, and surfaced R1–R8 risks</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        # ── SUB-TAB 1: EXECUTIVE SUMMARY & ASSESSMENT STATUS ──
-        with res_tab1:
-            sum_c1, sum_c2 = st.columns([6, 4], gap="large")
-            with sum_c1:
-                st.markdown("##### Vendor & Service Scope")
-                scope_df = pd.DataFrame([
-                    {"Field": "Report Run ID", "Value": e2e_rep.report_id},
-                    {"Field": "Generated Timestamp (UTC)", "Value": e2e_rep.generated_at},
-                    {"Field": "Data Provenance Mode", "Value": "SYNTHETIC DEMO FIXTURES" if e2e_rep.is_synthetic_evidence_run else "REAL OSINT ASSESSMENT"},
-                    {"Field": "Vendor Legal Entity", "Value": f"{e2e_rep.legal_entity} ({e2e_rep.vendor_id})"},
-                    {"Field": "Primary Domain", "Value": e2e_rep.domain or "N/A"},
-                    {"Field": "Service Purchased by Meridian", "Value": e2e_rep.service_product_provided or "N/A"},
-                    {"Field": "Business Process Supported", "Value": e2e_rep.business_process_supported or "N/A"},
-                    {"Field": "Effective Criticality Tier", "Value": f"{crit_tier_str} (Base Score: {base_score_str})"},
-                    {"Field": "OSINT Depth Profile", "Value": f"{depth_str} (Completed: {e2e_rep.ai_use_verdict.depth_completed})"},
-                    {"Field": "Rulebook AI-Use Verdict", "Value": f"{verdict_val} — {e2e_rep.ai_use_verdict.verdict_statement}"},
-                    {"Field": "Determined AI Scope & Types", "Value": f"Scope: {e2e_rep.determined_scope} | AI Types: {', '.join(e2e_rep.determined_ai_types) or 'NONE'}"},
-                    {"Field": "Fourth-Party AI Supply Chain (G4)", "Value": f"Status: {e2e_rep.supply_chain_identity_status} | Providers: {', '.join(e2e_rep.named_providers) or 'None'} | Models: {', '.join(e2e_rep.named_models) or 'None'} | Hosting: {', '.join(e2e_rep.hosting_infrastructures) or 'None'}"},
-                    {"Field": "Level 9 Risk Rating Status", "Value": f"{score_status_val} (Final Score: {e2e_rep.deterministic_risk_score.final_risk_score if e2e_rep.deterministic_risk_score.final_risk_score is not None else 'None — Unconfigured Policy'})"},
-                ])
-                st.dataframe(scope_df, use_container_width=True, hide_index=True)
-
-            with sum_c2:
-                st.markdown("##### Assessment Limitations & Blockers")
-                if e2e_rep.unavailable_integrations:
-                    st.markdown("**Unconfigured / Unavailable External Integrations:**")
-                    for ui_msg in e2e_rep.unavailable_integrations:
-                        st.markdown(f"- {ui_msg}")
-                if e2e_rep.assessment_limitations:
-                    st.markdown("**Recorded Assessment Limitations:**")
-                    for lim_msg in e2e_rep.assessment_limitations:
-                        st.markdown(f"- {lim_msg}")
-                if not e2e_rep.unavailable_integrations and not e2e_rep.assessment_limitations:
-                    st.caption("No integration blockers or assessment limitations recorded.")
-
-                if e2e_rep.unresolved_questions:
-                    st.markdown("##### Open Diligence Questions for Vendor")
-                    for oq in e2e_rep.unresolved_questions:
-                        st.markdown(f"- {oq}")
-
-        # ── SUB-TAB 2: CRITICALITY FACTORS, SCORE, TIER & TRIGGERED OVERRIDES (LEVELS 1–2) ──
-        with res_tab2:
-            crit_data = e2e_rep.criticality_summary or {}
+        if sel_rpt is None:
             st.markdown(
-                f"##### Level 1 Deterministic Criticality Breakdown (`C = 0.30D + 0.20P + 0.20R + 0.20O + 0.10V`)\n"
-                f"**Base Score:** `{base_score_str}` &nbsp;|&nbsp; "
-                f"**Base Tier:** `{crit_data.get('base_tier', 'UNKNOWN')}` &nbsp;|&nbsp; "
-                f"**Override Tier:** `{crit_data.get('override_tier') or 'None'}` &nbsp;|&nbsp; "
-                f"**Effective Criticality:** **`{crit_tier_str}`** (`{crit_data.get('score_status', 'COMPLETE')}`)"
+                f"""
+                <div class="uc-empty-state">
+                    <div class="uc-empty-title">No AI-Risk Assessment Executed Yet for {html.escape(sel_vendor.vendor_name)}</div>
+                    <div class="uc-empty-desc">
+                        Inherent criticality tiering is complete (<strong>{html.escape(str(sel_crit.final_criticality or "Unknown"))}</strong>),
+                        but public OSINT reconnaissance and evidentiary AI-risk evaluation have not been run yet.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            factor_rows = []
-            factors_dict = crit_data.get("factors", {})
-            for fk in ("D", "P", "R", "O", "V"):
-                fd = factors_dict.get(fk, {})
-                factor_rows.append({
-                    "Factor": fk,
-                    "Score (0–3)": str(fd.get("score", "UNKNOWN")),
-                    "Weight": f"{fd.get('weight', 0.0):.2f}" if isinstance(fd.get("weight"), (int, float)) else "—",
-                    "Weighted Contribution": (
-                        f"{fd.get('weighted_contribution'):.2f}"
-                        if isinstance(fd.get("weighted_contribution"), (int, float))
-                        else "UNKNOWN"
-                    ),
-                    "Determination Method": fd.get("determination_method", ""),
-                    "Source Fields": ", ".join(fd.get("source_fields", [])),
-                    "Matched Concepts / Phrases": ", ".join(fd.get("matched_concepts", []) or fd.get("deterministic_matches", [])),
-                    "Rationale": fd.get("rationale", ""),
-                })
-            st.dataframe(pd.DataFrame(factor_rows), use_container_width=True, hide_index=True)
-
-            st.markdown("##### Evaluated Governance Safeguards & Overrides (`O1–O5`)")
-            ov_rows = []
-            for ov in crit_data.get("overrides_evaluated", []):
-                ov_rows.append({
-                    "Override ID": ov.get("override_id", ""),
-                    "Rule Description": ov.get("description", ""),
-                    "Condition Evaluated": ov.get("condition_evaluated", ""),
-                    "Triggered": "YES" if ov.get("triggered") else "NO",
-                    "Resulting Tier": ov.get("resulting_tier") or "—",
-                    "Rationale": ov.get("rationale", ""),
-                })
-            if ov_rows:
-                st.dataframe(pd.DataFrame(ov_rows), use_container_width=True, hide_index=True)
-
-            st.markdown("##### Level 2 OSINT Depth Scoping & S1–S12 Source Coverage")
-            osint_sum = e2e_rep.osint_plan_summary or {}
-            cond_items = [
-                c.get("source_id", str(c)) if isinstance(c, dict) else str(c)
-                for c in osint_sum.get("conditional_source_classes", [])
-            ]
+            c_btn1, c_btn2 = st.columns(2, gap="small")
+            if c_btn1.button(
+                f"Configure Live Assessment ({sel_vendor.vendor_id})",
+                key="btn_port_start_live",
+                type="primary",
+                use_container_width=True,
+            ):
+                _navigate_to("Assessments", chosen_vid)
+                st.rerun()
+            if c_btn2.button(
+                f"Run Sample Walkthrough ({sel_vendor.vendor_id})",
+                key="btn_port_start_sample",
+                type="secondary",
+                use_container_width=True,
+            ):
+                _execute_vendor_assessment(sel_vendor, mode="SAMPLE", enable_local_llm=False)
+                _navigate_to("Assessments", chosen_vid)
+                st.rerun()
+        else:
+            mode_tag = (
+                _status_badge("Sample Walkthrough (Synthetic Fixtures)", "purple")
+                if sel_rpt.is_synthetic_evidence_run
+                else _status_badge("Live OSINT Assessment", "success")
+            )
             st.markdown(
-                f"- **Selected Depth Profile:** `{osint_sum.get('selected_depth_profile', 'N/A')}` — {osint_sum.get('selection_reason', '')}\n"
-                f"- **Required Source Classes:** `{', '.join(osint_sum.get('required_source_classes', []))}` | "
-                f"**Conditional:** `{', '.join(cond_items) or 'None'}` | "
-                f"**Corroborative:** `{', '.join(osint_sum.get('corroborative_source_classes', []))}`\n"
-                f"- **Stopping Rule (`{osint_sum.get('stopping_rule_id', '')}`):** `{osint_sum.get('stop_status', '')}`"
+                f"""
+                <div class="uc-kv-grid">
+                    <div class="uc-kv-box">
+                        <div class="uc-kv-label">Assessment Run Mode</div>
+                        <div class="uc-kv-val">{mode_tag}</div>
+                    </div>
+                    <div class="uc-kv-box">
+                        <div class="uc-kv-label">AI-Use Verdict</div>
+                        <div class="uc-kv-val">{_verdict_badge(sel_rpt.ai_use_verdict.verdict.value)}</div>
+                    </div>
+                    <div class="uc-kv-box">
+                        <div class="uc-kv-label">Captured Evidence</div>
+                        <div class="uc-kv-val">{len(sel_rpt.evidence_records)} verbatim excerpt(s)</div>
+                    </div>
+                    <div class="uc-kv-box">
+                        <div class="uc-kv-label">R1–R8 Risk Findings</div>
+                        <div class="uc-kv-val">{len(sel_rpt.risk_findings)} surfaced finding(s)</div>
+                    </div>
+                </div>
+                <div class="uc-callout uc-callout-info">
+                    <strong>Determination Basis:</strong> {html.escape(sel_rpt.ai_use_verdict.basis_summary)}
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            cov_details = osint_sum.get("coverage_summary", {}).get("source_details", [])
-            if cov_details:
-                st.dataframe(pd.DataFrame(cov_details), use_container_width=True, hide_index=True)
 
-        # ── SUB-TAB 3: AI-USE VERDICT & G1–G4 GATE RESULTS (LEVEL 7) ──
-        with res_tab3:
-            v_obj = e2e_rep.ai_use_verdict
-            st.markdown("##### Level 7 Rulebook AI-Use Verdict")
-            st.markdown(
-                f"- **Verdict:** **`{v_obj.verdict.value}`** (Investigation Depth Completed: `{v_obj.depth_completed}`)\n"
-                f"- **Verdict Statement:** {v_obj.verdict_statement}\n"
-                f"- **Evidentiary Basis:** {v_obj.basis_summary}\n"
-                f"- **Supporting Evidence IDs:** `{', '.join(v_obj.supporting_evidence_ids) or 'None'}`\n"
-                f"- **Corroborating Source Classes:** `{', '.join(v_obj.corroborating_source_classes) or 'None'}`"
-            )
-            if v_obj.incomplete_reasons:
-                st.warning("Completeness Guardrail Reasons: " + " | ".join(v_obj.incomplete_reasons))
-
-            st.markdown("##### Evidentiary Gates (`G1–G4`)")
-            gate_rows = []
-            for g in e2e_rep.gates:
-                gate_rows.append({
-                    "Gate ID": g.gate_id,
-                    "Gate Title": g.title,
-                    "Evaluation Question": g.question,
-                    "Status": g.status,
-                    "Supporting Evidence IDs": ", ".join(g.supporting_evidence_ids) or "None",
-                    "Rationale": g.rationale,
-                    "Open Questions": "; ".join(g.open_questions) or "None",
-                })
-            st.dataframe(pd.DataFrame(gate_rows), use_container_width=True, hide_index=True)
-
-        # ── SUB-TAB 4: EVIDENCE REGISTER (LEVELS 3–6, E1–E14) ──
-        with res_tab4:
-            st.markdown("##### Point-of-Capture Evidence Register (`E1–E14` & `G1–G4`)")
-            if not e2e_rep.evidence_records:
-                st.info(
-                    "No evidence records captured in this run. "
-                    + (
-                        "External search is currently unconfigured (`MERIDIAN_SERPAPI_KEY` is blank)."
-                        if not is_synthetic_demo and not readiness.search_configured
-                        else "No qualifying excerpts were extracted."
+            if sel_rpt.risk_findings:
+                rf_html = []
+                for rf in sel_rpt.risk_findings[:4]:
+                    rf_html.append(
+                        f"<tr>"
+                        f"<td><strong>{html.escape(rf.risk_rule_id)}</strong>: {html.escape(rf.risk_title)}</td>"
+                        f"<td>{_severity_badge(rf.severity.value)}</td>"
+                        f"<td>{html.escape(rf.finding_description)}</td>"
+                        f"</tr>"
                     )
-                )
-            else:
-                weight_by_id = {w.evidence_id: w for w in e2e_rep.weighted_evidence}
-                cls_by_id = {c.evidence_id: c for c in e2e_rep.signal_classifications}
-
-                all_sources = sorted({ev.source_class for ev in e2e_rep.evidence_records})
-                all_strengths = sorted({
-                    (weight_by_id[ev.evidence_id].evidence_strength.value if ev.evidence_id in weight_by_id else ev.evidence_strength.value)
-                    for ev in e2e_rep.evidence_records
-                })
-                all_scopes = sorted({ev.scope.value for ev in e2e_rep.evidence_records})
-
-                f_c1, f_c2, f_c3, f_c4, f_c5 = st.columns([2, 2, 2, 2, 3])
-                with f_c1:
-                    flt_source = st.multiselect("Source Class (S1–S12)", options=all_sources, default=[], key=f"ev_flt_src_{cache_key}")
-                with f_c2:
-                    flt_strength = st.multiselect("Evidence Strength", options=all_strengths, default=[], key=f"ev_flt_str_{cache_key}")
-                with f_c3:
-                    flt_gate = st.multiselect("Supports Gate", options=["G1", "G2", "G3", "G4"], default=[], key=f"ev_flt_gate_{cache_key}")
-                with f_c4:
-                    flt_scope = st.multiselect("Product Scope", options=all_scopes, default=[], key=f"ev_flt_scp_{cache_key}")
-                with f_c5:
-                    flt_kw = st.text_input("Keyword Filter (URL, Excerpt, E-Rule)", value="", key=f"ev_flt_kw_{cache_key}")
-
-                filtered_evs = []
-                for ev in e2e_rep.evidence_records:
-                    we = weight_by_id.get(ev.evidence_id)
-                    eff_strength = we.evidence_strength.value if we else ev.evidence_strength.value
-                    eff_erules = we.fired_e_rule_ids if we else ev.e_rule_ids
-                    ev_gates = gates_for_evidence(e2e_rep, ev.evidence_id)
-                    if flt_source and ev.source_class not in flt_source:
-                        continue
-                    if flt_strength and eff_strength not in flt_strength:
-                        continue
-                    if flt_gate and not any(g in ev_gates for g in flt_gate):
-                        continue
-                    if flt_scope and ev.scope.value not in flt_scope:
-                        continue
-                    if flt_kw.strip():
-                        kw_low = flt_kw.strip().lower()
-                        searchable = f"{ev.evidence_id} {ev.canonical_url} {ev.verbatim_excerpt} {' '.join(eff_erules)}".lower()
-                        if kw_low not in searchable:
-                            continue
-                    filtered_evs.append(ev)
-
-                st.caption(f"Showing {len(filtered_evs)} of {len(e2e_rep.evidence_records)} evidence record(s).")
-
-                ev_table_rows = []
-                for ev in filtered_evs:
-                    we = weight_by_id.get(ev.evidence_id)
-                    cls_r = cls_by_id.get(ev.evidence_id)
-                    ev_gates = gates_for_evidence(e2e_rep, ev.evidence_id)
-                    ev_table_rows.append({
-                        "Evidence ID": ev.evidence_id,
-                        "Source Class": f"{ev.source_class} (Grade {ev.source_reliability_grade})",
-                        "Source URL": ev.canonical_url,
-                        "Retrieved At (UTC)": ev.retrieved_at,
-                        "Scope": ev.scope.value,
-                        "AI Type": ev.ai_type.value,
-                        "Evidence Strength": we.evidence_strength.value if we else ev.evidence_strength.value,
-                        "Weight Band": we.weight_band.value if we else "—",
-                        "E1–E14 Rules": ", ".join(we.fired_e_rule_ids if we else ev.e_rule_ids),
-                        "Gates": ", ".join(ev_gates),
-                        "L6 Classifier": (
-                            f"{cls_r.classification_method.value} ({cls_r.model_used or 'DETERMINISTIC'} [{cls_r.model_execution_status or 'OK'}])"
-                            if cls_r else "—"
-                        ),
-                        "Verbatim Excerpt": ev.verbatim_excerpt,
-                    })
-
-                st.dataframe(
-                    pd.DataFrame(ev_table_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Source URL": st.column_config.LinkColumn("Source URL", display_text="Open Source URL"),
-                    },
-                )
-
-                with st.expander("Inspect Full Verbatim Excerpts, SHA-256 Hashes & E1–E14 Rule Audit", expanded=True):
-                    for ev in filtered_evs:
-                        we = weight_by_id.get(ev.evidence_id)
-                        cls_r = cls_by_id.get(ev.evidence_id)
-                        erules_str = ", ".join(we.fired_e_rule_ids if we else ev.e_rule_ids)
-                        gates_str = ", ".join(gates_for_evidence(e2e_rep, ev.evidence_id)) or "None"
-                        hostile_badge = " · **HOSTILE PROMPT INJECTION ISOLATED (E14)**" if ev.hostile_instruction_detected else ""
-                        st.markdown(
-                            f"**`{ev.evidence_id}`** · Source **`{ev.source_class}`** (Grade `{ev.source_reliability_grade}`) · "
-                            f"Retrieved: `{ev.retrieved_at}` · Scope: `{ev.scope.value}` · "
-                            f"Strength: **`{we.evidence_strength.value if we else ev.evidence_strength.value}`** · "
-                            f"E-Rules: `{erules_str}` · Gates: `{gates_str}`{hostile_badge}\n\n"
-                            f"- **Source URL:** [{ev.canonical_url}]({ev.canonical_url})  |  "
-                            f"**SHA-256:** `{ev.content_sha256}`  |  **Offsets:** `{ev.char_start}:{ev.char_end}`\n"
-                            f"- **Verbatim Excerpt:** *\"{ev.verbatim_excerpt}\"*"
-                        )
-                        if cls_r:
-                            st.caption(
-                                f"Level 6 Classification: `{cls_r.signal_category.value}` | Method: `{cls_r.classification_method.value}` | "
-                                f"Model: `{cls_r.model_used or 'DETERMINISTIC'}` [`{cls_r.model_execution_status or 'DETERMINISTIC_ONLY'}`] — {cls_r.rationale}"
-                            )
-                        st.divider()
-
-            with st.expander(f"Level 3B Candidate-URL Triage Log ({len(e2e_rep.url_triage_decisions)} URLs)", expanded=False):
-                if not e2e_rep.url_triage_decisions:
-                    st.caption("No candidate URLs queued for triage in this run.")
-                else:
-                    t_rows = [
-                        {
-                            "Candidate ID": td.candidate_id,
-                            "Action": getattr(td.action, "value", str(td.action)),
-                            "Source Class": td.candidate_source_class,
-                            "Scope Relevance": getattr(td.product_scope_relevance, "value", str(td.product_scope_relevance)),
-                            "Target Gates": ", ".join(td.target_gates),
-                            "Confidence": td.confidence,
-                            "Method": getattr(td.decision_method, "value", str(td.decision_method)),
-                            "Model Used": td.model_used or "DETERMINISTIC",
-                            "Model Status": td.model_execution_status or "DETERMINISTIC_ONLY",
-                            "URL": td.url,
-                            "Rationale": td.rationale,
-                        }
-                        for td in e2e_rep.url_triage_decisions
-                    ]
-                    st.dataframe(
-                        pd.DataFrame(t_rows),
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={"URL": st.column_config.LinkColumn("URL")},
-                    )
-
-            with st.expander("Level 5 Semantic Filtering & RAG Chunking Summary", expanded=False):
-                rag_s = e2e_rep.semantic_retrieval
                 st.markdown(
-                    f"- **Status:** `{rag_s.status}` | **Embedding Model:** `{rag_s.model_name}` (Available: `{rag_s.model_available}`)\n"
-                    f"- **Chunk Size:** `{rag_s.chunk_size_tokens}` tokens (`{rag_s.chunk_overlap_tokens}` token overlap)\n"
-                    f"- **Chunks Created:** `{rag_s.chunks_created}` | **Chunks Embedded:** `{rag_s.chunks_embedded}` | **Concept Matches:** `{len(rag_s.matches)}`"
+                    f"""
+                    <div class="uc-table-wrap">
+                        <table class="uc-table">
+                            <thead>
+                                <tr><th>Risk Rule</th><th>Severity</th><th>Surfaced Exposure</th></tr>
+                            </thead>
+                            <tbody>{"".join(rf_html)}</tbody>
+                        </table>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                for lim in rag_s.limitations:
-                    st.caption(f"Note: {lim}")
 
-        # ── SUB-TAB 5: RISK FINDINGS (R1–R8) & RECOMMENDED FOLLOW-UP ACTIONS (LEVELS 8–9) ──
-        with res_tab5:
-            st.markdown("##### Level 8 AI Security Risk Findings (`R1–R8`) & Recommended Follow-Up Actions")
-            st.caption(
-                "Rule-determined fields (Rule ID, Severity, Exposure Determination, Supporting Evidence IDs, Verbatim Quotes, and Remediation) "
-                "are strictly deterministic. Optional Model B (`mistral:latest`) narrative explanations are separated below and validated against cited evidence."
+        # O1-O5 Override summary table
+        ov_rows_html = []
+        for ov in sel_crit.overrides_evaluated:
+            trig_badge = _status_badge("Triggered", "critical") if ov.triggered else _status_badge("Not Triggered", "neutral")
+            ov_rows_html.append(
+                f"<tr>"
+                f"<td><span class='uc-mono'>{html.escape(ov.override_id)}</span></td>"
+                f"<td>{trig_badge}</td>"
+                f"<td>{html.escape(str(ov.resulting_floor or '—'))}</td>"
+                f"<td>{html.escape(ov.rationale)}</td>"
+                f"</tr>"
             )
-            if not e2e_rep.risk_findings:
-                st.info("No R1–R8 AI risk findings triggered for this assessment run.")
-            else:
-                rf_c1, rf_c2 = st.columns(2)
-                all_sev = sorted({rf.severity.value for rf in e2e_rep.risk_findings})
-                all_det = sorted({rf.exposure_determination.value for rf in e2e_rep.risk_findings})
-                with rf_c1:
-                    flt_sev = st.multiselect("Filter by Severity", options=all_sev, default=[], key=f"rf_flt_sev_{cache_key}")
-                with rf_c2:
-                    flt_det = st.multiselect("Filter by Exposure Determination", options=all_det, default=[], key=f"rf_flt_det_{cache_key}")
-
-                shown_rfs = [
-                    rf for rf in e2e_rep.risk_findings
-                    if (not flt_sev or rf.severity.value in flt_sev)
-                    and (not flt_det or rf.exposure_determination.value in flt_det)
-                ]
-
-                for rf in shown_rfs:
-                    llm_status_str = rf.model_execution_status or "DETERMINISTIC_ONLY"
-                    is_llm_fallback = rf.summary_method != "LOCAL_LLM_VALIDATED"
-                    st.markdown(
-                        f"""
-                        <div class="factor-card">
-                            <div style="display:flex;justify-content:space-between;align-items:center">
-                                <strong>[{rf.risk_rule_id}] {rf.risk_title} (<code>{rf.finding_id}</code>)</strong>
-                                <span>
-                                    Rule Severity: <strong><code>{rf.severity.value}</code></strong> &nbsp;·&nbsp;
-                                    Rule Exposure: <code>{rf.exposure_determination.value}</code> &nbsp;·&nbsp;
-                                    Confidence: <code>{rf.confidence}</code>
-                                </span>
-                            </div>
-                            <div style="font-size:0.76rem;color:#0f172a;margin-top:0.35rem">
-                                <strong>Deterministic Rule Finding:</strong> {rf.finding_description}
-                            </div>
-                            <div style="font-size:0.73rem;color:#334155;margin-top:0.25rem">
-                                <strong>Supporting Evidence IDs:</strong> <code>{', '.join(rf.evidence_ids)}</code> &nbsp;|&nbsp;
-                                <strong>Fired E-Rules:</strong> <code>{', '.join(rf.fired_e_rules) or 'None'}</code> &nbsp;|&nbsp;
-                                <strong>Gates:</strong> <code>{', '.join(rf.fired_gate_rules) or 'None'}</code>
-                            </div>
-                            <div style="font-size:0.73rem;color:#1e293b;background:#f8fafc;border-left:3px solid {'#0284c7' if not is_llm_fallback else '#64748b'};padding:0.4rem 0.6rem;border-radius:4px;margin-top:0.35rem">
-                                <strong>Analyst Explanation (Method: <code>{rf.summary_method}</code> · Model: <code>{rf.model_used or 'DETERMINISTIC'}</code> [<code>{llm_status_str}</code>]):</strong><br>
-                                {rf.analyst_explanation or rf.finding_description}
-                            </div>
-                            <div style="font-size:0.74rem;color:#0f172a;margin-top:0.35rem">
-                                <strong>Recommended Follow-Up / Remediation Action:</strong> {rf.recommended_remediation}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-            st.markdown("##### Level 9 Deterministic Risk Rating (`Risk Score = M_c * sum(S_i * W_i)`)")
-            drs = e2e_rep.deterministic_risk_score
+        with st.expander("View O1–O5 Governance Override Evaluation", expanded=False):
             st.markdown(
-                f"- **Policy Readiness Status:** **`{drs.policy_status.value}`** (Policy Version: `{drs.policy_version}`)\n"
-                f"- **Calculation Formula:** `{drs.calculation_method}`\n"
-                f"- **Vendor Criticality Tier (`M_c`):** `{drs.criticality_tier}` (Multiplier: `{drs.criticality_multiplier if drs.criticality_multiplier is not None else 'UNCONFIGURED'}`)\n"
-                f"- **Distinct Findings Evaluated:** `{drs.distinct_findings_scored}` (`{drs.duplicates_suppressed}` duplicate exposure(s) suppressed)\n"
-                f"- **Final Numerical Risk Score:** **`{drs.final_risk_score if drs.final_risk_score is not None else 'None (SCORING_POLICY_UNCONFIGURED)'}`** | **Overall Rating:** `{drs.overall_risk_rating or 'UNCONFIGURED'}`\n"
-                f"- **Status Explanation:** {drs.status_message}"
+                f"""
+                <div class="uc-table-wrap">
+                    <table class="uc-table">
+                        <thead>
+                            <tr><th>Rule</th><th>Status</th><th>Resulting Tier</th><th>Evaluation Rationale</th></tr>
+                        </thead>
+                        <tbody>{"".join(ov_rows_html)}</tbody>
+                    </table>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            if drs.finding_breakdowns:
-                bd_rows = [
-                    {
-                        "Finding ID": b.finding_id,
-                        "Rule": b.risk_rule_id,
-                        "Deduplication Key": b.dedup_exposure_key,
-                        "Severity": b.severity_label,
-                        "S_i (Numeric)": b.severity_numeric if b.severity_numeric is not None else "UNCONFIGURED",
-                        "W_i (Weight)": b.evidentiary_weight if b.evidentiary_weight is not None else "UNCONFIGURED",
-                        "S_i * W_i": b.weighted_contribution if b.weighted_contribution is not None else "UNCONFIGURED",
-                        "Primary (Not Duplicate)": "YES" if b.is_deduplicated_primary else "NO (Suppressed)",
-                        "Evidence IDs": ", ".join(b.source_evidence_ids),
-                    }
-                    for b in drs.finding_breakdowns
-                ]
-                st.dataframe(pd.DataFrame(bd_rows), use_container_width=True, hide_index=True)
 
-        # ── SUB-TAB 6: STAGE AUDIT, TELEMETRY, HUMAN VALIDATION & CLEAN EXPORTS ──
-        with res_tab6:
-            st.markdown("##### Clean Assessment Report & Evidence Exports")
-            st.caption(
-                "Export the complete assessment report or filtered evidence register. Exports include run ID, timestamp, "
-                "provenance hashes, stage statuses, and human-validation records, and never include API keys or secrets."
+
+# ─── Page 2: Assessment Workspace (Setup -> Execution -> Results) ─────────────
+
+
+def _render_assessments_page(readiness: SystemReadinessReport) -> None:
+    vendors_by_id: dict[str, MeridianVendor] = st.session_state["vendors_by_id"]
+    reports_by_id: dict[str, VendorEndToEndAssessmentReport] = st.session_state["reports_by_vendor"]
+
+    st.markdown(
+        """
+        <div class="uc-page-header">
+            <div>
+                <h1 class="uc-page-title">Vendor AI-Risk Assessment Workspace</h1>
+                <p class="uc-page-desc">Configure vendor scope and criticality inputs, execute bounded OSINT reconnaissance and evidence extraction, and validate G1–G4 gates and R1–R8 risk findings.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── AREA A: ASSESSMENT SETUP ──
+    st.markdown(
+        """
+        <div class="uc-section-header">
+            <div>
+                <h2 class="uc-section-title">A. Assessment Setup &amp; Scope Configuration</h2>
+                <p class="uc-section-subtitle">Select an existing portfolio vendor or enter a new third-party vendor. Unknown inputs are preserved explicitly as UNKNOWN for analyst review.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    setup_col1, setup_col2 = st.columns([1.3, 1.7], gap="medium")
+    with setup_col1:
+        source_mode = st.radio(
+            "Vendor Input Source",
+            options=["Portfolio Vendor", "New / Custom Vendor"],
+            horizontal=True,
+            key="assess_vendor_source_mode",
+        )
+        all_vids = sorted(vendors_by_id.keys())
+        cur_vid = st.session_state.get("selected_vendor_id", all_vids[0])
+        if cur_vid not in vendors_by_id:
+            cur_vid = all_vids[0]
+
+        if source_mode == "Portfolio Vendor":
+            chosen_vid = st.selectbox(
+                "Select Portfolio Vendor",
+                options=all_vids,
+                index=all_vids.index(cur_vid),
+                format_func=lambda vid: f"{vid} — {vendors_by_id[vid].vendor_name}",
+                key="assess_portfolio_vendor_select",
             )
-            dl_c1, dl_c2, dl_c3, dl_c4 = st.columns(4)
-            with dl_c1:
-                st.download_button(
-                    "Download Assessment JSON (.json)",
-                    data=AssessmentReportExporter.to_json(e2e_rep),
-                    file_name=f"Meridian_Assessment_{e2e_rep.vendor_id}_{e2e_rep.report_id}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                    key=f"dl_json_{cache_key}",
-                )
-            with dl_c2:
-                st.download_button(
-                    "Download Evidence CSV (.csv)",
-                    data=AssessmentReportExporter.to_evidence_csv(e2e_rep),
-                    file_name=f"Meridian_Evidence_{e2e_rep.vendor_id}_{e2e_rep.report_id}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key=f"dl_csv_{cache_key}",
-                )
-            with dl_c3:
-                st.download_button(
-                    "Download Markdown Report (.md)",
-                    data=AssessmentReportExporter.to_markdown(e2e_rep),
-                    file_name=f"Meridian_Report_{e2e_rep.vendor_id}_{e2e_rep.report_id}.md",
-                    mime="text/markdown",
-                    use_container_width=True,
-                    key=f"dl_md_{cache_key}",
-                )
-            with dl_c4:
-                st.download_button(
-                    "Download HTML Report (.html)",
-                    data=AssessmentReportExporter.to_html(e2e_rep),
-                    file_name=f"Meridian_Report_{e2e_rep.vendor_id}_{e2e_rep.report_id}.html",
-                    mime="text/html",
-                    use_container_width=True,
-                    key=f"dl_html_{cache_key}",
+            st.session_state["selected_vendor_id"] = chosen_vid
+            base_v = vendors_by_id[chosen_vid]
+        else:
+            base_v = MeridianVendor(
+                vendor_id="V-007",
+                vendor_name="",
+                domain="",
+                category="Enterprise SaaS",
+                service_product_provided="UNKNOWN",
+                business_process_supported="UNKNOWN",
+                data_classification_accessed="UNKNOWN",
+                operational_dependency="UNKNOWN",
+                data_volume_annual="UNKNOWN",
+                is_sole_source=False,
+            )
+
+        exec_mode_choice = st.selectbox(
+            "Assessment Execution Mode",
+            options=[
+                "Live OSINT Assessment (Serper Search + Direct HTTP / ScraperAPI)",
+                "Sample Assessment (Pre-Collected Demonstration Fixtures)",
+            ],
+            index=0 if readiness.external_research_ready else 1,
+            key="assess_execution_mode_select",
+        )
+        is_sample_mode = exec_mode_choice.startswith("Sample")
+
+        use_local_ai = st.checkbox(
+            "Enable Local AI Model Routing (llama3.2:latest URL triage + mistral:latest classification/summaries)",
+            value=False,
+            key="assess_enable_local_ai",
+        )
+
+    with setup_col2:
+        c1, c2, c3 = st.columns([1.0, 1.4, 1.4], gap="small")
+        in_vid = c1.text_input("Vendor ID", value=base_v.vendor_id, key=f"in_vid_{source_mode}_{base_v.vendor_id}")
+        in_name = c2.text_input("Vendor Legal / Display Name", value=base_v.vendor_name, key=f"in_name_{source_mode}_{base_v.vendor_id}")
+        in_dom = c3.text_input("Primary Domain", value=base_v.domain or "", placeholder="e.g. fiserv.com", key=f"in_dom_{source_mode}_{base_v.vendor_id}")
+
+        c4, c5 = st.columns(2, gap="small")
+        in_srv = c4.text_input(
+            "Service Meridian Purchases",
+            value=base_v.service_product_provided or "UNKNOWN",
+            key=f"in_srv_{source_mode}_{base_v.vendor_id}",
+        )
+        in_bp = c5.text_input(
+            "Business Process Supported",
+            value=base_v.business_process_supported or "UNKNOWN",
+            key=f"in_bp_{source_mode}_{base_v.vendor_id}",
+        )
+
+        c6, c7, c8, c9 = st.columns([1.2, 1.2, 1.2, 0.9], gap="small")
+        in_dc = c6.text_input(
+            "Data Classification (D)",
+            value=base_v.data_classification_accessed or "UNKNOWN",
+            key=f"in_dc_{source_mode}_{base_v.vendor_id}",
+        )
+        in_od = c7.text_input(
+            "Operational Dependency (O)",
+            value=base_v.operational_dependency or "UNKNOWN",
+            key=f"in_od_{source_mode}_{base_v.vendor_id}",
+        )
+        in_dv = c8.text_input(
+            "Annual Data Volume (V)",
+            value=base_v.data_volume_annual or "UNKNOWN",
+            key=f"in_dv_{source_mode}_{base_v.vendor_id}",
+        )
+        in_sole = c9.checkbox(
+            "Sole Source",
+            value=bool(getattr(base_v, "is_sole_source", False)),
+            key=f"in_sole_{source_mode}_{base_v.vendor_id}",
+        )
+
+    validated_vendor, val_errors, val_warnings = validate_vendor_assessment_input(
+        vendor_id=in_vid,
+        vendor_name=in_name,
+        domain=in_dom,
+        category=base_v.category,
+        vendor_description=base_v.vendor_description,
+        service_product_provided=in_srv,
+        business_process_supported=in_bp,
+        data_classification_accessed=in_dc,
+        operational_dependency=in_od,
+        data_volume_annual=in_dv,
+        is_sole_source=in_sole,
+    )
+
+    if val_errors:
+        for err in val_errors:
+            st.markdown(f'<div class="uc-callout uc-callout-danger"><strong>Validation Error:</strong> {html.escape(err)}</div>', unsafe_allow_html=True)
+    elif val_warnings:
+        st.markdown(
+            f'<div class="uc-callout uc-callout-warn"><strong>Input Governance Notice:</strong> {html.escape(" | ".join(val_warnings))}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── AREA B: EXECUTION ──
+    st.markdown(
+        """
+        <div class="uc-section-header">
+            <div>
+                <h2 class="uc-section-title">B. Assessment Execution &amp; Pipeline Controls</h2>
+                <p class="uc-section-subtitle">Execute all nine assessment stages in sequence with real-time stage telemetry and source-integrity verification.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not is_sample_mode and not readiness.external_research_ready:
+        st.markdown(
+            f"""
+            <div class="uc-callout uc-callout-warn">
+                <strong>Live Search Credentials Not Configured:</strong> {html.escape(readiness.search_status_message)}
+                Running a Live OSINT Assessment without search credentials will execute Levels 1–2 and mark Level 3 as
+                <code>BLOCKED BY CONFIG</code> and the AI-use determination as <code>INCOMPLETE_ASSESSMENT</code>.
+                To evaluate a full end-to-end walkthrough offline, select <strong>Sample Assessment</strong> above.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    exec_col1, exec_col2, exec_col3 = st.columns([1.5, 1.5, 2.0], gap="small")
+    primary_label = (
+        f"Run Sample Assessment ({in_vid or 'Vendor'})"
+        if is_sample_mode
+        else f"Run Live OSINT Assessment ({in_vid or 'Vendor'})"
+    )
+    run_clicked = exec_col1.button(
+        primary_label,
+        key="btn_execute_assessment_primary",
+        type="primary",
+        disabled=validated_vendor is None,
+        use_container_width=True,
+    )
+
+    alt_sample_clicked = False
+    if not is_sample_mode:
+        alt_sample_clicked = exec_col2.button(
+            "Load Sample Walkthrough Instead",
+            key="btn_execute_assessment_sample_alt",
+            type="secondary",
+            disabled=validated_vendor is None,
+            use_container_width=True,
+        )
+
+    progress_container = st.empty()
+    status_container = st.empty()
+
+    if (run_clicked or alt_sample_clicked) and validated_vendor is not None:
+        target_mode = "SAMPLE" if (is_sample_mode or alt_sample_clicked) else "LIVE"
+        prog_bar = progress_container.progress(0, text="Initializing 9-level assessment pipeline...")
+
+        def _on_stage(lvl_num: int, stage_title: str, detail: str) -> None:
+            pct = min(100, int((lvl_num / 9.0) * 100))
+            prog_bar.progress(pct, text=f"{stage_title} — {detail}")
+
+        report = _execute_vendor_assessment(
+            validated_vendor,
+            mode=target_mode,
+            enable_local_llm=use_local_ai,
+            human_crit_override=st.session_state["human_crit_overrides"].get(validated_vendor.vendor_id),
+            progress_callback=_on_stage,
+        )
+        prog_bar.progress(100, text=f"Assessment {report.report_id} completed.")
+        status_container.markdown(
+            f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
+            f'Report <code>{html.escape(report.report_id)}</code> generated for <strong>{html.escape(report.legal_entity)}</strong>.</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── AREA C: RESULTS ──
+    active_vid = validated_vendor.vendor_id if validated_vendor else st.session_state.get("selected_vendor_id", "V-002")
+    active_report = reports_by_id.get(active_vid)
+
+    st.markdown(
+        """
+        <div class="uc-section-header">
+            <div>
+                <h2 class="uc-section-title">C. Assessment Results &amp; Analyst Governance</h2>
+                <p class="uc-section-subtitle">Executive determination, G1–G4 evidentiary gates, E1–E14 evidence register, R1–R8 risk findings, and analyst sign-off.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if active_report is None:
+        st.markdown(
+            f"""
+            <div class="uc-empty-state">
+                <div class="uc-empty-title">No Assessment Results Available for {html.escape(active_vid)}</div>
+                <div class="uc-empty-desc">Click <strong>{html.escape(primary_label)}</strong> above to execute the assessment workflow and populate results, evidence, and risk findings.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Mode banner (Sample vs Live)
+    if active_report.is_synthetic_evidence_run:
+        st.markdown(
+            """
+            <div class="uc-callout uc-callout-warn">
+                <strong>Sample Assessment Mode (Pre-Collected Demonstration Fixtures):</strong>
+                This report was generated using deterministic sample fixtures to demonstrate the nine-level workflow.
+                It is labeled as synthetic sample data and is never counted as a completed live vendor assessment.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif active_report.ai_use_verdict.verdict.value == "INCOMPLETE_ASSESSMENT":
+        st.markdown(
+            f"""
+            <div class="uc-callout uc-callout-danger">
+                <strong>Incomplete Live Assessment:</strong>
+                {html.escape(active_report.ai_use_verdict.basis_summary)}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    crit_sum = active_report.criticality_summary or {}
+    ds = active_report.deterministic_risk_score
+    pos_gates = sum(1 for g in active_report.gates if g.status == "QUALIFYING_POSITIVE_EVIDENCE")
+
+    st.markdown(
+        f"""
+        <div class="uc-kv-grid">
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Effective Criticality Tier</div>
+                <div class="uc-kv-val">{_tier_badge(str(crit_sum.get("final_criticality", "Unknown")))} (Base: {html.escape(str(crit_sum.get("base_score", "N/A")))})</div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">AI-Use Verdict &amp; Scope</div>
+                <div class="uc-kv-val">{_verdict_badge(active_report.ai_use_verdict.verdict.value)}<div style="font-size:0.75rem;color:#64748B;margin-top:3px;">Scope: {html.escape(format_plain_status(active_report.determined_scope))}</div></div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Evidentiary Gates (G1–G4)</div>
+                <div class="uc-kv-val">{pos_gates} / 4 Positive Gates<div style="font-size:0.75rem;color:#64748B;margin-top:3px;">{len(active_report.evidence_records)} captured excerpt(s)</div></div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Surfaced Risk Findings (R1–R8)</div>
+                <div class="uc-kv-val">{len(active_report.risk_findings)} finding(s)<div style="font-size:0.75rem;color:#64748B;margin-top:3px;">Supply Chain: {html.escape(format_plain_status(active_report.supply_chain_identity_status))}</div></div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Deterministic Risk Rating</div>
+                <div class="uc-kv-val">{_status_badge(format_plain_status(ds.policy_status), "neutral")}<div style="font-size:0.75rem;color:#64748B;margin-top:3px;">Policy: {html.escape(ds.policy_status.value)}</div></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    res_tabs = st.tabs([
+        "Executive Summary & Gates (G1–G4)",
+        "Criticality Result (D/P/R/O/V)",
+        f"Evidence Register ({len(active_report.evidence_records)})",
+        f"Risk Findings ({len(active_report.risk_findings)}) & Open Questions",
+        "Human Review & Exports",
+    ])
+
+    # Tab 1: Executive Summary & Gates
+    with res_tabs[0]:
+        st.markdown(
+            f"""
+            <div class="uc-callout uc-callout-info">
+                <strong>AI-Use Verdict Statement:</strong> {html.escape(active_report.ai_use_verdict.verdict_statement)}<br/>
+                <strong>Analytical Basis:</strong> {html.escape(active_report.ai_use_verdict.basis_summary)}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        gate_rows = []
+        for g in active_report.gates:
+            g_var = (
+                "critical"
+                if g.status == "QUALIFYING_POSITIVE_EVIDENCE"
+                else "success"
+                if g.status == "QUALIFYING_NEGATIVE_EVIDENCE"
+                else "high"
+            )
+            gate_rows.append(
+                f"<tr>"
+                f"<td><span class='uc-mono'>{html.escape(g.gate_id)}</span></td>"
+                f"<td><strong>{html.escape(g.title)}</strong><div style='font-size:0.76rem;color:#64748B;'>{html.escape(g.question)}</div></td>"
+                f"<td>{_status_badge(format_plain_status(g.status), g_var)}</td>"
+                f"<td><span class='uc-mono'>{html.escape(', '.join(g.supporting_evidence_ids) or 'None')}</span></td>"
+                f"<td>{html.escape(g.rationale)}</td>"
+                f"</tr>"
+            )
+        st.markdown(
+            f"""
+            <div class="uc-table-wrap">
+                <table class="uc-table">
+                    <thead>
+                        <tr><th>Gate</th><th>Gate Question</th><th>Determination</th><th>Evidence IDs</th><th>Rationale</th></tr>
+                    </thead>
+                    <tbody>{"".join(gate_rows)}</tbody>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Tab 2: Criticality Result
+    with res_tabs[1]:
+        factors = crit_sum.get("factors", {})
+        f_rows = []
+        for fk in ("D", "P", "R", "O", "V"):
+            fd = factors.get(fk, {})
+            f_rows.append(
+                f"<tr>"
+                f"<td><strong>{html.escape(fk)}</strong></td>"
+                f"<td><span class='uc-mono'>{html.escape(str(fd.get('score', 'UNKNOWN')))}</span></td>"
+                f"<td><span class='uc-mono'>{html.escape(str(fd.get('weight', '')))}</span></td>"
+                f"<td><span class='uc-mono'>{html.escape(str(fd.get('weighted_contribution', '')))}</span></td>"
+                f"<td>{html.escape(format_plain_status(fd.get('determination_method', '')))}</td>"
+                f"<td>{html.escape(str(fd.get('rationale', '')))}</td>"
+                f"</tr>"
+            )
+        st.markdown(
+            f"""
+            <div class="uc-table-wrap">
+                <table class="uc-table">
+                    <thead>
+                        <tr><th>Factor</th><th>Score</th><th>Weight</th><th>Weighted</th><th>Method</th><th>Rationale</th></tr>
+                    </thead>
+                    <tbody>{"".join(f_rows)}</tbody>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Tab 3: Evidence Register
+    with res_tabs[2]:
+        mismatched = [
+            d for d in active_report.extracted_documents
+            if d.extraction_status == ExtractionStatus.SOURCE_IDENTITY_MISMATCH
+        ]
+        if mismatched:
+            for m_doc in mismatched:
+                st.markdown(
+                    f"""
+                    <div class="uc-callout uc-callout-danger">
+                        <strong>Source-Identity Mismatch Rejected ({html.escape(m_doc.document_id)}):</strong>
+                        Requested URL <code>{html.escape(m_doc.requested_url or m_doc.url)}</code> returned page identity
+                        <code>{html.escape(m_doc.declared_og_url or m_doc.declared_canonical_url or m_doc.title or "Unknown")}</code>.
+                        Document was marked <code>SOURCE_IDENTITY_MISMATCH</code> and excluded from vendor evidence.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
 
-            st.divider()
-            st.markdown("##### Dual-Model Routing & 6 GB VRAM Lifecycle Telemetry")
-            if e2e_rep.model_routing_telemetry:
-                tel = e2e_rep.model_routing_telemetry
-                assignments = tel.get("model_assignments", {})
-                vram_info = tel.get("vram_management", {})
-                tasks_tel = tel.get("tasks", {})
-                tel_rows = []
-                for t_key, t_label in [
-                    ("URL_TRIAGE", "Level 3B: Candidate-URL Triage (Model A)"),
-                    ("RAG_EMBEDDING", "Level 5: Semantic Chunk Embedding (Separate Model)"),
-                    ("EVIDENCE_CLASSIFICATION", "Level 6: Signal Classification (Model B)"),
-                    ("RISK_SUMMARIZATION", "Level 8: Risk Finding Summarization (Model B)"),
-                ]:
-                    td = tasks_tel.get(t_key, {})
-                    tel_rows.append({
-                        "Pipeline Task": t_label,
-                        "Assigned Model": assignments.get(t_key, "N/A"),
-                        "Overall Status": td.get("overall_status", "NOT_CALLED"),
-                        "Calls Total": td.get("calls_total", 0),
-                        "Calls Succeeded": td.get("calls_succeeded", 0),
-                        "Total Latency (ms)": td.get("total_latency_ms", 0.0),
-                        "Errors / Fallback Notes": "; ".join(td.get("errors", [])) or "None",
-                    })
-                st.dataframe(pd.DataFrame(tel_rows), use_container_width=True, hide_index=True)
-                unload_evts = vram_info.get("vram_unload_events", [])
-                st.caption(
-                    f"Ollama Endpoint: `{tel.get('ollama_endpoint')}` | Enabled: `{tel.get('ollama_enabled')}` | "
-                    f"Sequential VRAM Unload (`keep_alive=0`): `{vram_info.get('unload_on_model_switch')}` "
-                    f"({len(unload_evts)} unload event(s) recorded in this run)."
+        if not active_report.evidence_records:
+            st.markdown(
+                """
+                <div class="uc-empty-state">
+                    <div class="uc-empty-title">No Evidence Records Captured</div>
+                    <div class="uc-empty-desc">No public web or PDF evidence records were captured during this assessment run.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            w_map = {w.evidence_id: w for w in active_report.weighted_evidence}
+            ev_rows = []
+            for ev in active_report.evidence_records:
+                we = w_map.get(ev.evidence_id)
+                st_str = we.evidence_strength.value if we else ev.evidence_strength.value
+                erules = ", ".join(we.fired_e_rule_ids if we else ev.e_rule_ids)
+                sup_g = ", ".join(gates_for_evidence(active_report, ev.evidence_id))
+                ev_rows.append(
+                    f"<tr>"
+                    f"<td><span class='uc-mono'>{html.escape(ev.evidence_id)}</span></td>"
+                    f"<td><span class='uc-mono'>{html.escape(ev.source_class)}</span> (Grade {html.escape(ev.source_reliability_grade)})</td>"
+                    f"<td>{html.escape(format_plain_status(st_str))}</td>"
+                    f"<td><span class='uc-mono'>{html.escape(erules or '—')}</span></td>"
+                    f"<td><span class='uc-mono'>{html.escape(sup_g or '—')}</span></td>"
+                    f"<td><span class='uc-mono'>{html.escape(ev.retrieval_method)}</span></td>"
+                    f"<td><a href='{html.escape(ev.canonical_url)}' target='_blank'>{html.escape(ev.canonical_url)}</a>"
+                    f"<div style='margin-top:4px;color:#1E293B;'><em>\"{html.escape(ev.verbatim_excerpt)}\"</em></div>"
+                    f"<div style='font-size:0.72rem;color:#64748B;margin-top:2px;'>SHA-256: <code>{html.escape(ev.content_sha256[:16])}...</code> | Integrity: {html.escape(ev.source_integrity_status)}</div></td>"
+                    f"</tr>"
                 )
+            st.markdown(
+                f"""
+                <div class="uc-table-wrap">
+                    <table class="uc-table">
+                        <thead>
+                            <tr><th>ID</th><th>Source</th><th>Strength</th><th>E-Rules</th><th>Gates</th><th>Method</th><th>URL &amp; Verbatim Excerpt</th></tr>
+                        </thead>
+                        <tbody>{"".join(ev_rows)}</tbody>
+                    </table>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-            st.divider()
-            st.markdown("##### Human Validation & Governance Sign-Off")
-            if e2e_rep.human_Review_required:
-                st.warning(
-                    "Human validation is required before final governance sign-off: "
-                    + " | ".join(e2e_rep.human_review_triggers)
+    # Tab 4: Risk Findings & Unresolved Questions
+    with res_tabs[3]:
+        if not active_report.risk_findings:
+            st.markdown(
+                """
+                <div class="uc-empty-state">
+                    <div class="uc-empty-title">No R1–R8 AI Security Risk Findings Surfaced</div>
+                    <div class="uc-empty-desc">No evidence-backed R1–R8 risk findings were triggered for this run.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            rf_rows = []
+            for rf in active_report.risk_findings:
+                rf_rows.append(
+                    f"<tr>"
+                    f"<td><strong>{html.escape(rf.risk_rule_id)}</strong>: {html.escape(rf.risk_title)}<div style='font-size:0.74rem;color:#64748B;'>ID: {html.escape(rf.finding_id)}</div></td>"
+                    f"<td>{_severity_badge(rf.severity.value)}<div style='font-size:0.74rem;color:#64748B;margin-top:3px;'>{html.escape(format_plain_status(rf.exposure_determination))}</div></td>"
+                    f"<td>{html.escape(rf.finding_description)}<div style='font-size:0.75rem;color:#475569;margin-top:4px;'>Evidence: <code>{html.escape(', '.join(rf.evidence_ids))}</code></div></td>"
+                    f"<td>{html.escape(rf.recommended_remediation)}</td>"
+                    f"</tr>"
                 )
-            hv_f1, hv_f2 = st.columns([5, 5], gap="large")
-            with hv_f1:
-                hv_reviewer = st.text_input("Reviewer Name / Role", value="Primary TPRM Analyst", key=f"hv_rev_{cache_key}")
-                hv_target_type = st.selectbox(
-                    "Validation Target Type",
-                    options=["VERDICT", "GATE", "RISK_FINDING", "CRITICALITY_O5"],
-                    key=f"hv_ttype_{cache_key}",
-                )
-                hv_decision = st.selectbox(
-                    "Validation Decision",
-                    options=["CONFIRM_ASSESSMENT", "OVERRIDE_AI_VERDICT", "ACCEPT_WITH_CONDITIONS"],
-                    key=f"hv_dec_{cache_key}",
-                )
-            with hv_f2:
-                hv_verdict = st.selectbox(
-                    "Updated Status / Verdict",
-                    options=["YES", "INCONCLUSIVE", "NO", "INCOMPLETE_ASSESSMENT"],
-                    index=0,
-                    key=f"hv_verd_{cache_key}",
-                )
-                hv_rat = st.text_area(
-                    "Mandatory Written Rationale",
-                    placeholder="Document evidence review, compensating controls, and validation rationale...",
-                    key=f"hv_rat_{cache_key}",
-                )
-                if st.button("Record Human Validation Decision", type="primary", key=f"btn_save_hv_{cache_key}", use_container_width=True):
-                    try:
-                        val_rec = HumanValidationService.create_validation_record(
-                            vendor_id=e2e_rep.vendor_id,
-                            target_type=hv_target_type,
-                            target_id="AI_USE_VERDICT" if hv_target_type == "VERDICT" else hv_target_type,
-                            proposed_automated_finding=verdict_val,
-                            human_decision=hv_decision,
-                            rationale=hv_rat,
-                            original_status=verdict_val,
-                            updated_status=hv_verdict if hv_decision != "CONFIRM_ASSESSMENT" else verdict_val,
-                            reviewer_id=hv_reviewer,
-                        )
-                        e2e_rep.human_validations.append(val_rec)
-                        st.success(f"Recorded human validation `{val_rec.validation_id}`.")
-                        st.rerun()
-                    except ValueError as err:
-                        st.error(str(err))
+            st.markdown(
+                f"""
+                <div class="uc-table-wrap">
+                    <table class="uc-table">
+                        <thead>
+                            <tr><th>Risk Rule</th><th>Severity &amp; Exposure</th><th>Deterministic Finding &amp; Evidence</th><th>Recommended Follow-Up</th></tr>
+                        </thead>
+                        <tbody>{"".join(rf_rows)}</tbody>
+                    </table>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-            if e2e_rep.human_validations:
-                st.markdown("**Logged Human Validation Records:**")
-                hv_rows = [
-                    {
-                        "Validation ID": hv.validation_id,
-                        "Target": f"{hv.target_type}:{hv.target_id}",
-                        "Decision": hv.human_decision,
-                        "Original Status": hv.original_status,
-                        "Updated Status": hv.updated_status,
-                        "Reviewer": hv.reviewer_id,
-                        "Reviewed At (UTC)": hv.reviewed_at,
-                        "Rationale": hv.rationale,
-                    }
-                    for hv in e2e_rep.human_validations
-                ]
-                st.dataframe(pd.DataFrame(hv_rows), use_container_width=True, hide_index=True)
+        if active_report.unresolved_questions:
+            q_items = "".join(f"<li>{html.escape(q)}</li>" for q in active_report.unresolved_questions)
+            st.markdown(
+                f"""
+                <div class="uc-callout uc-callout-warn">
+                    <strong>Unresolved Diligence Questions ({len(active_report.unresolved_questions)}):</strong>
+                    <ul style="margin:6px 0 0 18px;padding:0;">{q_items}</ul>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # Tab 5: Human Review & Exports
+    with res_tabs[4]:
+        rev_col, exp_col = st.columns([1.3, 1.0], gap="medium")
+        with rev_col:
+            st.markdown("#### Log Analyst Governance Validation / Override")
+            target_type = st.selectbox(
+                "Validation Target Type",
+                options=["VERDICT", "GATE", "RISK_FINDING", "CRITICALITY_O5"],
+                key="hval_target_type",
+            )
+            target_id = st.text_input("Target ID (e.g. G2, R1, VERDICT, O5)", value="VERDICT", key="hval_target_id")
+            decision = st.selectbox(
+                "Analyst Decision",
+                options=["ACCEPTED_AS_PROPOSED", "OVERRIDDEN_BY_ANALYST", "ESCALATED_FOR_VENDOR_DILIGENCE"],
+                key="hval_decision",
+            )
+            reviewer_id = st.text_input("Reviewer Name / Role", value="Senior TPRM Analyst", key="hval_reviewer")
+            rationale_txt = st.text_area(
+                "Written Governance Rationale (Required)",
+                placeholder="Document the evidentiary basis for accepting, overriding, or escalating this determination...",
+                key="hval_rationale",
+            )
+            if st.button("Record Analyst Sign-Off", key="btn_record_hval", type="primary"):
+                if not rationale_txt.strip():
+                    st.error("A written rationale is required to record an analyst validation decision.")
+                else:
+                    rec = HumanValidationService.create_validation_record(
+                        vendor_id=active_report.vendor_id,
+                        target_type=target_type,
+                        target_id=target_id,
+                        proposed_automated_finding=active_report.ai_use_verdict.verdict.value,
+                        human_decision=decision,
+                        rationale=rationale_txt,
+                        original_status="PROPOSED",
+                        updated_status=decision,
+                        reviewer_id=reviewer_id,
+                    )
+                    active_report.human_validations.append(rec)
+                    st.session_state["evidence_repo"].save_human_validation(rec)
+                    st.session_state["evidence_repo"].save_vendor_report(active_report)
+                    st.success(f"Recorded validation {rec.validation_id}.")
+
+        with exp_col:
+            st.markdown("#### Export Assessment Package")
+            st.download_button(
+                "Download Executive HTML Dossier (.html)",
+                data=AssessmentReportExporter.to_html(active_report),
+                file_name=f"{active_report.vendor_id}_{active_report.report_id}.html",
+                mime="text/html",
+                use_container_width=True,
+                key="dl_assess_html",
+            )
+            st.download_button(
+                "Download Markdown Assessment Report (.md)",
+                data=AssessmentReportExporter.to_markdown(active_report),
+                file_name=f"{active_report.vendor_id}_{active_report.report_id}.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key="dl_assess_md",
+            )
+            st.download_button(
+                "Download Point-of-Capture Evidence CSV (.csv)",
+                data=AssessmentReportExporter.to_evidence_csv(active_report),
+                file_name=f"{active_report.vendor_id}_evidence.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_assess_csv",
+            )
+            st.download_button(
+                "Download Full Audit JSON (.json)",
+                data=AssessmentReportExporter.to_json(active_report),
+                file_name=f"{active_report.vendor_id}_{active_report.report_id}.json",
+                mime="application/json",
+                use_container_width=True,
+                key="dl_assess_json",
+            )
+
+    # Single compact expandable 9-Level Stage Execution Ledger (Levels 1-9)
+    tracker_rows = build_nine_level_stage_tracker(active_report)
+    with st.expander("Audit Trail: Nine-Level Assessment Execution Ledger (Canonical Levels 1–9)", expanded=False):
+        ledger_html: list[str] = []
+        for r in tracker_rows:
+            st_variant = (
+                "success"
+                if r.status == "COMPLETED"
+                else "high"
+                if r.status in ("REQUIRES_REVIEW", "PARTIAL", "NOT_CONFIGURED")
+                else "neutral"
+            )
+            ledger_html.append(
+                f"<tr>"
+                f"<td><strong>{html.escape(r.level_label)}</strong></td>"
+                f"<td><strong>{html.escape(r.level_name)}</strong></td>"
+                f"<td>{_status_badge(r.badge_label, st_variant)}</td>"
+                f"<td>{html.escape(r.analyst_method)}</td>"
+                f"<td><span class='uc-mono'>{html.escape(r.analyst_counts)}</span></td>"
+                f"<td>{html.escape(r.analyst_summary)}</td>"
+                f"</tr>"
+            )
+            for sub in r.substeps:
+                ledger_html.append(
+                    f"<tr style='background:#F8FAFC;'>"
+                    f"<td style='padding-left:24px;color:#475569;'>↳ <em>{html.escape(sub['substep_id'])}</em></td>"
+                    f"<td style='color:#475569;'><em>{html.escape(sub['substep_name'])}</em></td>"
+                    f"<td><span class='uc-mono'>{html.escape(sub['status'])}</span></td>"
+                    f"<td>—</td>"
+                    f"<td>—</td>"
+                    f"<td style='color:#475569;'>{html.escape(sub['detail'])}</td>"
+                    f"</tr>"
+                )
+        st.markdown(
+            f"""
+            <div class="uc-table-wrap">
+                <table class="uc-table">
+                    <thead>
+                        <tr><th>Level</th><th>Canonical Framework Stage</th><th>Execution Status</th><th>Method</th><th>Volume</th><th>Stage Outcome</th></tr>
+                    </thead>
+                    <tbody>{"".join(ledger_html)}</tbody>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
+# ─── Page 3: Evidence Workbench ───────────────────────────────────────────────
 
+
+def _render_evidence_page() -> None:
+    vendors_by_id: dict[str, MeridianVendor] = st.session_state["vendors_by_id"]
+    reports_by_id: dict[str, VendorEndToEndAssessmentReport] = st.session_state["reports_by_vendor"]
+
+    st.markdown(
+        """
+        <div class="uc-page-header">
+            <div>
+                <h1 class="uc-page-title">Point-of-Capture Evidence Workbench</h1>
+                <p class="uc-page-desc">Filter and inspect verbatim evidence excerpts, cryptographic SHA-256 capture hashes, retrieval provenance (Direct HTTP vs ScraperAPI), source-integrity verification, and E1–E14 rule weightings.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    all_vids = sorted(vendors_by_id.keys())
+    cur_vid = st.session_state.get("selected_vendor_id", all_vids[0])
+
+    f1, f2, f3, f4, f5 = st.columns([1.6, 1.1, 1.2, 1.1, 1.2], gap="small")
+    vendor_choice = f1.selectbox(
+        "Filter by Vendor",
+        options=["All Assessed Vendors"] + all_vids,
+        index=(all_vids.index(cur_vid) + 1) if cur_vid in reports_by_id else 0,
+        format_func=lambda x: x if x == "All Assessed Vendors" else f"{x} — {vendors_by_id[x].vendor_name}",
+        key="ev_wb_vendor_filter",
+    )
+    if vendor_choice != "All Assessed Vendors":
+        st.session_state["selected_vendor_id"] = vendor_choice
+
+    source_options = ["All Sources"] + [f"S{i}" for i in range(1, 13)]
+    source_filter = f2.selectbox("Source Class", options=source_options, key="ev_wb_source_filter")
+
+    strength_options = [
+        "All Strengths",
+        "CONFIRMED",
+        "STRONG",
+        "INDICATIVE",
+        "MARKETING",
+        "DISCARDED_HOSTILE",
+        "REQUIRES_REVIEW",
+    ]
+    strength_filter = f3.selectbox("Evidence Strength", options=strength_options, key="ev_wb_strength_filter")
+
+    gate_options = ["All Gates", "G1", "G2", "G3", "G4"]
+    gate_filter = f4.selectbox("Supported Gate", options=gate_options, key="ev_wb_gate_filter")
+
+    method_options = ["All Methods", "DIRECT_HTTP", "SCRAPERAPI", "SYNTHETIC_SAMPLE"]
+    method_filter = f5.selectbox("Retrieval Method", options=method_options, key="ev_wb_method_filter")
+
+    # Collect matching evidence items across selected vendor(s)
+    target_reports = (
+        [reports_by_id[vendor_choice]]
+        if vendor_choice != "All Assessed Vendors" and vendor_choice in reports_by_id
+        else list(reports_by_id.values())
+    )
+
+    matching_items: list[tuple[VendorEndToEndAssessmentReport, Any, Any, list[str]]] = []
+    rejected_docs: list[tuple[str, Any]] = []
+
+    for rpt in target_reports:
+        w_map = {w.evidence_id: w for w in rpt.weighted_evidence}
+        for doc in rpt.extracted_documents:
+            if doc.extraction_status == ExtractionStatus.SOURCE_IDENTITY_MISMATCH:
+                rejected_docs.append((rpt.legal_entity, doc))
+        for ev in rpt.evidence_records:
+            we = w_map.get(ev.evidence_id)
+            eff_strength = we.evidence_strength.value if we else ev.evidence_strength.value
+            sup_gates = gates_for_evidence(rpt, ev.evidence_id)
+
+            if source_filter != "All Sources" and ev.source_class != source_filter:
+                continue
+            if strength_filter != "All Strengths" and eff_strength != strength_filter:
+                continue
+            if gate_filter != "All Gates" and gate_filter not in sup_gates:
+                continue
+            if method_filter != "All Methods" and ev.retrieval_method != method_filter:
+                continue
+
+            matching_items.append((rpt, ev, we, sup_gates))
+
+    if rejected_docs:
+        for v_name, r_doc in rejected_docs:
+            st.markdown(
+                f"""
+                <div class="uc-callout uc-callout-danger">
+                    <strong>Rejected Upstream Document ({html.escape(v_name)} · {html.escape(r_doc.document_id)}):</strong>
+                    Requested <code>{html.escape(r_doc.requested_url or r_doc.url)}</code> via <code>{html.escape(r_doc.retrieval_method)}</code>,
+                    but received identity metadata for <code>{html.escape(r_doc.declared_og_url or r_doc.declared_canonical_url or r_doc.title or "unrelated site")}</code>.
+                    Status: <code>SOURCE_IDENTITY_MISMATCH</code> (blocked from evidence register).
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    if not matching_items:
+        target_vid = vendor_choice if vendor_choice != "All Assessed Vendors" else cur_vid
+        st.markdown(
+            f"""
+            <div class="uc-empty-state">
+                <div class="uc-empty-title">No Captured Evidence Records Match Current Selection</div>
+                <div class="uc-empty-desc">
+                    Run a Live OSINT Assessment or load a Sample Walkthrough for <strong>{html.escape(vendors_by_id[target_vid].vendor_name)}</strong>
+                    to populate point-of-capture evidence excerpts, SHA-256 hashes, and E1–E14 rule evaluations.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        c1, c2, _ = st.columns([1.4, 1.4, 2.2], gap="small")
+        if c1.button(f"Load Sample Evidence for {target_vid}", key="btn_ev_load_sample", type="primary", use_container_width=True):
+            _execute_vendor_assessment(vendors_by_id[target_vid], mode="SAMPLE", enable_local_llm=False)
+            st.rerun()
+        if c2.button("Go to Assessment Workspace", key="btn_ev_go_assess", type="secondary", use_container_width=True):
+            _navigate_to("Assessments", target_vid)
+            st.rerun()
+        return
+
+    # Render Evidence Workbench Table
+    ev_table_rows = []
+    for rpt, ev, we, sup_gates in matching_items:
+        eff_strength = we.evidence_strength.value if we else ev.evidence_strength.value
+        w_band = we.weight_band.value if we else "LOW"
+        erules = ", ".join(we.fired_e_rule_ids if we else ev.e_rule_ids)
+        origin_badge = (
+            _status_badge("Sample Fixture", "purple")
+            if ev.is_synthetic_test_fixture
+            else _status_badge(ev.retrieval_method, "success")
+        )
+        ev_table_rows.append(
+            f"<tr>"
+            f"<td><span class='uc-mono'>{html.escape(ev.evidence_id)}</span><div style='font-size:0.74rem;color:#64748B;'>{html.escape(ev.legal_entity)}</div></td>"
+            f"<td><span class='uc-mono'>{html.escape(ev.source_class)}</span> (Grade {html.escape(ev.source_reliability_grade)})</td>"
+            f"<td>{_status_badge(format_plain_status(eff_strength), 'medium')} <span class='uc-mono'>{html.escape(w_band)}</span></td>"
+            f"<td>{html.escape(format_plain_status(ev.scope))}</td>"
+            f"<td><span class='uc-mono'>{html.escape(erules or '—')}</span></td>"
+            f"<td><span class='uc-mono'>{html.escape(', '.join(sup_gates) or '—')}</span></td>"
+            f"<td>{origin_badge}<div style='font-size:0.72rem;color:#64748B;margin-top:2px;'>{html.escape(ev.source_integrity_status)}</div></td>"
+            f"<td><a href='{html.escape(ev.canonical_url)}' target='_blank'>{html.escape(ev.canonical_url)}</a>"
+            f"<div style='margin-top:3px;'><em>\"{html.escape(ev.verbatim_excerpt)}\"</em></div></td>"
+            f"</tr>"
+        )
+
+    st.markdown(
+        f"""
+        <div class="uc-table-wrap">
+            <table class="uc-table">
+                <thead>
+                    <tr>
+                        <th>Evidence ID</th>
+                        <th>Source</th>
+                        <th>Strength &amp; Weight</th>
+                        <th>Product Scope</th>
+                        <th>E-Rules</th>
+                        <th>Gates</th>
+                        <th>Retrieval &amp; Integrity</th>
+                        <th>Canonical URL &amp; Full Verbatim Excerpt</th>
+                    </tr>
+                </thead>
+                <tbody>{"".join(ev_table_rows)}</tbody>
+            </table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Detailed Point-of-Capture Inspector
+    st.markdown(
+        """
+        <div class="uc-section-header" style="margin-top:16px;">
+            <div>
+                <h3 class="uc-section-title">Point-of-Capture Provenance &amp; E1–E14 Rule Inspector</h3>
+                <p class="uc-section-subtitle">Select any captured evidence item to inspect its full cryptographic provenance, character offsets, and rule-by-rule evaluation.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    ev_options = [f"{ev.evidence_id} — {ev.legal_entity} ({ev.source_class}: {ev.page_title or ev.canonical_url})" for _, ev, _, _ in matching_items]
+    sel_idx = st.selectbox(
+        "Select Evidence Record to Inspect",
+        options=list(range(len(ev_options))),
+        format_func=lambda i: ev_options[i],
+        key="ev_wb_detail_selector",
+    )
+    sel_rpt, sel_ev, sel_we, sel_gates = matching_items[sel_idx]
+
+    st.markdown(
+        f"""
+        <div class="uc-kv-grid">
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Requested URL</div>
+                <div class="uc-kv-val"><span class="uc-mono">{html.escape(sel_ev.original_url)}</span></div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Final Response URL</div>
+                <div class="uc-kv-val"><span class="uc-mono">{html.escape(sel_ev.final_url or sel_ev.canonical_url)}</span></div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Retrieval Method &amp; Integrity</div>
+                <div class="uc-kv-val"><span class="uc-mono">{html.escape(sel_ev.retrieval_method)}</span> · {html.escape(sel_ev.source_integrity_status)}</div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Captured At (UTC)</div>
+                <div class="uc-kv-val"><span class="uc-mono">{html.escape(_format_short_date(sel_ev.retrieved_at))}</span></div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">SHA-256 Content Digest</div>
+                <div class="uc-kv-val"><span class="uc-mono">{html.escape(sel_ev.content_sha256[:24])}...</span></div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Character Offsets / Page</div>
+                <div class="uc-kv-val"><span class="uc-mono">chars {sel_ev.char_start}..{sel_ev.char_end}</span> (Page: {sel_ev.page_number or "Web"})</div>
+            </div>
+        </div>
+        <div class="uc-callout uc-callout-info">
+            <strong>Full Verbatim Excerpt ({html.escape(sel_ev.section_heading or sel_ev.page_title or "Document Body")}):</strong><br/>
+            "{html.escape(sel_ev.verbatim_excerpt)}"
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if sel_we and sel_we.applied_e_rules:
+        er_html = []
+        for er in sel_we.applied_e_rules:
+            if er.triggered:
+                er_html.append(
+                    f"<tr>"
+                    f"<td><span class='uc-mono'>{html.escape(er.rule_id)}</span></td>"
+                    f"<td><strong>{html.escape(er.rule_name)}</strong></td>"
+                    f"<td>{_status_badge(er.resulting_strength.value if er.resulting_strength else 'APPLIED', 'medium')}</td>"
+                    f"<td>{html.escape(er.rationale)}</td>"
+                    f"</tr>"
+                )
+        if er_html:
+            st.markdown(
+                f"""
+                <div class="uc-table-wrap">
+                    <table class="uc-table">
+                        <thead>
+                            <tr><th>Rule ID</th><th>Evidentiary Rule Name</th><th>Resulting Disposition</th><th>Rule Evaluation Rationale</th></tr>
+                        </thead>
+                        <tbody>{"".join(er_html)}</tbody>
+                    </table>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+# ─── Page 4: Reports & Export Center ──────────────────────────────────────────
+
+
+def _render_reports_page() -> None:
+    vendors_by_id: dict[str, MeridianVendor] = st.session_state["vendors_by_id"]
+    reports_by_id: dict[str, VendorEndToEndAssessmentReport] = st.session_state["reports_by_vendor"]
+
+    st.markdown(
+        """
+        <div class="uc-page-header">
+            <div>
+                <h1 class="uc-page-title">Vendor Assessment Dossier &amp; Export Center</h1>
+                <p class="uc-page-desc">Review the complete, executive-ready third-party AI risk dossier and export auditable artifacts in HTML, Markdown, CSV, or JSON format.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    all_vids = sorted(vendors_by_id.keys())
+    cur_vid = st.session_state.get("selected_vendor_id", all_vids[0])
+    if cur_vid not in vendors_by_id:
+        cur_vid = all_vids[0]
+
+    sel_col, dl1, dl2, dl3, dl4 = st.columns([2.2, 1.0, 1.0, 1.0, 1.0], gap="small")
+    chosen_vid = sel_col.selectbox(
+        "Select Vendor Dossier",
+        options=all_vids,
+        index=all_vids.index(cur_vid),
+        format_func=lambda vid: f"{vid} — {vendors_by_id[vid].vendor_name}",
+        key="reports_vendor_selector",
+    )
+    st.session_state["selected_vendor_id"] = chosen_vid
+    report = reports_by_id.get(chosen_vid)
+
+    if report is None:
+        st.markdown(
+            f"""
+            <div class="uc-empty-state">
+                <div class="uc-empty-title">No Assessment Dossier Generated for {html.escape(vendors_by_id[chosen_vid].vendor_name)}</div>
+                <div class="uc-empty-desc">Execute a Live OSINT Assessment or Sample Walkthrough to generate a complete vendor risk dossier and enable exports.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        b1, b2, _ = st.columns([1.4, 1.4, 2.2], gap="small")
+        if b1.button(f"Open Assessment Workspace ({chosen_vid})", key="btn_rpt_go_assess", type="primary", use_container_width=True):
+            _navigate_to("Assessments", chosen_vid)
+            st.rerun()
+        if b2.button(f"Generate Sample Dossier ({chosen_vid})", key="btn_rpt_gen_sample", type="secondary", use_container_width=True):
+            _execute_vendor_assessment(vendors_by_id[chosen_vid], mode="SAMPLE", enable_local_llm=False)
+            st.rerun()
+        return
+
+    st.write("")
+    dl1.download_button(
+        "Export HTML",
+        data=AssessmentReportExporter.to_html(report),
+        file_name=f"{report.vendor_id}_dossier.html",
+        mime="text/html",
+        use_container_width=True,
+        key="btn_rpt_dl_html",
+    )
+    dl2.download_button(
+        "Export Markdown",
+        data=AssessmentReportExporter.to_markdown(report),
+        file_name=f"{report.vendor_id}_dossier.md",
+        mime="text/markdown",
+        use_container_width=True,
+        key="btn_rpt_dl_md",
+    )
+    dl3.download_button(
+        "Evidence CSV",
+        data=AssessmentReportExporter.to_evidence_csv(report),
+        file_name=f"{report.vendor_id}_evidence.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="btn_rpt_dl_csv",
+    )
+    dl4.download_button(
+        "Audit JSON",
+        data=AssessmentReportExporter.to_json(report),
+        file_name=f"{report.vendor_id}_report.json",
+        mime="application/json",
+        use_container_width=True,
+        key="btn_rpt_dl_json",
+    )
+
+    if report.is_synthetic_evidence_run:
+        st.markdown(
+            """
+            <div class="uc-callout uc-callout-warn">
+                <strong>Dossier Origin — Sample Assessment (Synthetic Demonstration Fixtures):</strong>
+                This dossier was generated from pre-collected demonstration fixtures and does not represent live vendor evidence.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """
+            <div class="uc-callout uc-callout-info">
+                <strong>Dossier Origin — Live OSINT Assessment:</strong>
+                Generated from live public source reconnaissance and point-of-capture extraction.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    crit = report.criticality_summary or {}
+    osint = report.osint_plan_summary or {}
+    ds = report.deterministic_risk_score
+
+    st.markdown(
+        f"""
+        <div class="uc-section-header">
+            <div>
+                <h2 class="uc-section-title">1. Executive Summary — {html.escape(report.legal_entity)} ({html.escape(report.vendor_id)})</h2>
+                <p class="uc-section-subtitle">Report Run ID: {html.escape(report.report_id)} · Generated: {html.escape(_format_short_date(report.generated_at))}</p>
+            </div>
+        </div>
+        <div class="uc-kv-grid">
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Service Purchased by Meridian</div>
+                <div class="uc-kv-val">{html.escape(report.service_product_provided or "UNKNOWN")}</div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Business Process Supported</div>
+                <div class="uc-kv-val">{html.escape(report.business_process_supported or "UNKNOWN")}</div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Effective Criticality Tier</div>
+                <div class="uc-kv-val">{_tier_badge(str(crit.get("final_criticality", "Unknown")))} (Base: {html.escape(str(crit.get("base_score", "N/A")))})</div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">OSINT Depth Profile</div>
+                <div class="uc-kv-val">{html.escape(str(osint.get("selected_depth_profile", "N/A")))} (Completed: {"Yes" if report.ai_use_verdict.depth_completed else "No"})</div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">AI-Use Determination</div>
+                <div class="uc-kv-val">{_verdict_badge(report.ai_use_verdict.verdict.value)}</div>
+            </div>
+            <div class="uc-kv-box">
+                <div class="uc-kv-label">Level 9 Numerical Risk Rating</div>
+                <div class="uc-kv-val">{html.escape(format_plain_status(ds.policy_status))}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Section 2: G1-G4 Gates & Supply Chain Identity
+    st.markdown(
+        f"""
+        <div class="uc-section-header" style="margin-top:16px;">
+            <div>
+                <h2 class="uc-section-title">2. AI-Use Verdict, Supply-Chain Identity &amp; Gates (G1–G4)</h2>
+                <p class="uc-section-subtitle">Named Providers: {html.escape(', '.join(report.named_providers) or 'Undisclosed')} · Named Models: {html.escape(', '.join(report.named_models) or 'Undisclosed')} · Hosting: {html.escape(', '.join(report.hosting_infrastructures) or 'Undisclosed')}</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    gate_rows = []
+    for g in report.gates:
+        gate_rows.append(
+            f"<tr>"
+            f"<td><span class='uc-mono'>{html.escape(g.gate_id)}</span></td>"
+            f"<td><strong>{html.escape(g.title)}</strong></td>"
+            f"<td>{html.escape(format_plain_status(g.status))}</td>"
+            f"<td><span class='uc-mono'>{html.escape(', '.join(g.supporting_evidence_ids) or 'None')}</span></td>"
+            f"<td>{html.escape(g.rationale)}</td>"
+            f"</tr>"
+        )
+    st.markdown(
+        f"""
+        <div class="uc-table-wrap">
+            <table class="uc-table">
+                <thead>
+                    <tr><th>Gate</th><th>Gate Title</th><th>Status</th><th>Evidence IDs</th><th>Evaluation Rationale</th></tr>
+                </thead>
+                <tbody>{"".join(gate_rows)}</tbody>
+            </table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Section 3: R1-R8 Findings & Remediation
+    st.markdown(
+        """
+        <div class="uc-section-header" style="margin-top:16px;">
+            <div>
+                <h2 class="uc-section-title">3. AI Security &amp; Governance Risk Findings (R1–R8)</h2>
+                <p class="uc-section-subtitle">Evidence-backed risk exposures, analytical explanations, and recommended vendor follow-up actions.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if report.risk_findings:
+        rf_rows = []
+        for rf in report.risk_findings:
+            rf_rows.append(
+                f"<tr>"
+                f"<td><strong>{html.escape(rf.risk_rule_id)}</strong>: {html.escape(rf.risk_title)}</td>"
+                f"<td>{_severity_badge(rf.severity.value)}</td>"
+                f"<td>{html.escape(rf.finding_description)}<div style='font-size:0.75rem;color:#64748B;margin-top:3px;'>Evidence: <code>{html.escape(', '.join(rf.evidence_ids))}</code></div></td>"
+                f"<td>{html.escape(rf.analyst_explanation or rf.finding_description)}</td>"
+                f"<td>{html.escape(rf.recommended_remediation)}</td>"
+                f"</tr>"
+            )
+        st.markdown(
+            f"""
+            <div class="uc-table-wrap">
+                <table class="uc-table">
+                    <thead>
+                        <tr><th>Risk Rule</th><th>Severity</th><th>Surfaced Exposure</th><th>Analytical Summary</th><th>Recommended Follow-Up</th></tr>
+                    </thead>
+                    <tbody>{"".join(rf_rows)}</tbody>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown('<p style="font-size:0.85rem;color:#64748B;">No R1–R8 risk findings surfaced for this run.</p>', unsafe_allow_html=True)
+
+    # Section 4: Limitations, Unresolved Questions & Level 9 Policy Status
+    notices = format_analyst_unavailable_integrations(report, st.session_state.get("system_readiness"))
+    st.markdown(
+        f"""
+        <div class="uc-section-header" style="margin-top:16px;">
+            <div>
+                <h2 class="uc-section-title">4. Governance Limitations, Open Questions &amp; Scoring Policy</h2>
+            </div>
+        </div>
+        <div class="uc-callout uc-callout-info">
+            <strong>Level 9 Deterministic Risk Rating Policy ({html.escape(ds.policy_status.value)}):</strong><br/>
+            {html.escape(ds.status_message)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if notices or report.assessment_limitations:
+        lim_html = "".join(f"<li>{html.escape(item)}</li>" for item in (notices + list(report.assessment_limitations)))
+        st.markdown(f"<ul style='font-size:0.84rem;color:#334155;'>{lim_html}</ul>", unsafe_allow_html=True)
+
+
+# ─── Page 5: Settings & Technical Diagnostics ─────────────────────────────────
+
+
+def _render_settings_page(readiness: SystemReadinessReport) -> None:
+    st.markdown(
+        """
+        <div class="uc-page-header">
+            <div>
+                <h1 class="uc-page-title">System Settings &amp; Technical Diagnostics</h1>
+                <p class="uc-page-desc">Inspect OSINT search and retrieval adapters (Serper + ScraperAPI), source-integrity guardrails, local Ollama dual-model routing, Level 5 embeddings, and Level 9 scoring calibration.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col_a, col_b = st.columns(2, gap="medium")
+
+    with col_a:
+        serper_badge = _status_badge("Configured", "success") if readiness.search_configured else _status_badge("API Key Not Set", "high")
+        scraper_badge = _status_badge("Configured", "success") if readiness.scraperapi_configured else _status_badge("Optional Fallback Unconfigured", "neutral")
+
+        st.markdown(
+            f"""
+            <div class="uc-panel">
+                <div class="uc-section-header">
+                    <div>
+                        <h2 class="uc-section-title">1. OSINT Search &amp; Webpage Retrieval Pipeline</h2>
+                        <p class="uc-section-subtitle">Level 3 Search Discovery (Serper) &amp; Level 4 Retrieval (Direct HTTP + ScraperAPI Fallback)</p>
+                    </div>
+                </div>
+                <div class="uc-table-wrap">
+                    <table class="uc-table">
+                        <thead>
+                            <tr><th>Component</th><th>Status</th><th>Configuration &amp; Endpoint</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Serper Search Adapter</strong><div style="font-size:0.75rem;color:#64748B;">MERIDIAN_SERPER_API_KEY</div></td>
+                                <td>{serper_badge}</td>
+                                <td><code>https://google.serper.dev/search</code> (POST JSON)<div style="font-size:0.76rem;color:#475569;margin-top:2px;">{html.escape(readiness.search_status_message)}</div></td>
+                            </tr>
+                            <tr>
+                                <td><strong>Direct HTTP Fetcher</strong><div style="font-size:0.75rem;color:#64748B;">Primary Level 4 Fetch</div></td>
+                                <td>{_status_badge("Active (Primary)", "success")}</td>
+                                <td><code>UrllibPublicFetchAdapter</code> with SSRF/private-IP guard &amp; redirect tracking</td>
+                            </tr>
+                            <tr>
+                                <td><strong>ScraperAPI Retrieval Fallback</strong><div style="font-size:0.75rem;color:#64748B;">MERIDIAN_SCRAPERAPI_KEY</div></td>
+                                <td>{scraper_badge}</td>
+                                <td><code>https://api.scraperapi.com</code> (Max Concurrency: 5, JS Render: Off by default)<div style="font-size:0.76rem;color:#475569;margin-top:2px;">{html.escape(readiness.scraperapi_status_message)}</div></td>
+                            </tr>
+                            <tr>
+                                <td><strong>Source-Integrity Guard</strong><div style="font-size:0.75rem;color:#64748B;">Pre-Evidence Identity Check</div></td>
+                                <td>{_status_badge("Enforced", "success")}</td>
+                                <td>Validates requested URL vs. final URL, <code>rel="canonical"</code>, <code>og:url</code>, and page title; isolates <code>SOURCE_IDENTITY_MISMATCH</code> responses</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        rag_badge = _status_badge("Vector Retrieval Ready", "success") if readiness.semantic_retrieval_ready else _status_badge("Deterministic Passthrough", "neutral")
+        st.markdown(
+            f"""
+            <div class="uc-panel">
+                <div class="uc-section-header">
+                    <div>
+                        <h2 class="uc-section-title">3. Level 5 RAG Chunking &amp; Semantic Embeddings</h2>
+                        <p class="uc-section-subtitle">Separate embedding model configuration (never routed through generative Ollama models)</p>
+                    </div>
+                </div>
+                <div class="uc-kv-grid">
+                    <div class="uc-kv-box">
+                        <div class="uc-kv-label">Embedding Model</div>
+                        <div class="uc-kv-val"><span class="uc-mono">{html.escape(readiness.embedding_model_name)}</span></div>
+                    </div>
+                    <div class="uc-kv-box">
+                        <div class="uc-kv-label">Active Level 5 Mode</div>
+                        <div class="uc-kv-val">{rag_badge}</div>
+                    </div>
+                </div>
+                <p style="font-size:0.82rem;color:#475569;margin:0;">{html.escape(readiness.rag_status_message)}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col_b:
+        ollama_badge = _status_badge("Online", "success") if readiness.ollama_reachable else _status_badge("Unreachable", "high")
+        llama_badge = _status_badge("Installed", "success") if readiness.llama3_2_installed else _status_badge("Missing", "high")
+        mistral_badge = _status_badge("Installed", "success") if readiness.mistral_installed else _status_badge("Missing", "high")
+
+        st.markdown(
+            f"""
+            <div class="uc-panel">
+                <div class="uc-section-header">
+                    <div>
+                        <h2 class="uc-section-title">2. Local Ollama Server &amp; Dual-Model Routing</h2>
+                        <p class="uc-section-subtitle">6 GB VRAM sequential model lifecycle management</p>
+                    </div>
+                </div>
+                <div class="uc-table-wrap">
+                    <table class="uc-table">
+                        <thead>
+                            <tr><th>Model / Service</th><th>Status</th><th>Assigned Pipeline Role</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Ollama Endpoint</strong></td>
+                                <td>{ollama_badge}</td>
+                                <td><code>{html.escape(readiness.ollama_endpoint)}</code> — {html.escape(readiness.ollama_status_message)}</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Model A: <code>{html.escape(readiness.triage_model)}</code></strong></td>
+                                <td>{llama_badge}</td>
+                                <td>Level 3B Candidate-URL Triage (lightweight relevance &amp; source-class filtering)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Model B: <code>{html.escape(readiness.analysis_model)}</code></strong></td>
+                                <td>{mistral_badge}</td>
+                                <td>Level 6 Signal Classification &amp; Level 8 Grounded Risk Summarization</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Sequential VRAM Unload</strong></td>
+                                <td>{_status_badge("Enabled (keep_alive=0)" if readiness.unload_on_model_switch else "Disabled", "neutral")}</td>
+                                <td>Unloads Model A after Level 3B before loading Model B at Level 6</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f"""
+            <div class="uc-panel">
+                <div class="uc-section-header">
+                    <div>
+                        <h2 class="uc-section-title">4. Level 9 Risk-Scoring Policy &amp; Storage</h2>
+                        <p class="uc-section-subtitle">Deterministic formula readiness (Risk Score = M_c × Σ(S_i × W_i)) and local persistence</p>
+                    </div>
+                </div>
+                <div class="uc-callout uc-callout-warn">
+                    <strong>Policy Status ({html.escape(readiness.scoring_policy_status)}):</strong><br/>
+                    {html.escape(readiness.scoring_status_message)}
+                </div>
+                <div class="uc-kv-grid">
+                    <div class="uc-kv-box">
+                        <div class="uc-kv-label">Evidence SQLite Repository</div>
+                        <div class="uc-kv-val"><span class="uc-mono">{html.escape(str(_DEFAULT_DB_PATH))}</span></div>
+                    </div>
+                    <div class="uc-kv-box">
+                        <div class="uc-kv-label">Point-of-Capture Artifacts</div>
+                        <div class="uc-kv-val"><span class="uc-mono">{html.escape(str(_DEFAULT_ARTIFACT_DIR))}</span></div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# ─── Main Entrypoint ──────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    _inject_enterprise_styles()
+    _init_session_state()
+
+    readiness = SystemReadinessInspector.check_system_readiness()
+    st.session_state["system_readiness"] = readiness
+
+    active_page = _render_app_shell(readiness)
+
+    if active_page == "Portfolio":
+        _render_portfolio_page(readiness)
+    elif active_page == "Assessments":
+        _render_assessments_page(readiness)
+    elif active_page == "Evidence":
+        _render_evidence_page()
+    elif active_page == "Reports":
+        _render_reports_page()
+    elif active_page == "Settings":
+        _render_settings_page(readiness)
+
+
+if __name__ == "__main__":
+    main()

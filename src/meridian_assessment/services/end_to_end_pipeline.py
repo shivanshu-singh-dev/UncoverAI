@@ -219,42 +219,84 @@ class MeridianEndToEndPipeline:
         classification_llm_adapter: Optional[LocalLLMClassificationAdapter] = None,
         risk_summary_llm_adapter: Optional[RiskSummaryLLMProvider] = None,
         scoring_engine: Optional[DeterministicRiskScoringEngine] = None,
+        readiness: Optional[Any] = None,
     ) -> None:
         self.criticality_engine = criticality_engine or MeridianCriticalityEngine()
         self.investigation_planner = investigation_planner or OSINTInvestigationPlanner()
         self.search_backend = search_backend or build_search_backend_from_env()
+        self._local_llm_disable_reason: Optional[str] = None
 
         if model_router is not None:
             self.model_router = model_router
         else:
-            # In normal CLI/UI execution, load .env and enable dual-model routing if MERIDIAN_OLLAMA_ENABLED=true.
+            # In normal CLI/UI execution, load .env and enable dual-model routing if MERIDIAN_OLLAMA_ENABLED=true
+            # AND the local Ollama server and required models are reachable/installed.
             # When running inside pytest without an explicit model_router or enable_local_llm_from_env=True,
             # default to offline deterministic mode so unit tests remain fast and network-free.
             in_pytest = "PYTEST_CURRENT_TEST" in os.environ
             cfg = ModelRoutingConfig.from_env_and_config()
-            if enable_local_llm_from_env is True:
-                cfg.enabled = True
-            elif enable_local_llm_from_env is False or (enable_local_llm_from_env is None and in_pytest):
+            if enable_local_llm_from_env is False:
                 cfg.enabled = False
+                self._local_llm_disable_reason = (
+                    "Local AI analysis disabled for deterministic run; deterministic rules applied."
+                )
+            elif enable_local_llm_from_env is None and in_pytest:
+                cfg.enabled = False
+                self._local_llm_disable_reason = (
+                    "Local AI analysis bypassed in offline test mode; deterministic rules applied."
+                )
+            else:
+                if enable_local_llm_from_env is True:
+                    cfg.enabled = True
+                if cfg.enabled:
+                    if readiness is None and not in_pytest:
+                        from meridian_assessment.services.readiness_and_exports import (
+                            SystemReadinessInspector,
+                        )
+
+                        readiness = SystemReadinessInspector.check_system_readiness(
+                            local_analysis_override=enable_local_llm_from_env
+                        )
+                    if readiness is not None and not getattr(readiness, "ollama_reachable", False):
+                        cfg.enabled = False
+                        self._local_llm_disable_reason = (
+                            "Local analysis unavailable: local model service is unreachable."
+                        )
+                else:
+                    self._local_llm_disable_reason = (
+                        "Local analysis unavailable: disabled in configuration."
+                    )
             self.model_router = OllamaModelRouter(config=cfg)
+
+        llama_ok = True if readiness is None else bool(getattr(readiness, "llama3_2_installed", False))
+        mistral_ok = True if readiness is None else bool(getattr(readiness, "mistral_installed", False))
 
         if triage_llm_provider is not None:
             resolved_triage_llm: Optional[URLTriageLLMProvider] = triage_llm_provider
-        elif self.model_router.config.enabled:
+        elif self.model_router.config.enabled and llama_ok:
             resolved_triage_llm = OllamaURLTriageProvider(router=self.model_router)
         else:
             resolved_triage_llm = None
 
         if classification_llm_adapter is not None:
             resolved_cls_llm: Optional[LocalLLMClassificationAdapter] = classification_llm_adapter
-        elif self.model_router.config.enabled:
+        elif self.model_router.config.enabled and mistral_ok:
             resolved_cls_llm = OllamaClassificationAdapter(router=self.model_router)
         else:
-            resolved_cls_llm = None
+            if self.model_router.config.enabled and not mistral_ok:
+                cls_reason = (
+                    f"Local analysis unavailable: required analysis model "
+                    f"'{self.model_router.config.analysis_model}' is not installed."
+                )
+            elif self._local_llm_disable_reason:
+                cls_reason = self._local_llm_disable_reason
+            else:
+                cls_reason = "Local analysis unavailable: local model service is not configured."
+            resolved_cls_llm = UnconfiguredOllamaAdapter(reason=cls_reason)
 
         if risk_summary_llm_adapter is not None:
             resolved_sum_llm: Optional[RiskSummaryLLMProvider] = risk_summary_llm_adapter
-        elif self.model_router.config.enabled:
+        elif self.model_router.config.enabled and mistral_ok:
             resolved_sum_llm = OllamaRiskSummaryAdapter(router=self.model_router)
         else:
             resolved_sum_llm = None
@@ -523,12 +565,27 @@ class MeridianEndToEndPipeline:
             d.is_synthetic_fixture for d in extracted_docs
         )
 
+        mismatched_docs = [
+            d for d in extracted_docs if d.extraction_status == ExtractionStatus.SOURCE_IDENTITY_MISMATCH
+        ]
         l4_status = (
             "COMPLETED"
             if evidence_records or reviewed_no_evidence_sources
             else "NOT_CONFIGURED"
             if not fetch_ok
+            else "PARTIAL"
+            if mismatched_docs
             else "SKIPPED_NO_INPUT"
+        )
+        l4_limits: list[str] = []
+        for m_doc in mismatched_docs:
+            l4_limits.extend(m_doc.extraction_limitations)
+        if not evidence_records and not l4_limits:
+            l4_limits.append("No extracted evidence records present.")
+        mismatch_note = (
+            f" ({len(mismatched_docs)} rejected due to SOURCE_IDENTITY_MISMATCH)"
+            if mismatched_docs
+            else ""
         )
         stage_ledger.append(
             StageExecutionRecord(
@@ -536,10 +593,10 @@ class MeridianEndToEndPipeline:
                 level_name="Data Scraping & Point-of-Capture Traceability",
                 status=l4_status,
                 summary=(
-                    f"{len(extracted_docs)} documents processed; "
+                    f"{len(extracted_docs)} documents processed{mismatch_note}; "
                     f"{len(evidence_records)} traceable EvidenceRecord items created."
                 ),
-                limitations=[] if evidence_records else ["No extracted evidence records present."],
+                limitations=l4_limits,
                 selected_model="N/A",
                 model_task="DOCUMENT_EXTRACTION",
                 model_execution_status="DETERMINISTIC_ONLY",
@@ -851,6 +908,11 @@ class MeridianEndToEndPipeline:
             "depth_completed": ai_verdict.depth_completed,
         }
 
+        if mismatched_docs:
+            review_triggers.append(
+                f"Source-identity mismatch detected on {len(mismatched_docs)} fetched document(s); rejected from evidence register."
+            )
+
         report = VendorEndToEndAssessmentReport(
             report_id=f"RPT_{vendor.vendor_id}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
             generated_at=now_iso,
@@ -866,6 +928,7 @@ class MeridianEndToEndPipeline:
             osint_plan_summary=osint_summary,
             url_triage_decisions=triage_decisions,
             extracted_documents_count=len(extracted_docs),
+            extracted_documents=extracted_docs,
             evidence_records=evidence_records,
             semantic_retrieval=rag_summary,
             signal_classifications=classifications,

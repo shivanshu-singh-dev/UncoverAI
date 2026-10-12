@@ -55,6 +55,7 @@ from meridian_assessment.services.osint. investigation_planner import OSINTInves
 from meridian_assessment.services.osint.search_collector import (
     OSINTSearchCollector,
     SerpAPISearchBackend,
+    SerperSearchBackend,
     build_search_backend_from_env,
 )
 from meridian_assessment.services.osint.url_triage import (
@@ -80,12 +81,10 @@ def test_real_dotenv_file_exists_and_loads_expected_defaults() -> None:
     assert dotenv_path.is_file(), "Expected local .env file to exist in repository root"
 
     parsed = parse_dotenv_file(dotenv_path)
-    assert parsed["MERIDIAN_SEARCH_PROVIDER"] == "serpapi"
-    assert parsed["MERIDIAN_SERPAPI_KEY"] == ""
-    assert parsed["MERIDIAN_GOOGLE_API_KEY"] == ""
-    assert parsed["MERIDIAN_GOOGLE_CSE_ID"] == ""
-    assert parsed["MERIDIAN_BRAVE_API_KEY"] == ""
-    assert parsed["MERIDIAN_BING_API_KEY"] == ""
+    assert parsed["MERIDIAN_SEARCH_PROVIDER"] == "serper"
+    assert parsed["MERIDIAN_SERPER_API_KEY"] == ""
+    assert parsed["MERIDIAN_SCRAPERAPI_KEY"] == ""
+    assert "MERIDIAN_SERPAPI_KEY" not in parsed
 
     assert parsed["MERIDIAN_OLLAMA_ENABLED"].lower() == "true"
     assert parsed["MERIDIAN_OLLAMA_ENDPOINT"] == "http://localhost:11434"
@@ -107,19 +106,19 @@ def test_real_dotenv_file_exists_and_loads_expected_defaults() -> None:
     assert cfg.unload_on_model_switch is True
 
 
-# ─── 2. Default Search Provider (serpapi) & Blank Key Handling ───────────────
+# ─── 2. Default Search Provider (serper) & Blank Key Handling ───────────────
 
 
 def test_default_serpapi_provider_with_blank_key_degrades_cleanly() -> None:
-    """Verify MERIDIAN_SEARCH_PROVIDER=serpapi with blank MERIDIAN_SERPAPI_KEY marks queries UNAVAILABLE."""
+    """Verify MERIDIAN_SEARCH_PROVIDER=serper with blank MERIDIAN_SERPER_API_KEY marks queries UNAVAILABLE."""
     dotenv_vars = parse_dotenv_file(Path(".env"))
     backend = build_search_backend_from_env(env=dotenv_vars, load_dotenv=False)
-    assert isinstance(backend, SerpAPISearchBackend)
-    assert backend.provider_name == "serpapi"
+    assert isinstance(backend, SerperSearchBackend)
+    assert backend.provider_name == "serper"
 
     configured, reason = backend.is_configured()
     assert configured is False
-    assert "MERIDIAN_SERPAPI_KEY" in reason
+    assert "MERIDIAN_SERPER_API_KEY" in reason
 
     vendors = MeridianCSVVendorLoader().load(Path("data/input/meridian_vendors.csv"))
     planner = OSINTInvestigationPlanner()
@@ -128,7 +127,7 @@ def test_default_serpapi_provider_with_blank_key_degrades_cleanly() -> None:
     collector = OSINTSearchCollector(backend=backend, retry_backoff_seconds=0.0)
     collector.execute_planned_queries(plan, persist=False)
     assert all(q.execution_status == SearchExecutionStatus.UNAVAILABLE for q in plan.planned_queries)
-    assert all("MERIDIAN_SERPAPI_KEY" in (q.error_message or "") for q in plan.planned_queries)
+    assert all("MERIDIAN_SERPER_API_KEY" in (q.error_message or "") for q in plan.planned_queries)
 
 
 # ─── 3. Level 3B URL Triage Routed to llama3.2:latest ────────────────────────

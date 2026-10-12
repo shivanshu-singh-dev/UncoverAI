@@ -72,6 +72,7 @@ class ExtractionStatus(StrEnum):
     FETCH_FAILED = "FETCH_FAILED"
     TIMEOUT = "TIMEOUT"
     UNAVAILABLE = "UNAVAILABLE"
+    SOURCE_IDENTITY_MISMATCH = "SOURCE_IDENTITY_MISMATCH"
 
 
 class EvidenceScope(StrEnum):
@@ -110,6 +111,15 @@ class ExtractedDocument(BaseModel):
     vendor_id: str
     url: str
     canonical_url: str
+    requested_url: Optional[str] = None
+    final_response_url: Optional[str] = None
+    http_status: Optional[int] = None
+    redirect_chain: list[str] = Field(default_factory=list)
+    declared_canonical_url: Optional[str] = None
+    declared_og_url: Optional[str] = None
+    retrieval_method: str = "DIRECT_HTTP"
+    source_integrity_status: str = "VERIFIED"
+    source_integrity_warnings: list[str] = Field(default_factory=list)
     source_class: str
     content_type: str = "text/html"
     title: Optional[str] = None
@@ -137,6 +147,9 @@ class EvidenceRecord(BaseModel):
     source_class: str
     canonical_url: str
     original_url: str
+    final_url: Optional[str] = None
+    retrieval_method: str = "DIRECT_HTTP"
+    source_integrity_status: str = "VERIFIED"
     retrieved_at: str
     page_title: Optional[str] = None
     section_heading: Optional[str] = None
@@ -513,6 +526,7 @@ class VendorEndToEndAssessmentReport(BaseModel):
 
     # 4. Level 4: Extracted Documents & Evidence Records
     extracted_documents_count: int = 0
+    extracted_documents: list[ExtractedDocument] = Field(default_factory=list)
     evidence_records: list[EvidenceRecord] = Field(default_factory=list)
 
     # 5. Level 5: Semantic Filtering & RAG Chunking

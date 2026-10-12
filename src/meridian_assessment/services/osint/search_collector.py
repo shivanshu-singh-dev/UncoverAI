@@ -96,6 +96,13 @@ class SearchProviderError(SearchExecutionError):
         super().__init__(message, retryable=retryable)
 
 
+class SearchQuotaExhaustedError(SearchExecutionError):
+    """Raised when a search provider rejects a request due to exhausted credits or quota."""
+
+    def __init__(self, message: str = "Search provider credits or quota exhausted.") -> None:
+        super().__init__(message, retryable=False)
+
+
 # ─── Data Structures ──────────────────────────────────────────────────────────
 
 
@@ -220,10 +227,8 @@ class UnconfiguredSearchBackend(SearchBackend):
     def __init__(
         self,
         reason: str = (
-            "No search provider credentials configured. Set MERIDIAN_SEARCH_PROVIDER "
-            "and the corresponding API credentials (e.g. MERIDIAN_GOOGLE_API_KEY + "
-            "MERIDIAN_GOOGLE_CSE_ID, MERIDIAN_BRAVE_API_KEY, MERIDIAN_BING_API_KEY, "
-            "or MERIDIAN_SERPAPI_KEY)."
+            "No search provider credentials configured. Set MERIDIAN_SEARCH_PROVIDER=serper "
+            "and MERIDIAN_SERPER_API_KEY in .env."
         ),
         provider_name: str = "unconfigured",
     ) -> None:
@@ -346,6 +351,87 @@ def _execute_json_http_get(
 
     if not isinstance(data, dict):
         raise SearchProviderError("Search provider returned non-object JSON payload.", retryable=False)
+    return data
+
+
+def _is_quota_or_credit_error_body(body_text: str) -> bool:
+    """Return True if an HTTP error body indicates quota or credit exhaustion."""
+    lower = (body_text or "").lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "not enough credits",
+            "insufficient credits",
+            "credits exhausted",
+            "quota exceeded",
+            "quota exhausted",
+            "out of credits",
+            "billing",
+            "payment required",
+        )
+    )
+
+
+def _execute_json_http_post(
+    url: str,
+    *,
+    payload_body: dict[str, Any],
+    headers: Optional[dict[str, str]] = None,
+    timeout_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Perform a bounded HTTP POST with JSON payload returning parsed JSON or raising typed SearchExecutionError."""
+    encoded_body = json.dumps(payload_body).encode("utf-8")
+    req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=encoded_body, headers=req_headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            raw_bytes = resp.read()
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+
+        if _is_quota_or_credit_error_body(err_body) or exc.code == 402:
+            raise SearchQuotaExhaustedError(
+                f"Search provider credits or quota exhausted (HTTP {exc.code}: {exc.reason})."
+            ) from exc
+        if exc.code == 429:
+            raise SearchRateLimitError(f"HTTP 429 rate limit from search provider: {exc.reason}") from exc
+        if exc.code in (401, 403):
+            raise SearchConfigurationError(
+                f"Search provider authentication/authorization failed (HTTP {exc.code}: {exc.reason})."
+            ) from exc
+        if 500 <= exc.code < 600:
+            raise SearchProviderError(
+                f"Search provider server error (HTTP {exc.code}: {exc.reason}).",
+                retryable=True,
+            ) from exc
+        raise SearchProviderError(
+            f"Search provider request failed (HTTP {exc.code}: {exc.reason}).",
+            retryable=False,
+        ) from exc
+    except TimeoutError as exc:
+        raise SearchTimeoutError(f"Search request timed out after {timeout_seconds}s.") from exc
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), TimeoutError) or "timed out" in str(exc).lower():
+            raise SearchTimeoutError(f"Search request timed out after {timeout_seconds}s.") from exc
+        raise SearchProviderError(f"Network error contacting search provider: {exc.reason}", retryable=True) from exc
+
+    try:
+        data = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise SearchProviderError(f"Malformed JSON response from search provider: {exc}", retryable=False) from exc
+
+    if not isinstance(data, dict):
+        raise SearchProviderError("Search provider returned non-object JSON payload.", retryable=False)
+
+    err_msg = str(data.get("message") or data.get("error") or "")
+    if err_msg and _is_quota_or_credit_error_body(err_msg):
+        raise SearchQuotaExhaustedError(f"Search provider credits or quota exhausted: {err_msg}")
     return data
 
 
@@ -635,6 +721,113 @@ class SerpAPISearchBackend(SearchBackend):
         )
 
 
+class SerperSearchBackend(SearchBackend):
+    """Serper Google Search API backend (`https://google.serper.dev/search`)."""
+
+    provider_name = "serper"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        endpoint: str = "https://google.serper.dev/search",
+        enable_cache: bool = True,
+    ) -> None:
+        self.api_key = (api_key or "").strip()
+        self.endpoint = endpoint
+        self.enable_cache = enable_cache
+        self._cache: dict[tuple[str, int], SearchBackendResponse] = {}
+        self.telemetry: dict[str, int] = {
+            "requests_made": 0,
+            "cache_hits": 0,
+            "results_returned": 0,
+            "errors": 0,
+        }
+
+    def is_configured(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, "Serper search requires MERIDIAN_SERPER_API_KEY in .env."
+        return True, "Serper Search API configured."
+
+    def search(
+        self,
+        query: str,
+        *,
+        max_results: int = 10,
+        timeout_seconds: float = 10.0,
+    ) -> SearchBackendResponse:
+        ok, reason = self.is_configured()
+        if not ok:
+            raise SearchConfigurationError(reason)
+
+        normalized_query = " ".join((query or "").split())
+        num = max(1, min(int(max_results), 20))
+        cache_key = (normalized_query, num)
+
+        if self.enable_cache and cache_key in self._cache:
+            self.telemetry["cache_hits"] += 1
+            cached = self._cache[cache_key]
+            return SearchBackendResponse(
+                provider=cached.provider,
+                executed_query=query,
+                executed_at=cached.executed_at,
+                results=list(cached.results),
+            )
+
+        self.telemetry["requests_made"] += 1
+        try:
+            payload = _execute_json_http_post(
+                self.endpoint,
+                payload_body={"q": normalized_query, "num": num},
+                headers={
+                    "X-API-KEY": self.api_key,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception:
+            self.telemetry["errors"] += 1
+            raise
+
+        now_iso = _utc_now_iso()
+        raw_items = payload.get("organic", payload.get("organic_results", []))
+        if raw_items is None:
+            raw_items = []
+        if not isinstance(raw_items, list):
+            self.telemetry["errors"] += 1
+            raise SearchProviderError("Malformed 'organic' field in Serper response.", retryable=False)
+
+        results: list[SearchResultItem] = []
+        for idx, item in enumerate(raw_items[:max_results], start=1):
+            if not isinstance(item, dict):
+                continue
+            link = item.get("link") or item.get("url")
+            if not link or not isinstance(link, str):
+                continue
+            rank_val = item.get("position")
+            rank_int = int(rank_val) if isinstance(rank_val, int) and rank_val > 0 else idx
+            results.append(
+                SearchResultItem(
+                    url=link,
+                    title=item.get("title"),
+                    snippet=item.get("snippet"),
+                    rank=rank_int,
+                    retrieved_at=now_iso,
+                )
+            )
+
+        self.telemetry["results_returned"] += len(results)
+        resp = SearchBackendResponse(
+            provider=self.provider_name,
+            executed_query=query,
+            executed_at=now_iso,
+            results=results,
+        )
+        if self.enable_cache:
+            self._cache[cache_key] = resp
+        return resp
+
+
 def build_search_backend_from_env(
     provider: Optional[str] = None,
     *,
@@ -653,10 +846,11 @@ def build_search_backend_from_env(
         environ = env
     selected = (provider or environ.get("MERIDIAN_SEARCH_PROVIDER", "")).strip().lower()
 
-
     # Auto-detect if MERIDIAN_SEARCH_PROVIDER was not explicitly set
     if not selected:
-        if environ.get("MERIDIAN_GOOGLE_API_KEY") and environ.get("MERIDIAN_GOOGLE_CSE_ID"):
+        if environ.get("MERIDIAN_SERPER_API_KEY"):
+            selected = "serper"
+        elif environ.get("MERIDIAN_GOOGLE_API_KEY") and environ.get("MERIDIAN_GOOGLE_CSE_ID"):
             selected = "google_cse"
         elif environ.get("MERIDIAN_BRAVE_API_KEY"):
             selected = "brave"
@@ -665,6 +859,8 @@ def build_search_backend_from_env(
         elif environ.get("MERIDIAN_SERPAPI_KEY"):
             selected = "serpapi"
 
+    if selected in ("serper", "serper_dev"):
+        return SerperSearchBackend(api_key=environ.get("MERIDIAN_SERPER_API_KEY"))
     if selected in ("google_cse", "google"):
         return GoogleCSESearchBackend(
             api_key=environ.get("MERIDIAN_GOOGLE_API_KEY"),
@@ -674,7 +870,7 @@ def build_search_backend_from_env(
         return BraveSearchBackend(api_key=environ.get("MERIDIAN_BRAVE_API_KEY"))
     if selected == "bing":
         return BingSearchBackend(api_key=environ.get("MERIDIAN_BING_API_KEY"))
-    if selected == "serpapi":
+    if selected in ("serpapi", "serperapi"):
         return SerpAPISearchBackend(api_key=environ.get("MERIDIAN_SERPAPI_KEY"))
 
     if selected and selected not in ("none", "unconfigured"):
@@ -735,6 +931,7 @@ class OSINTSearchCollector:
             else int(exec_cfg.get("max_queries_per_run", 50))
         )
         self._sleep_fn = sleep_fn
+        self._halt_network_reason: Optional[tuple[SearchExecutionStatus, str]] = None
 
         canon_cfg = self._cfg.get("canonicalization", {})
         raw_strip = canon_cfg.get("strip_tracking_params")
@@ -759,6 +956,10 @@ class OSINTSearchCollector:
         query: PlannedQuery,
     ) -> tuple[SearchExecutionStatus, Optional[SearchBackendResponse], int, Optional[str]]:
         """Execute a single PlannedQuery with bounded retries for transient failures."""
+        if self._halt_network_reason is not None:
+            halt_status, halt_msg = self._halt_network_reason
+            return (halt_status, None, 0, halt_msg)
+
         configured, config_msg = self.backend.is_configured()
         if not configured:
             return (
@@ -786,7 +987,11 @@ class OSINTSearchCollector:
                     raise SearchProviderError("Search backend response 'results' must be a list.")
                 return SearchExecutionStatus.EXECUTED, response, attempt, None
             except SearchConfigurationError as exc:
+                self._halt_network_reason = (SearchExecutionStatus.UNAVAILABLE, str(exc))
                 return SearchExecutionStatus.UNAVAILABLE, None, attempt, str(exc)
+            except SearchQuotaExhaustedError as exc:
+                self._halt_network_reason = (SearchExecutionStatus.FAILED, str(exc))
+                return SearchExecutionStatus.FAILED, None, attempt, str(exc)
             except SearchExecutionError as exc:
                 last_error = str(exc)
                 if exc.retryable and attempt < max_attempts:
@@ -856,6 +1061,7 @@ class OSINTSearchCollector:
         By default, only queries with `execution_status == SearchExecutionStatus.PLANNED` are executed.
         Already-`EXECUTED` queries are never re-executed unless explicitly targeted in `query_ids` with retry flags.
         """
+        self._halt_network_reason = None
         eligible_statuses = {SearchExecutionStatus.PLANNED}
         if retry_failed:
             eligible_statuses.add(SearchExecutionStatus.FAILED)

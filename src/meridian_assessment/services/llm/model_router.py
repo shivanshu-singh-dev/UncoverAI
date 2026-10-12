@@ -126,8 +126,13 @@ class ModelRoutingConfig(BaseModel):
                 return False
             return default
 
+        raw_enabled = (
+            environ.get("MERIDIAN_OLLAMA_ENABLED")
+            if environ.get("MERIDIAN_OLLAMA_ENABLED") is not None
+            else environ.get("MERIDIAN_ENABLE_LOCAL_LLM")
+        )
         enabled = _parse_bool(
-            environ.get("MERIDIAN_OLLAMA_ENABLED"),
+            raw_enabled,
             bool(yaml_llm.get("enabled", False)),
         )
         endpoint = (

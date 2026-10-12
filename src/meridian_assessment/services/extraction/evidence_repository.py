@@ -343,3 +343,21 @@ class EvidenceRepository:
         finally:
             if self._persistent_conn is None:
                 conn.close()
+
+    def load_latest_reports_by_vendor(self) -> dict[str, VendorEndToEndAssessmentReport]:
+        """Return a mapping of `vendor_id -> latest VendorEndToEndAssessmentReport` across all persisted reports."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT vendor_id, payload_json FROM vendor_reports ORDER BY generated_at ASC"
+            ).fetchall()
+            latest: dict[str, VendorEndToEndAssessmentReport] = {}
+            for vid, pjson in rows:
+                try:
+                    latest[str(vid)] = VendorEndToEndAssessmentReport.model_validate(json.loads(pjson))
+                except Exception:
+                    continue
+            return latest
+        finally:
+            if self._persistent_conn is None:
+                conn.close()

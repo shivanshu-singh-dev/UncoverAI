@@ -982,21 +982,23 @@ def test_regression_search_provider_config_and_env_alignment() -> None:
     env_example_text = Path(".env.example").read_text(encoding="utf-8")
     search_cfg = yaml.safe_load(Path("config/osint_search.yaml").read_text(encoding="utf-8"))
 
-    expected_providers = {"google_cse", "brave", "bing", "serpapi"}
-    assert set(search_cfg["providers"].keys()) == expected_providers
+    assert search_cfg["execution"]["default_provider"] == "serper"
+    assert "serper" in search_cfg["providers"]
 
     expected_env_vars = {
         "MERIDIAN_SEARCH_PROVIDER",
-        "MERIDIAN_GOOGLE_API_KEY",
-        "MERIDIAN_GOOGLE_CSE_ID",
-        "MERIDIAN_BRAVE_API_KEY",
-        "MERIDIAN_BING_API_KEY",
-        "MERIDIAN_SERPAPI_KEY",
+        "MERIDIAN_SERPER_API_KEY",
+        "MERIDIAN_SCRAPERAPI_KEY",
     }
     for var_name in expected_env_vars:
         assert f"{var_name}=" in env_example_text
 
-    # Verify factory instantiates each provider when configured via those exact env vars
+    # Verify factory instantiates Serper and legacy providers when configured
+    b_serper = build_search_backend_from_env(
+        env={"MERIDIAN_SEARCH_PROVIDER": "serper", "MERIDIAN_SERPER_API_KEY": "k"}
+    )
+    assert b_serper.provider_name == "serper" and b_serper.is_configured()[0] is True
+
     b_google = build_search_backend_from_env(
         env={"MERIDIAN_SEARCH_PROVIDER": "google_cse", "MERIDIAN_GOOGLE_API_KEY": "k", "MERIDIAN_GOOGLE_CSE_ID": "cx"}
     )

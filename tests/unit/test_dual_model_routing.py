@@ -694,3 +694,52 @@ def test_end_to_end_pipeline_with_dual_models_preserves_deterministic_criticalit
         == ScoringPolicyStatus.SCORING_POLICY_UNCONFIGURED
     )
     assert report.deterministic_risk_score.final_risk_score is None
+
+
+# ─── 11. Configurable GPU Layer Offloading (num_gpu) Verification ─────────────
+
+
+def test_gpu_layer_offloading_num_gpu_configuration_and_payload_options() -> None:
+    """Verify num_gpu config parsing, default=99, graceful error handling, and payload options inclusion."""
+    # 1. Default configuration has num_gpu=99
+    cfg_default = ModelRoutingConfig.from_env_and_config(env={})
+    assert cfg_default.num_gpu == 99
+
+    # 2. Custom valid integer parsed correctly
+    cfg_custom = ModelRoutingConfig.from_env_and_config(env={"MERIDIAN_OLLAMA_NUM_GPU": "33"})
+    assert cfg_custom.num_gpu == 33
+
+    # 3. Invalid string falls back safely to 99 without crashing
+    cfg_invalid = ModelRoutingConfig.from_env_and_config(env={"MERIDIAN_OLLAMA_NUM_GPU": "not_a_number"})
+    assert cfg_invalid.num_gpu == 99
+
+    # 4. Negative integer clamped safely to 0
+    cfg_negative = ModelRoutingConfig.from_env_and_config(env={"MERIDIAN_OLLAMA_NUM_GPU": "-5"})
+    assert cfg_negative.num_gpu == 0
+
+    # 5. Verify generate_json includes num_gpu in options while preserving temperature
+    captured_payloads: list[dict[str, Any]] = []
+
+    def fake_post(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        captured_payloads.append(payload)
+        return {
+            "model": payload["model"],
+            "response": json.dumps({"status": "ok"}),
+        }
+
+    router = OllamaModelRouter(
+        config=ModelRoutingConfig(enabled=True, num_gpu=42),
+        http_post_fn=fake_post,
+    )
+    resp = router.generate_json(
+        LLMTaskType.URL_TRIAGE,
+        prompt="Test prompt",
+        temperature=0.2,
+    )
+
+    assert resp.status == LLMExecutionStatus.SUCCEEDED
+    assert len(captured_payloads) == 1
+    options = captured_payloads[0].get("options", {})
+    assert options["temperature"] == 0.2
+    assert options["num_gpu"] == 42
+

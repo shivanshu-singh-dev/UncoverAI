@@ -75,6 +75,7 @@ local_llm:
   timeout_seconds: 25.0
   keep_alive: "2m"
   unload_on_model_switch: true        # Unloads prior model (keep_alive=0) before switching models on 6 GB VRAM GPUs
+  num_gpu: 99                         # Request offload of model layers to GPU (default: 99)
 
 
 

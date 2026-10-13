@@ -79,6 +79,7 @@ class ModelRoutingConfig(BaseModel):
     timeout_seconds: float = 25.0
     keep_alive: str = "2m"
     unload_on_model_switch: bool = True
+    num_gpu: Optional[int] = 99
 
     @classmethod
     def from_env_and_config(
@@ -185,6 +186,20 @@ class ModelRoutingConfig(BaseModel):
             bool(yaml_llm.get("unload_on_model_switch", True)),
         )
 
+        raw_num_gpu = (
+            environ.get("MERIDIAN_OLLAMA_NUM_GPU")
+            if environ.get("MERIDIAN_OLLAMA_NUM_GPU") is not None
+            else yaml_llm.get("num_gpu", 99)
+        )
+        if raw_num_gpu is None:
+            num_gpu: Optional[int] = 99
+        else:
+            try:
+                num_gpu_val = int(raw_num_gpu)
+                num_gpu = max(0, num_gpu_val)
+            except (TypeError, ValueError):
+                num_gpu = 99
+
         return cls(
             enabled=enabled,
             provider=str(yaml_llm.get("provider") or "ollama"),
@@ -197,6 +212,7 @@ class ModelRoutingConfig(BaseModel):
             timeout_seconds=timeout_seconds,
             keep_alive=keep_alive,
             unload_on_model_switch=unload_on_switch,
+            num_gpu=num_gpu,
         )
 
 
@@ -407,6 +423,12 @@ class OllamaModelRouter:
             )
             unloaded_prior = prior_model
 
+        options: dict[str, Any] = {
+            "temperature": temperature,
+        }
+        if self.config.num_gpu is not None:
+            options["num_gpu"] = self.config.num_gpu
+
         payload: dict[str, Any] = {
             "model": model_name,
             "prompt": prompt,
@@ -414,9 +436,7 @@ class OllamaModelRouter:
             "format": "json",
             "context": [],
             "keep_alive": self.config.keep_alive if keep_alive_override is None else keep_alive_override,
-            "options": {
-                "temperature": temperature,
-            },
+            "options": options,
         }
         if system_prompt:
             payload["system"] = system_prompt
@@ -771,6 +791,7 @@ class OllamaModelRouter:
         return {
             "ollama_enabled": self.config.enabled,
             "ollama_endpoint": self.config.endpoint,
+            "num_gpu": self.config.num_gpu,
             "model_assignments": {
                 LLMTaskType.URL_TRIAGE.value: self.config.triage_model,
                 LLMTaskType.EVIDENCE_CLASSIFICATION.value: self.config.analysis_model,

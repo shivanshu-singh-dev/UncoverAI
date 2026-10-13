@@ -528,3 +528,122 @@ def test_same_host_canonical_path_difference_warns_without_discarding_valid_evid
     )
     assert len(ev_records) >= 1
     assert ev_records[0].source_integrity_status == "WARNING_SAME_HOST_PATH_DIFF"
+
+
+# ─── 4. Sole Source O2 Override, Per-Stage AI Toggles, Large Doc Cleaning & Intra-Level Progress ───
+
+
+def test_sole_source_checkbox_triggers_o2_critical_override() -> None:
+    """Verify is_sole_source=True with O=3 triggers Override O2 and elevates tier to Critical."""
+    from meridian_assessment.services.meridian_criticality_engine import MeridianCriticalityEngine
+
+    vendors = MeridianCSVVendorLoader().load(Path("data/input/meridian_vendors.csv"))
+    # Create a vendor with O=3 (high operational criticality) and no "no alternative" text,
+    # then toggle is_sole_source=True vs False.
+    base_vendor = vendors[0].model_copy(
+        update={
+            "vendor_name": "Acme Payments Engine",
+            "service_product_provided": "Real-time payment clearing gateway",
+            "business_process_supported": "Core real-time payment settlement and ledger posting",
+            "operational_dependency": "Critical",
+            "notes": "Standard enterprise contract.",
+            "is_sole_source": False,
+        }
+    )
+    engine = MeridianCriticalityEngine()
+    res_not_sole = engine.evaluate(base_vendor)
+    o2_not_sole = next(ov for ov in res_not_sole.overrides_evaluated if ov.override_id == "O2")
+
+    sole_vendor = base_vendor.model_copy(update={"is_sole_source": True})
+    res_sole = engine.evaluate(sole_vendor)
+    o2_sole = next(ov for ov in res_sole.overrides_evaluated if ov.override_id == "O2")
+
+    assert res_sole.O.score == 3
+    assert o2_not_sole.triggered is False
+    assert o2_sole.triggered is True
+    assert "is_sole_source=True" in (o2_sole.evidence or "")
+    assert res_sole.final_criticality == "Critical"
+
+
+def test_large_document_cleaning_and_per_stage_progress_callbacks(tmp_path: Path) -> None:
+    """Verify >20 block documents are deduplicated/bounded and pipeline emits (level, title, detail, completed, total)."""
+    from meridian_assessment.models.ai_risk import ExtractedDocument
+
+    # Build a synthetic document with 120 noisy boilerplate paragraphs and 4 high-signal AI paragraphs
+    blocks: list[str] = []
+    for i in range(60):
+        blocks.append(f"Navigation link item {i}")  # short noise (<45 chars without AI keywords)
+        blocks.append("Copyright 2026 Vendor Corp. All rights reserved worldwide. Cookie preferences and terms.")  # repeated boilerplate
+    blocks.append(
+        "AutomWorx embeds OpenAI GPT-4o and Anthropic Claude 3.5 Sonnet for automated exception routing in production."
+    )
+    blocks.append(
+        "Customer production data is processed under a zero data retention subprocessor agreement with Microsoft Azure OpenAI."
+    )
+    blocks.append(
+        "Model training on customer prompts is disabled by default and SOC 2 Type II controls govern AI inference pipelines."
+    )
+    blocks.append(
+        "Automated underwriting workflow decisions require human-in-the-loop review before final credit denial."
+    )
+
+    doc = ExtractedDocument(
+        document_id="DOC_LARGE_001",
+        vendor_id="V-001",
+        url="https://trust.automworx.com/ai-architecture",
+        canonical_url="https://trust.automworx.com/ai-architecture",
+        source_class="S1",
+        retrieved_at="2026-10-13T00:00:00Z",
+        extraction_status=ExtractionStatus.EXTRACTED,
+        cleaned_text="\n\n".join(blocks),
+    )
+
+    extractor = OSINTExtractionService(fetch_adapter=StubFetchAdapter())
+    records = extractor.build_evidence_records_from_document(
+        doc,
+        legal_entity="AutomWorx",
+        domain="automworx.com",
+        max_records_per_document=25,
+    )
+    # Instead of 124 raw records, cleaning + deduplication + bounding keeps only clean relevant records (<= 25)
+    assert 4 <= len(records) <= 25
+    combined_excerpts = " ".join(r.verbatim_excerpt for r in records)
+    assert "GPT-4o" in combined_excerpts
+    assert "zero data retention" in combined_excerpts
+
+    # Verify per-stage toggles and 5-arg progress callback on MeridianEndToEndPipeline
+    vendors = MeridianCSVVendorLoader().load(Path("data/input/meridian_vendors.csv"))
+    progress_events: list[tuple[int, str, str, int, int]] = []
+
+    def on_progress(lvl: int, title: str, detail: str, completed: int, total: int) -> None:
+        progress_events.append((lvl, title, detail, completed, total))
+
+    pipeline = MeridianEndToEndPipeline(
+        search_backend=StubSearchBackend(),
+        fetch_adapter=StubFetchAdapter(),
+        evidence_repository=EvidenceRepository(
+            db_path=tmp_path / "prog.sqlite3",
+            artifact_dir=tmp_path / "prog_artifacts",
+        ),
+        enable_local_llm_from_env=False,
+        enable_triage_llm=False,
+        enable_rag_embeddings=False,
+        enable_classification_llm=False,
+        enable_summary_llm=False,
+    )
+    assert pipeline.triage_service.llm_provider.is_configured()[0] is False
+    assert type(pipeline.rag_service.embedding_provider).__name__ == "UnconfiguredEmbeddingProvider"
+    assert pipeline.classification_service.llm_adapter.is_configured()[0] is False
+    assert pipeline.risk_analyzer.summary_llm_adapter.is_configured()[0] is False
+
+    pipeline.run_vendor_assessment(
+        vendors[0],
+        execute_searches=False,
+        execute_extraction=False,
+        persist_to_repository=False,
+        progress_callback=on_progress,
+    )
+    assert len(progress_events) >= 9
+    assert progress_events[0][0] == 1
+    assert all(ev[4] >= 1 and 0 <= ev[3] <= ev[4] for ev in progress_events)
+

@@ -398,15 +398,109 @@ class SignalClassificationService:
         *,
         meridian_service_scope: Optional[str] = None,
         meridian_business_process: Optional[str] = None,
+        rag_candidate_evidence_ids: Optional[ set[str] ] = None,
+        max_llm_calls: int = 35,
+        progress_callback: Optional[Any] = None,
     ) -> list[SignalClassificationResult]:
-        return [
-            self.classify_evidence(
+        total = len(evidence_records)
+        is_large_batch = total > 12
+        rag_ids = rag_candidate_evidence_ids or set()
+        llm_calls_made = 0
+        results: list[SignalClassificationResult] = []
+
+        for idx, ev in enumerate(evidence_records, start=1):
+            if callable(progress_callback):
+                try:
+                    progress_callback(idx, max(1, total), ev)
+                except Exception:
+                    pass
+            allow_llm_for_item = True
+            if is_large_batch:
+                if llm_calls_made >= max_llm_calls:
+                    allow_llm_for_item = False
+                else:
+                    low_txt = (ev.verbatim_excerpt or "").lower()
+                    has_candidate_signal = (
+                        ev.evidence_id in rag_ids
+                        or any(
+                            kw in low_txt
+                            for kw in (
+                                "openai",
+                                "anthropic",
+                                "bedrock",
+                                "vertex",
+                                "cohere",
+                                "mistral",
+                                "hugging face",
+                                "huggingface",
+                                "gpt",
+                                "claude",
+                                "llama",
+                                "gemini",
+                                "titan",
+                                "xgboost",
+                                "random forest",
+                                "large language model",
+                                "llm",
+                                "generative ai",
+                                "genai",
+                                "machine learning",
+                                "neural network",
+                                "predictive model",
+                                "anomaly detection",
+                                "scoring model",
+                                "classification model",
+                                "agentic",
+                                "autonomous",
+                                "tool calling",
+                                "automated decision",
+                                "rag",
+                                "retrieval-augmented",
+                                "vector",
+                                "embedding",
+                                "inference",
+                                "subprocessor",
+                                "train",
+                                "fine-tun",
+                                "zero data retention",
+                                "zdr",
+                                "opt-in",
+                                "disabled by default",
+                                "ai-powered",
+                                "ai powered",
+                                "artificial intelligence",
+                                "next-generation intelligence",
+                                "smart automation",
+                                "cutting-edge ai",
+                                "intelligent platform",
+                                "batch scheduling",
+                                "batch job",
+                                "job orchestration",
+                                "cron schedule",
+                                "rules engine",
+                                "rule-based workflow",
+                                "robotic process automation",
+                                "rpa",
+                                "deterministic workflow",
+                            )
+                        )
+                    )
+                    allow_llm_for_item = has_candidate_signal
+
+            res = self.classify_evidence(
                 ev,
                 meridian_service_scope=meridian_service_scope,
                 meridian_business_process=meridian_business_process,
+                allow_llm=allow_llm_for_item,
             )
-            for ev in evidence_records
-        ]
+            if allow_llm_for_item and res.classification_method in (
+                ClassificationMethod.LOCAL_LLM_VALIDATED,
+                ClassificationMethod.LLM_UNAVAILABLE_DETERMINISTIC_FALLBACK,
+            ):
+                llm_calls_made += 1
+            results.append(res)
+
+        return results
 
     def classify_evidence(
         self,
@@ -414,6 +508,7 @@ class SignalClassificationService:
         *,
         meridian_service_scope: Optional[str] = None,
         meridian_business_process: Optional[str] = None,
+        allow_llm: bool = True,
     ) -> SignalClassificationResult:
         """Classify a single EvidenceRecord and enrich its in-memory fields."""
         text = evidence.verbatim_excerpt or ""
@@ -666,12 +761,12 @@ class SignalClassificationService:
             cap_summary = "No operational AI capability or marketing AI claim detected in excerpt."
             rationale = "Excerpt discusses general product, contractual, or security terms without AI indicators."
 
-        # Check optional local-LLM adapter if configured
+        # Check optional local-LLM adapter if configured and item is eligible for LLM refinement
         method = ClassificationMethod.DETERMINISTIC_RULES
         model_used_val: Optional[str] = None
         model_exec_status: Optional[str] = None
         llm_ok, _ = self.llm_adapter.is_configured()
-        if llm_ok:
+        if llm_ok and allow_llm:
             model_used_val = getattr(self.llm_adapter, "model_name", None)
             llm_out = self.llm_adapter.classify_excerpt(
                 evidence,
@@ -694,6 +789,8 @@ class SignalClassificationService:
                 model_exec_status = (
                     f"FALLBACK_DETERMINISTIC ({last_st})" if last_st else "FALLBACK_DETERMINISTIC"
                 )
+        elif llm_ok and not allow_llm:
+            model_exec_status = "SKIPPED_NO_AI_SIGNAL_PREFILTER"
 
         customer_data_flag: Optional[bool] = None
         if any(

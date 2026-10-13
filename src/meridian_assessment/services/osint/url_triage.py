@@ -340,6 +340,7 @@ class OSINTURLTriageService:
         plan: OSINTInvestigationPlan,
         *,
         unload_model_after_batch: bool = True,
+        progress_callback: Optional[Any] = None,
     ) -> list[URLTriageDecision]:
         """Triage all CandidateURL items on an OSINTInvestigationPlan and update their triage_status.
 
@@ -348,7 +349,13 @@ class OSINTURLTriageService:
         before Level 6 & Level 8 load Model B (`mistral:latest`).
         """
         decisions: list[URLTriageDecision] = []
-        for cand in plan.candidate_urls:
+        total_cands = len(plan.candidate_urls)
+        for idx, cand in enumerate(plan.candidate_urls, start=1):
+            if callable(progress_callback):
+                try:
+                    progress_callback(idx, max(1, total_cands), cand)
+                except Exception:
+                    pass
             decision = self.triage_candidate(
                 cand,
                 vendor_name=plan.vendor_name,

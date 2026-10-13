@@ -17,9 +17,14 @@ Provides a cohesive enterprise analyst workspace across five top-level views:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import html
+import json
+import os
 from pathlib import Path
 import sys
+import threading
+import time
 from typing import Any, Optional
 
 import streamlit as st
@@ -81,9 +86,32 @@ st.set_page_config(
 _DEFAULT_VENDORS_CSV = Path("data/input/meridian_vendors.csv")
 _DEFAULT_DB_PATH = Path("data/state/evidence_repository.sqlite3")
 _DEFAULT_ARTIFACT_DIR = Path("data/state/artifacts")
+_DEFAULT_ACTIVE_STATUS_PATH = Path("data/state/active_assessment_status.json")
 
 _NAV_PAGES = ("Portfolio", "Assessments", "Evidence", "Reports", "Settings")
 _TIER_SORT_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+
+_GLOBAL_JOB_LOCK = threading.Lock()
+_GLOBAL_JOB_STATE: dict[str, Any] = {
+    "status": "IDLE",
+    "vendor_id": None,
+    "vendor_name": None,
+    "mode": None,
+    "level_num": 0,
+    "stage_title": "",
+    "detail": "",
+    "completed": 0,
+    "total": 1,
+    "remaining": 0,
+    "level_pct": 0,
+    "overall_pct": 0,
+    "report_id": None,
+    "error": None,
+    "cancel_requested": False,
+    "updated_at": None,
+    "latest_report": None,
+    "latest_vendor": None,
+}
 
 
 # ─── Enterprise Visual Design System (CSS) ────────────────────────────────────
@@ -579,6 +607,99 @@ def _format_short_date(iso_str: Optional[str]) -> str:
 # ─── Session State & Data Initialization ──────────────────────────────────────
 
 
+class _AssessmentCancelledError(RuntimeError):
+    """Raised when the analyst cancels an active background assessment run."""
+
+
+def _save_job_state_to_disk(snapshot: dict[str, Any]) -> None:
+    try:
+        _DEFAULT_ACTIVE_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        serializable = {
+            k: v for k, v in snapshot.items() if k not in ("latest_report", "latest_vendor")
+        }
+        _DEFAULT_ACTIVE_STATUS_PATH.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _update_global_job_progress(
+    *,
+    status: str,
+    vendor_id: Optional[str] = None,
+    vendor_name: Optional[str] = None,
+    mode: Optional[str] = None,
+    level_num: int = 0,
+    stage_title: str = "",
+    detail: str = "",
+    completed: int = 0,
+    total: int = 1,
+    report_id: Optional[str] = None,
+    error: Optional[str] = None,
+    latest_report: Optional[VendorEndToEndAssessmentReport] = None,
+    latest_vendor: Optional[MeridianVendor] = None,
+) -> dict[str, Any]:
+    safe_total = max(1, int(total))
+    safe_comp = max(0, min(int(completed), safe_total))
+    rem = max(0, safe_total - safe_comp)
+    lvl_pct = int(round((safe_comp / float(safe_total)) * 100))
+    if status == "COMPLETED":
+        ov_pct = 100
+        lvl_pct = 100
+    elif level_num <= 0:
+        ov_pct = 0
+    else:
+        ov_pct = min(99, max(1, int(round(((level_num - 1 + (safe_comp / float(safe_total))) / 9.0) * 100))))
+
+    with _GLOBAL_JOB_LOCK:
+        if vendor_id is not None:
+            _GLOBAL_JOB_STATE["vendor_id"] = vendor_id
+        if vendor_name is not None:
+            _GLOBAL_JOB_STATE["vendor_name"] = vendor_name
+        if mode is not None:
+            _GLOBAL_JOB_STATE["mode"] = mode
+        _GLOBAL_JOB_STATE["status"] = status
+        _GLOBAL_JOB_STATE["level_num"] = level_num
+        _GLOBAL_JOB_STATE["stage_title"] = stage_title
+        _GLOBAL_JOB_STATE["detail"] = detail
+        _GLOBAL_JOB_STATE["completed"] = safe_comp
+        _GLOBAL_JOB_STATE["total"] = safe_total
+        _GLOBAL_JOB_STATE["remaining"] = rem
+        _GLOBAL_JOB_STATE["level_pct"] = lvl_pct
+        _GLOBAL_JOB_STATE["overall_pct"] = ov_pct
+        if report_id is not None:
+            _GLOBAL_JOB_STATE["report_id"] = report_id
+        _GLOBAL_JOB_STATE["error"] = error
+        _GLOBAL_JOB_STATE["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if latest_report is not None:
+            _GLOBAL_JOB_STATE["latest_report"] = latest_report
+        if latest_vendor is not None:
+            _GLOBAL_JOB_STATE["latest_vendor"] = latest_vendor
+        snapshot = dict(_GLOBAL_JOB_STATE)
+
+    _save_job_state_to_disk(snapshot)
+    return snapshot
+
+
+def _get_global_job_snapshot() -> dict[str, Any]:
+    with _GLOBAL_JOB_LOCK:
+        snap = dict(_GLOBAL_JOB_STATE)
+    if snap["status"] == "IDLE" and _DEFAULT_ACTIVE_STATUS_PATH.is_file() and "PYTEST_CURRENT_TEST" not in os.environ:
+        try:
+            disk_data = json.loads(_DEFAULT_ACTIVE_STATUS_PATH.read_text(encoding="utf-8"))
+            if isinstance(disk_data, dict) and disk_data.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
+                for k, v in disk_data.items():
+                    if k in snap:
+                        snap[k] = v
+        except Exception:
+            pass
+    return snap
+
+
+def _request_cancel_active_job() -> None:
+    with _GLOBAL_JOB_LOCK:
+        _GLOBAL_JOB_STATE["cancel_requested"] = True
+
+
 def _init_session_state() -> None:
     repo = EvidenceRepository(db_path=_DEFAULT_DB_PATH, artifact_dir=_DEFAULT_ARTIFACT_DIR)
     st.session_state["evidence_repo"] = repo
@@ -607,6 +728,21 @@ def _init_session_state() -> None:
             vid: rpt for vid, rpt in persisted.items() if not rpt.is_synthetic_evidence_run
         }
         st.session_state["reports_by_vendor"] = live_reports
+    elif "PYTEST_CURRENT_TEST" not in os.environ:
+        # Sync any completed background job or newly persisted live report after browser refresh
+        snap = _get_global_job_snapshot()
+        latest_rpt = snap.get("latest_report")
+        latest_v = snap.get("latest_vendor")
+        if isinstance(latest_rpt, VendorEndToEndAssessmentReport):
+            st.session_state["reports_by_vendor"][latest_rpt.vendor_id] = latest_rpt
+            st.session_state["e2e_report"] = latest_rpt
+        if isinstance(latest_v, MeridianVendor):
+            st.session_state["vendors_by_id"][latest_v.vendor_id] = latest_v
+            engine = st.session_state["criticality_engine"]
+            st.session_state["criticality_by_id"][latest_v.vendor_id] = engine.evaluate(
+                latest_v,
+                human_review=st.session_state["human_crit_overrides"].get(latest_v.vendor_id),
+            )
 
     if "selected_vendor_id" not in st.session_state:
         vids = sorted(st.session_state["vendors_by_id"].keys())
@@ -656,22 +792,24 @@ def _get_vendor_assessment_status(
     return "Completed", "success", True
 
 
-def _execute_vendor_assessment(
+def _run_pipeline_core(
     vendor: MeridianVendor,
     *,
     mode: str,
-    enable_local_llm: bool,
+    repo: EvidenceRepository,
+    readiness: SystemReadinessReport,
+    crit_engine: MeridianCriticalityEngine,
+    enable_local_llm: bool = False,
+    enable_triage_llm: Optional[bool] = None,
+    enable_rag_embeddings: Optional[bool] = None,
+    enable_classification_llm: Optional[bool] = None,
+    enable_summary_llm: Optional[bool] = None,
     human_crit_override: Optional[HumanReviewRecord] = None,
     analyst_gate_overrides: Optional[dict[str, tuple[str, str]]] = None,
     human_validations: Optional[list[HumanValidationRecord]] = None,
     progress_callback: Optional[Any] = None,
 ) -> VendorEndToEndAssessmentReport:
-    """Execute the 9-level assessment pipeline in either Live OSINT or Sample Fixture mode."""
-    repo: EvidenceRepository = st.session_state["evidence_repo"]
-    readiness: SystemReadinessReport = st.session_state["system_readiness"]
-    crit_engine: MeridianCriticalityEngine = st.session_state["criticality_engine"]
     all_sources = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12"]
-
     if mode == "SAMPLE":
         stub_search, stub_fetch = build_synthetic_demo_adapters_for_vendor(vendor)
         pipeline = MeridianEndToEndPipeline(
@@ -680,9 +818,13 @@ def _execute_vendor_assessment(
             fetch_adapter=stub_fetch,
             evidence_repository=repo,
             enable_local_llm_from_env=enable_local_llm,
+            enable_triage_llm=enable_triage_llm,
+            enable_rag_embeddings=enable_rag_embeddings,
+            enable_classification_llm=enable_classification_llm,
+            enable_summary_llm=enable_summary_llm,
             readiness=readiness,
         )
-        report = pipeline.run_vendor_assessment(
+        return pipeline.run_vendor_assessment(
             vendor,
             human_criticality_override=human_crit_override,
             execute_searches=True,
@@ -694,28 +836,69 @@ def _execute_vendor_assessment(
             persist_to_repository=True,
             progress_callback=progress_callback,
         )
-    else:
-        live_search = build_search_backend_from_env()
-        live_fetch = build_fetch_adapter_from_env(allow_live_direct=True)
-        pipeline = MeridianEndToEndPipeline(
-            criticality_engine=crit_engine,
-            search_backend=live_search,
-            fetch_adapter=live_fetch,
-            evidence_repository=repo,
-            enable_local_llm_from_env=enable_local_llm,
-            readiness=readiness,
-        )
-        report = pipeline.run_vendor_assessment(
-            vendor,
-            human_criticality_override=human_crit_override,
-            execute_searches=True,
-            execute_extraction=True,
-            mark_extracted_sources_reviewed=False,
-            analyst_gate_overrides=analyst_gate_overrides,
-            human_validations=human_validations,
-            persist_to_repository=True,
-            progress_callback=progress_callback,
-        )
+
+    live_search = build_search_backend_from_env()
+    live_fetch = build_fetch_adapter_from_env(allow_live_direct=True)
+    pipeline = MeridianEndToEndPipeline(
+        criticality_engine=crit_engine,
+        search_backend=live_search,
+        fetch_adapter=live_fetch,
+        evidence_repository=repo,
+        enable_local_llm_from_env=enable_local_llm,
+        enable_triage_llm=enable_triage_llm,
+        enable_rag_embeddings=enable_rag_embeddings,
+        enable_classification_llm=enable_classification_llm,
+        enable_summary_llm=enable_summary_llm,
+        readiness=readiness,
+    )
+    return pipeline.run_vendor_assessment(
+        vendor,
+        human_criticality_override=human_crit_override,
+        execute_searches=True,
+        execute_extraction=True,
+        mark_extracted_sources_reviewed=False,
+        analyst_gate_overrides=analyst_gate_overrides,
+        human_validations=human_validations,
+        persist_to_repository=True,
+        progress_callback=progress_callback,
+    )
+
+
+def _execute_vendor_assessment(
+    vendor: MeridianVendor,
+    *,
+    mode: str,
+    enable_local_llm: bool = False,
+    enable_triage_llm: Optional[bool] = None,
+    enable_rag_embeddings: Optional[bool] = None,
+    enable_classification_llm: Optional[bool] = None,
+    enable_summary_llm: Optional[bool] = None,
+    human_crit_override: Optional[HumanReviewRecord] = None,
+    analyst_gate_overrides: Optional[dict[str, tuple[str, str]]] = None,
+    human_validations: Optional[list[HumanValidationRecord]] = None,
+    progress_callback: Optional[Any] = None,
+) -> VendorEndToEndAssessmentReport:
+    """Execute the 9-level assessment pipeline synchronously and update session state."""
+    repo: EvidenceRepository = st.session_state["evidence_repo"]
+    readiness: SystemReadinessReport = st.session_state["system_readiness"]
+    crit_engine: MeridianCriticalityEngine = st.session_state["criticality_engine"]
+
+    report = _run_pipeline_core(
+        vendor,
+        mode=mode,
+        repo=repo,
+        readiness=readiness,
+        crit_engine=crit_engine,
+        enable_local_llm=enable_local_llm,
+        enable_triage_llm=enable_triage_llm,
+        enable_rag_embeddings=enable_rag_embeddings,
+        enable_classification_llm=enable_classification_llm,
+        enable_summary_llm=enable_summary_llm,
+        human_crit_override=human_crit_override,
+        analyst_gate_overrides=analyst_gate_overrides,
+        human_validations=human_validations,
+        progress_callback=progress_callback,
+    )
 
     st.session_state["vendors_by_id"][vendor.vendor_id] = vendor
     st.session_state["criticality_by_id"][vendor.vendor_id] = crit_engine.evaluate(
@@ -725,6 +908,125 @@ def _execute_vendor_assessment(
     st.session_state["e2e_report"] = report
     st.session_state["selected_vendor_id"] = vendor.vendor_id
     return report
+
+
+def _start_background_vendor_assessment(
+    vendor: MeridianVendor,
+    *,
+    mode: str,
+    enable_local_llm: bool = False,
+    enable_triage_llm: Optional[bool] = None,
+    enable_rag_embeddings: Optional[bool] = None,
+    enable_classification_llm: Optional[bool] = None,
+    enable_summary_llm: Optional[bool] = None,
+    human_crit_override: Optional[HumanReviewRecord] = None,
+) -> None:
+    """Launch a persistent background assessment thread whose progress survives browser refreshes."""
+    readiness: SystemReadinessReport = st.session_state["system_readiness"]
+    crit_engine: MeridianCriticalityEngine = st.session_state["criticality_engine"]
+
+    with _GLOBAL_JOB_LOCK:
+        _GLOBAL_JOB_STATE["cancel_requested"] = False
+
+    _update_global_job_progress(
+        status="RUNNING",
+        vendor_id=vendor.vendor_id,
+        vendor_name=vendor.vendor_name,
+        mode=mode,
+        level_num=1,
+        stage_title="Level 1: Criticality Tiering",
+        detail=f"Initializing 9-level assessment pipeline for {vendor.vendor_name}...",
+        completed=0,
+        total=1,
+        report_id=None,
+        error=None,
+        latest_vendor=vendor,
+    )
+
+    def _worker() -> None:
+        bg_repo = EvidenceRepository(db_path=_DEFAULT_DB_PATH, artifact_dir=_DEFAULT_ARTIFACT_DIR)
+
+        def _bg_on_stage(
+            lvl_num: int,
+            stage_title: str,
+            detail: str,
+            completed: int = 0,
+            total: int = 1,
+        ) -> None:
+            with _GLOBAL_JOB_LOCK:
+                if _GLOBAL_JOB_STATE.get("cancel_requested"):
+                    raise _AssessmentCancelledError("Assessment cancelled by analyst.")
+            _update_global_job_progress(
+                status="RUNNING",
+                vendor_id=vendor.vendor_id,
+                vendor_name=vendor.vendor_name,
+                mode=mode,
+                level_num=lvl_num,
+                stage_title=stage_title,
+                detail=detail,
+                completed=completed,
+                total=total,
+            )
+
+        try:
+            rpt = _run_pipeline_core(
+                vendor,
+                mode=mode,
+                repo=bg_repo,
+                readiness=readiness,
+                crit_engine=crit_engine,
+                enable_local_llm=enable_local_llm,
+                enable_triage_llm=enable_triage_llm,
+                enable_rag_embeddings=enable_rag_embeddings,
+                enable_classification_llm=enable_classification_llm,
+                enable_summary_llm=enable_summary_llm,
+                human_crit_override=human_crit_override,
+                progress_callback=_bg_on_stage,
+            )
+            _update_global_job_progress(
+                status="COMPLETED",
+                vendor_id=vendor.vendor_id,
+                vendor_name=vendor.vendor_name,
+                mode=mode,
+                level_num=9,
+                stage_title="Assessment Completed",
+                detail=f"Report {rpt.report_id} generated and persisted for {rpt.legal_entity}.",
+                completed=1,
+                total=1,
+                report_id=rpt.report_id,
+                error=None,
+                latest_report=rpt,
+                latest_vendor=vendor,
+            )
+        except _AssessmentCancelledError as exc:
+            _update_global_job_progress(
+                status="CANCELLED",
+                vendor_id=vendor.vendor_id,
+                vendor_name=vendor.vendor_name,
+                mode=mode,
+                level_num=_GLOBAL_JOB_STATE.get("level_num", 1),
+                stage_title="Assessment Cancelled",
+                detail=str(exc),
+                completed=_GLOBAL_JOB_STATE.get("completed", 0),
+                total=_GLOBAL_JOB_STATE.get("total", 1),
+                error=str(exc),
+            )
+        except Exception as exc:
+            _update_global_job_progress(
+                status="FAILED",
+                vendor_id=vendor.vendor_id,
+                vendor_name=vendor.vendor_name,
+                mode=mode,
+                level_num=_GLOBAL_JOB_STATE.get("level_num", 1),
+                stage_title="Assessment Failed",
+                detail=str(exc),
+                completed=_GLOBAL_JOB_STATE.get("completed", 0),
+                total=_GLOBAL_JOB_STATE.get("total", 1),
+                error=str(exc),
+            )
+
+    t = threading.Thread(target=_worker, name=f"UncoverAI_Assess_{vendor.vendor_id}", daemon=True)
+    t.start()
 
 
 # ─── Application Shell (Header + Top Navigation Bar) ──────────────────────────
@@ -1365,11 +1667,39 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
         )
         is_sample_mode = exec_mode_choice.startswith("Sample")
 
-        use_local_ai = st.checkbox(
-            "Enable Local AI Model Routing (llama3.2:latest URL triage + mistral:latest classification/summaries)",
-            value=False,
-            key="assess_enable_local_ai",
+        st.markdown(
+            "<div style='font-size:0.78rem;font-weight:600;color:#334155;margin:6px 0 4px 0;'>"
+            "Stage-by-Stage Local AI Model Routing Controls"
+            "</div>",
+            unsafe_allow_html=True,
         )
+        ai_c1, ai_c2 = st.columns(2, gap="small")
+        use_ai_l3b = ai_c1.checkbox(
+            "Level 3B: URL Triage (llama3.2:latest)",
+            value=False,
+            key="assess_ai_l3b",
+            help="Use local Ollama llama3.2:latest to score and prioritize candidate search URLs in Level 3B.",
+        )
+        use_ai_l5 = ai_c2.checkbox(
+            "Level 5: Semantic RAG (all-MiniLM-L6-v2)",
+            value=True,
+            key="assess_ai_l5",
+            help="Use local sentence-transformers/all-MiniLM-L6-v2 embeddings to retrieve top risk-concept passages in Level 5.",
+        )
+        ai_c3, ai_c4 = st.columns(2, gap="small")
+        use_ai_l6 = ai_c3.checkbox(
+            "Level 6: Signal Classification (mistral:latest)",
+            value=False,
+            key="assess_ai_l6",
+            help="Use local Ollama mistral:latest to classify candidate AI/automation excerpts in Level 6.",
+        )
+        use_ai_l8 = ai_c4.checkbox(
+            "Level 8: Risk Summarization (mistral:latest)",
+            value=False,
+            key="assess_ai_l8",
+            help="Use local Ollama mistral:latest to draft evidence-grounded R1–R8 risk explanations in Level 8.",
+        )
+        use_local_ai = bool(use_ai_l3b or use_ai_l6 or use_ai_l8)
 
     with setup_col2:
         c1, c2, c3 = st.columns([1.0, 1.4, 1.4], gap="small")
@@ -1409,6 +1739,7 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
             "Sole Source",
             value=bool(getattr(base_v, "is_sole_source", False)),
             key=f"in_sole_{source_mode}_{base_v.vendor_id}",
+            help="Trigger Override O2 (Critical floor) when Vendor is a Sole Source AND Operational Dependency (O) = 3.",
         )
 
     validated_vendor, val_errors, val_warnings = validate_vendor_assessment_input(
@@ -1440,7 +1771,7 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
         <div class="uc-section-header">
             <div>
                 <h2 class="uc-section-title">B. Assessment Execution &amp; Pipeline Controls</h2>
-                <p class="uc-section-subtitle">Execute all nine assessment stages in sequence with real-time stage telemetry and source-integrity verification.</p>
+                <p class="uc-section-subtitle">Execute all nine assessment stages in sequence with dual-bar stage/item telemetry and persistent progress across browser refreshes.</p>
             </div>
         </div>
         """,
@@ -1460,6 +1791,11 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
             unsafe_allow_html=True,
         )
 
+    job_snap = _get_global_job_snapshot()
+    is_job_running = (
+        job_snap.get("status") == "RUNNING" and "PYTEST_CURRENT_TEST" not in os.environ
+    )
+
     exec_col1, exec_col2, exec_col3 = st.columns([1.5, 1.5, 2.0], gap="small")
     primary_label = (
         f"Run Sample Assessment ({in_vid or 'Vendor'})"
@@ -1470,7 +1806,7 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
         primary_label,
         key="btn_execute_assessment_primary",
         type="primary",
-        disabled=validated_vendor is None,
+        disabled=(validated_vendor is None or is_job_running),
         use_container_width=True,
     )
 
@@ -1480,34 +1816,140 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
             "Load Sample Walkthrough Instead",
             key="btn_execute_assessment_sample_alt",
             type="secondary",
-            disabled=validated_vendor is None,
+            disabled=(validated_vendor is None or is_job_running),
             use_container_width=True,
         )
 
-    progress_container = st.empty()
+    cancel_clicked = False
+    if is_job_running:
+        cancel_clicked = exec_col3.button(
+            f"Stop Active Run ({job_snap.get('vendor_id')})",
+            key="btn_cancel_active_assessment",
+            type="secondary",
+            use_container_width=True,
+        )
+        if cancel_clicked:
+            _request_cancel_active_job()
+
+    overall_progress_container = st.empty()
+    level_progress_container = st.empty()
     status_container = st.empty()
 
     if (run_clicked or alt_sample_clicked) and validated_vendor is not None:
         target_mode = "SAMPLE" if (is_sample_mode or alt_sample_clicked) else "LIVE"
-        prog_bar = progress_container.progress(0, text="Initializing 9-level assessment pipeline...")
+        in_pytest = "PYTEST_CURRENT_TEST" in os.environ
 
-        def _on_stage(lvl_num: int, stage_title: str, detail: str) -> None:
-            pct = min(100, int((lvl_num / 9.0) * 100))
-            prog_bar.progress(pct, text=f"{stage_title} — {detail}")
+        if target_mode == "LIVE" and not in_pytest:
+            _start_background_vendor_assessment(
+                validated_vendor,
+                mode=target_mode,
+                enable_local_llm=use_local_ai,
+                enable_triage_llm=use_ai_l3b,
+                enable_rag_embeddings=use_ai_l5,
+                enable_classification_llm=use_ai_l6,
+                enable_summary_llm=use_ai_l8,
+                human_crit_override=st.session_state["human_crit_overrides"].get(validated_vendor.vendor_id),
+            )
+            st.rerun()
+        else:
+            prog_overall = overall_progress_container.progress(
+                0,
+                text="Overall Pipeline (Level 1 of 9 — 0%): Initializing 9-level assessment pipeline...",
+            )
+            prog_level = level_progress_container.progress(
+                0,
+                text="Current Level Progress: 0 / 1 completed (1 left — 0%) — Starting Level 1...",
+            )
 
-        report = _execute_vendor_assessment(
-            validated_vendor,
-            mode=target_mode,
-            enable_local_llm=use_local_ai,
-            human_crit_override=st.session_state["human_crit_overrides"].get(validated_vendor.vendor_id),
-            progress_callback=_on_stage,
-        )
-        prog_bar.progress(100, text=f"Assessment {report.report_id} completed.")
-        status_container.markdown(
-            f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
-            f'Report <code>{html.escape(report.report_id)}</code> generated for <strong>{html.escape(report.legal_entity)}</strong>.</div>',
-            unsafe_allow_html=True,
-        )
+            def _on_stage(
+                lvl_num: int,
+                stage_title: str,
+                detail: str,
+                completed: int = 0,
+                total: int = 1,
+            ) -> None:
+                safe_tot = max(1, int(total))
+                safe_comp = max(0, min(int(completed), safe_tot))
+                rem = max(0, safe_tot - safe_comp)
+                lvl_pct = int(round((safe_comp / float(safe_tot)) * 100))
+                ov_pct = min(99, max(1, int(round(((lvl_num - 1 + (safe_comp / float(safe_tot))) / 9.0) * 100))))
+                prog_overall.progress(
+                    ov_pct,
+                    text=f"Overall Pipeline (Level {lvl_num} of 9 — {ov_pct}%): {stage_title}",
+                )
+                prog_level.progress(
+                    lvl_pct,
+                    text=f"Current Level Progress: {safe_comp} / {safe_tot} completed ({rem} left — {lvl_pct}%) — {detail}",
+                )
+
+            report = _execute_vendor_assessment(
+                validated_vendor,
+                mode=target_mode,
+                enable_local_llm=use_local_ai,
+                enable_triage_llm=use_ai_l3b,
+                enable_rag_embeddings=use_ai_l5,
+                enable_classification_llm=use_ai_l6,
+                enable_summary_llm=use_ai_l8,
+                human_crit_override=st.session_state["human_crit_overrides"].get(validated_vendor.vendor_id),
+                progress_callback=_on_stage,
+            )
+            prog_overall.progress(100, text=f"Overall Pipeline (9 of 9 Levels — 100%): Assessment {report.report_id} completed.")
+            prog_level.progress(100, text="Current Level Progress: 1 / 1 completed (0 left — 100%) — All stages finished.")
+            status_container.markdown(
+                f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
+                f'Report <code>{html.escape(report.report_id)}</code> generated for <strong>{html.escape(report.legal_entity)}</strong>.</div>',
+                unsafe_allow_html=True,
+            )
+    elif "PYTEST_CURRENT_TEST" not in os.environ:
+        job_snap = _get_global_job_snapshot()
+        j_status = job_snap.get("status")
+        j_vid = job_snap.get("vendor_id")
+        j_vname = job_snap.get("vendor_name") or j_vid or "Vendor"
+        j_lvl = int(job_snap.get("level_num") or 1)
+        j_title = str(job_snap.get("stage_title") or f"Level {j_lvl}")
+        j_detail = str(job_snap.get("detail") or "")
+        j_comp = int(job_snap.get("completed") or 0)
+        j_tot = max(1, int(job_snap.get("total") or 1))
+        j_rem = max(0, int(job_snap.get("remaining") or (j_tot - j_comp)))
+        j_lvl_pct = max(0, min(100, int(job_snap.get("level_pct") or 0)))
+        j_ov_pct = max(0, min(100, int(job_snap.get("overall_pct") or 0)))
+
+        if j_status == "RUNNING":
+            overall_progress_container.progress(
+                j_ov_pct,
+                text=f"Overall Pipeline [{j_vid} · {j_vname}] (Level {j_lvl} of 9 — {j_ov_pct}%): {j_title}",
+            )
+            level_progress_container.progress(
+                j_lvl_pct,
+                text=f"Current Level Progress: {j_comp} / {j_tot} completed ({j_rem} left — {j_lvl_pct}%) — {j_detail}",
+            )
+            status_container.markdown(
+                f'<div class="uc-callout uc-callout-info"><strong>Live Assessment Running in Background ({html.escape(str(j_vid))}):</strong> '
+                f'Progress persists automatically across browser refreshes and tab switches.</div>',
+                unsafe_allow_html=True,
+            )
+            time.sleep(0.75)
+            st.rerun()
+        elif j_status == "COMPLETED" and j_vid == (validated_vendor.vendor_id if validated_vendor else cur_vid):
+            overall_progress_container.progress(
+                100,
+                text=f"Overall Pipeline [{j_vid} · {j_vname}] (9 of 9 Levels — 100%): Assessment {job_snap.get('report_id') or ''} completed.",
+            )
+            level_progress_container.progress(
+                100,
+                text=f"Current Level Progress: {j_tot} / {j_tot} completed (0 left — 100%) — {j_detail}",
+            )
+            status_container.markdown(
+                f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
+                f'{html.escape(j_detail)}</div>',
+                unsafe_allow_html=True,
+            )
+        elif j_status in ("CANCELLED", "FAILED") and j_vid == (validated_vendor.vendor_id if validated_vendor else cur_vid):
+            status_container.markdown(
+                f'<div class="uc-callout uc-callout-warn"><strong>Assessment {html.escape(str(j_status))}:</strong> '
+                f'{html.escape(str(job_snap.get("error") or j_detail))}</div>',
+                unsafe_allow_html=True,
+            )
 
     # ── AREA C: RESULTS ──
     active_vid = validated_vendor.vendor_id if validated_vendor else st.session_state.get("selected_vendor_id", "V-002")

@@ -190,7 +190,9 @@ def test_synthetic_fixture_mode_renders_all_nine_canonical_levels_and_level_3b_s
 def test_real_osint_mode_with_missing_search_credentials_shows_incomplete_assessment(
     tmp_path: Path,
 ) -> None:
-    """Verify Real OSINT Mode with blank MERIDIAN_SERPAPI_KEY marks queries UNAVAILABLE, blocks Level 3, and yields INCOMPLETE_ASSESSMENT."""
+    """Verify Real OSINT Mode with blank MERIDIAN_SERPER_API_KEY marks queries UNAVAILABLE, blocks Level 3, and yields INCOMPLETE_ASSESSMENT."""
+    from meridian_assessment.services.osint import SerperSearchBackend
+
     vendors = {v.vendor_id: v for v in MeridianCSVVendorLoader().load(Path("data/input/meridian_vendors.csv"))}
     fiserv = vendors["V-002"]
 
@@ -199,6 +201,7 @@ def test_real_osint_mode_with_missing_search_credentials_shows_incomplete_assess
         artifact_dir=tmp_path / "real_unconf_artifacts",
     )
     pipeline = MeridianEndToEndPipeline(
+        search_backend=SerperSearchBackend(api_key=""),
         evidence_repository=repo,
         enable_local_llm_from_env=False,
     )
@@ -567,6 +570,13 @@ def test_streamlit_app_renders_cleanly_without_exceptions() -> None:
 
     # Trigger sample walkthrough on Assessments and verify Evidence and Reports render populated views cleanly
     at.button(key="uc_top_nav_Assessments").click()
+    at.run(timeout=30)
+    assert not at.exception
+    at.selectbox(key="assess_execution_mode_select").set_value(
+        "Sample Assessment (Pre-Collected Demonstration Fixtures)"
+    )
+    for ck_key in ["assess_ai_l3b", "assess_ai_l5", "assess_ai_l6", "assess_ai_l8"]:
+        at.checkbox(key=ck_key).set_value(False)
     at.run(timeout=30)
     assert not at.exception
     at.button(key="btn_execute_assessment_primary").click()

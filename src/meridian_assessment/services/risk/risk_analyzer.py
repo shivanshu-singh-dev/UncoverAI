@@ -270,6 +270,7 @@ class AIRiskAnalyzer:
         verdict: AIUseVerdictResult,
         data_classification_accessed: Optional[str] = None,
         service_product_provided: Optional[str] = None,
+        progress_callback: Optional[Any] = None,
     ) -> list[AIRiskFinding]:
         """Generate evidence-backed R1–R8 findings and link finding IDs back onto EvidenceRecord objects."""
         weight_by_id = {w.evidence_id: w for w in weighted_items}
@@ -668,7 +669,13 @@ class AIRiskAnalyzer:
 
         # Optional Level 8 narrative explanation drafting via Model B (mistral:latest)
         summary_ok, _ = self.summary_llm_adapter.is_configured()
-        for rf in findings:
+        total_f = len(findings)
+        for idx, rf in enumerate(findings, start=1):
+            if callable(progress_callback):
+                try:
+                    progress_callback(idx, max(1, total_f), rf)
+                except Exception:
+                    pass
             if summary_ok:
                 llm_draft = self.summary_llm_adapter.draft_finding_explanation(
                     rf,

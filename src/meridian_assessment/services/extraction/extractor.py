@@ -1356,6 +1356,110 @@ class OSINTExtractionService:
             is_synthetic_fixture=is_synthetic_fixture,
         )
 
+    @staticmethod
+    def _score_excerpt_relevance(excerpt: str, legal_entity: str = "") -> int:
+        """Score an extracted paragraph block so large HTML/PDF documents prioritize AI, automation, and governance passages."""
+        low = excerpt.lower()
+        score = 0
+        high_signal_terms = (
+            "ignore previous",
+            "disregard all",
+            "system prompt",
+            "developer mode",
+            "openai",
+            "anthropic",
+            "bedrock",
+            "vertex ai",
+            "azure openai",
+            "cohere",
+            "mistral",
+            "hugging face",
+            "huggingface",
+            "gpt-",
+            "claude",
+            "llama",
+            "gemini",
+            "titan",
+            "xgboost",
+            "random forest",
+            "large language model",
+            "llm",
+            "generative ai",
+            "genai",
+            "machine learning",
+            "neural network",
+            "deep learning",
+            "predictive model",
+            "anomaly detection",
+            "scoring model",
+            "classification model",
+            "agentic",
+            "autonomous agent",
+            "tool calling",
+            "automated decision",
+            "retrieval-augmented",
+            "vector embedding",
+            "inference",
+            "subprocessor",
+            "not used to train",
+            "never used to train",
+            "model training",
+            "fine-tun",
+            "zero data retention",
+            "zero-data-retention",
+            "zdr",
+            "opt-in",
+            "disabled by default",
+            "ai-powered",
+            "ai powered",
+            "next-generation intelligence",
+            "smart automation",
+            "cutting-edge ai",
+            "intelligent platform",
+            "batch scheduling",
+            "batch job",
+            "job orchestration",
+            "cron schedule",
+            "rules engine",
+            "rule-based workflow",
+            "robotic process automation",
+            "rpa",
+            "deterministic workflow",
+        )
+        for term in high_signal_terms:
+            if term in low:
+                score += 10
+
+        medium_signal_terms = (
+            "artificial intelligence",
+            "automation",
+            "customer data",
+            "client data",
+            "pii",
+            "retention",
+            "encryption",
+            "multi-tenant",
+            "tenant isolation",
+            "soc 2",
+            "iso 42001",
+            "dpa",
+            "data processing",
+            "privacy",
+            "security",
+            "architecture",
+            "api endpoint",
+            "release notes",
+        )
+        for term in medium_signal_terms:
+            if term in low:
+                score += 3
+
+        if legal_entity and len(legal_entity.strip()) >= 3 and legal_entity.strip().lower() in low:
+            score += 2
+        if 80 <= len(excerpt) <= 1200:
+            score += 1
+        return score
+
     def build_evidence_records_from_document(
         self,
         doc: ExtractedDocument,
@@ -1363,12 +1467,15 @@ class OSINTExtractionService:
         legal_entity: str,
         domain: str,
         starting_seq: int = 1,
+        max_records_per_document: int = 25,
     ) -> list[EvidenceRecord]:
         """Construct traceable EvidenceRecord items from an ExtractedDocument.
 
         Every `verbatim_excerpt` is an exact substring of `doc.cleaned_text` with recorded
         `char_start` and `char_end` offsets. Never fabricates text for failed/empty extractions
         or documents flagged with `SOURCE_IDENTITY_MISMATCH`.
+        When a scraped document contains many blocks (> 20), deduplicates repeated boilerplate,
+        filters tiny noise fragments, and prioritizes AI/automation/governance-relevant passages.
         """
         s_def = self.source_registry.get_source(doc.source_class)
         grade = s_def.default_evidence_grade if s_def else "C"
@@ -1381,16 +1488,15 @@ class OSINTExtractionService:
         ):
             return []
 
-        records: list[EvidenceRecord] = []
         text = doc.cleaned_text
         blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
 
         search_cursor = 0
-        seq = starting_seq
         current_heading: Optional[str] = None
         current_page: Optional[int] = None
+        raw_candidates: list[tuple[int, str, Optional[str], Optional[int], int, int]] = []
 
-        for block in blocks:
+        for block_idx, block in enumerate(blocks):
             lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
             if not lines:
                 continue
@@ -1419,9 +1525,46 @@ class OSINTExtractionService:
             if idx != -1:
                 search_cursor = char_end
 
+            raw_candidates.append((block_idx, excerpt, current_heading, current_page, char_start, char_end))
+
+        # For large scraped HTML/PDF documents (> 20 blocks), clean boilerplate, deduplicate, and bound to top passages
+        if len(raw_candidates) > 20:
+            seen_norm: set[str] = set()
+            scored_candidates: list[tuple[int, int, str, Optional[str], Optional[int], int, int]] = []
+            for block_idx, excerpt, heading, page_num, c_start, c_end in raw_candidates:
+                norm_key = re.sub(r"\s+", " ", excerpt.lower()).strip()
+                if norm_key in seen_norm:
+                    continue
+                seen_norm.add(norm_key)
+
+                rel_score = self._score_excerpt_relevance(excerpt, legal_entity=legal_entity)
+                word_count = len(re.findall(r"[A-Za-z0-9]+", excerpt))
+                # Skip tiny menu/footer fragments unless they carry an explicit signal
+                if rel_score == 0 and (len(excerpt) < 35 or word_count < 5):
+                    continue
+                scored_candidates.append((rel_score, block_idx, excerpt, heading, page_num, c_start, c_end))
+
+            if len(scored_candidates) > max_records_per_document:
+                # Sort by relevance score descending, then earlier position in document
+                scored_candidates.sort(key=lambda item: (-item[0], item[1]))
+                top_subset = scored_candidates[:max_records_per_document]
+                # Restore natural document reading order
+                top_subset.sort(key=lambda item: item[1])
+                selected_candidates = [
+                    (item[1], item[2], item[3], item[4], item[5], item[6]) for item in top_subset
+                ]
+            else:
+                selected_candidates = [
+                    (item[1], item[2], item[3], item[4], item[5], item[6]) for item in scored_candidates
+                ]
+        else:
+            selected_candidates = raw_candidates
+
+        records: list[EvidenceRecord] = []
+        seq = starting_seq
+        for _, excerpt, heading, page_num, char_start, char_end in selected_candidates:
             ev_id = f"EV_{doc.vendor_id}_{seq:03d}"
             seq += 1
-
             records.append(
                 EvidenceRecord(
                     evidence_id=ev_id,
@@ -1437,9 +1580,9 @@ class OSINTExtractionService:
                     source_integrity_status=doc.source_integrity_status,
                     retrieved_at=doc.retrieved_at,
                     page_title=doc.title,
-                    section_heading=current_heading,
+                    section_heading=heading,
                     verbatim_excerpt=excerpt,
-                    page_number=current_page,
+                    page_number=page_num,
                     char_start=char_start,
                     char_end=char_end,
                     content_sha256=doc.content_sha256 or compute_sha256(text),

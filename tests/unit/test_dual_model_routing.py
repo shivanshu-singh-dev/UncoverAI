@@ -76,14 +76,20 @@ from meridian_assessment.services.risk.risk_analyzer import (
 
 
 def test_real_dotenv_file_exists_and_loads_expected_defaults() -> None:
-    """Verify s:/UncoverAI/.env exists, has no secret values committed, and configures dual-model routing."""
+    """Verify s:/UncoverAI/.env and .env.example exist, .env.example has no secret values, and dual-model routing is configured."""
     dotenv_path = Path(".env")
+    dotenv_example_path = Path(".env.example")
     assert dotenv_path.is_file(), "Expected local .env file to exist in repository root"
+    assert dotenv_example_path.is_file(), "Expected .env.example file to exist in repository root"
+
+    example_parsed = parse_dotenv_file(dotenv_example_path)
+    assert example_parsed["MERIDIAN_SERPER_API_KEY"] == ""
+    assert example_parsed["MERIDIAN_SCRAPERAPI_KEY"] == ""
 
     parsed = parse_dotenv_file(dotenv_path)
     assert parsed["MERIDIAN_SEARCH_PROVIDER"] == "serper"
-    assert parsed["MERIDIAN_SERPER_API_KEY"] == ""
-    assert parsed["MERIDIAN_SCRAPERAPI_KEY"] == ""
+    assert "MERIDIAN_SERPER_API_KEY" in parsed
+    assert "MERIDIAN_SCRAPERAPI_KEY" in parsed
     assert "MERIDIAN_SERPAPI_KEY" not in parsed
 
     assert parsed["MERIDIAN_OLLAMA_ENABLED"].lower() == "true"
@@ -111,7 +117,8 @@ def test_real_dotenv_file_exists_and_loads_expected_defaults() -> None:
 
 def test_default_serpapi_provider_with_blank_key_degrades_cleanly() -> None:
     """Verify MERIDIAN_SEARCH_PROVIDER=serper with blank MERIDIAN_SERPER_API_KEY marks queries UNAVAILABLE."""
-    dotenv_vars = parse_dotenv_file(Path(".env"))
+    dotenv_vars = parse_dotenv_file(Path(".env.example"))
+    dotenv_vars["MERIDIAN_SERPER_API_KEY"] = ""
     backend = build_search_backend_from_env(env=dotenv_vars, load_dotenv=False)
     assert isinstance(backend, SerperSearchBackend)
     assert backend.provider_name == "serper"

@@ -365,6 +365,8 @@ class MeridianCriticalityEngine:
             if pat in text_corpus:
                 o2_evidence = pat
                 break
+        if o2_evidence is None and bool(getattr(vendor, "is_sole_source", False)):
+            o2_evidence = "is_sole_source=True"
 
         o2_triggered = bool(o2_evidence and O.score == 3)
         overrides.append(

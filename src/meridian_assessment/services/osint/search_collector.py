@@ -1055,6 +1055,7 @@ class OSINTSearchCollector:
         retry_unavailable: bool = False,
         persist: bool = False,
         state_path: Path = DEFAULT_OSINT_STATE_PATH,
+        progress_callback: Optional[Callable[[int, int, PlannedQuery], None]] = None,
     ) -> OSINTInvestigationPlan:
         """Execute eligible queries in `plan`, collect/deduplicate candidate URLs, and update source coverage.
 
@@ -1069,6 +1070,15 @@ class OSINTSearchCollector:
             eligible_statuses.add(SearchExecutionStatus.UNAVAILABLE)
 
         target_id_set = set(query_ids) if query_ids is not None else None
+        eligible_total = min(
+            self.max_queries_per_run,
+            sum(
+                1
+                for q in plan.planned_queries
+                if (target_id_set is None or q.query_id in target_id_set)
+                and q.execution_status in eligible_statuses
+            ),
+        )
 
         # Index existing candidate URLs by canonical URL for conservative deduplication & provenance merging
         candidates_by_url: dict[str, CandidateURL] = {}
@@ -1096,6 +1106,11 @@ class OSINTSearchCollector:
                 continue
 
             queries_processed += 1
+            if callable(progress_callback):
+                try:
+                    progress_callback(queries_processed, max(1, eligible_total), q)
+                except Exception:
+                    pass
             now_iso = _utc_now_iso()
             status, response, attempts, error_msg = self._execute_single_query_with_retry(q)
 

@@ -212,6 +212,10 @@ class MeridianEndToEndPipeline:
         search_backend: Optional[SearchBackend] = None,
         model_router: Optional[OllamaModelRouter] = None,
         enable_local_llm_from_env: Optional[bool] = None,
+        enable_triage_llm: Optional[bool] = None,
+        enable_rag_embeddings: Optional[bool] = None,
+        enable_classification_llm: Optional[bool] = None,
+        enable_summary_llm: Optional[bool] = None,
         triage_llm_provider: Optional[URLTriageLLMProvider] = None,
         fetch_adapter: Optional[ContentFetchAdapter] = None,
         evidence_repository: Optional[EvidenceRepository] = None,
@@ -226,6 +230,15 @@ class MeridianEndToEndPipeline:
         self.search_backend = search_backend or build_search_backend_from_env()
         self._local_llm_disable_reason: Optional[str] = None
 
+        any_stage_llm_requested = any(
+            flag is True for flag in (enable_triage_llm, enable_classification_llm, enable_summary_llm)
+        )
+        effective_master_llm = (
+            True
+            if any_stage_llm_requested
+            else enable_local_llm_from_env
+        )
+
         if model_router is not None:
             self.model_router = model_router
         else:
@@ -235,18 +248,20 @@ class MeridianEndToEndPipeline:
             # default to offline deterministic mode so unit tests remain fast and network-free.
             in_pytest = "PYTEST_CURRENT_TEST" in os.environ
             cfg = ModelRoutingConfig.from_env_and_config()
-            if enable_local_llm_from_env is False:
+            if enable_rag_embeddings is not None:
+                cfg.enable_rag_embeddings = bool(enable_rag_embeddings)
+            if effective_master_llm is False:
                 cfg.enabled = False
                 self._local_llm_disable_reason = (
                     "Local AI analysis disabled for deterministic run; deterministic rules applied."
                 )
-            elif enable_local_llm_from_env is None and in_pytest:
+            elif effective_master_llm is None and in_pytest:
                 cfg.enabled = False
                 self._local_llm_disable_reason = (
                     "Local AI analysis bypassed in offline test mode; deterministic rules applied."
                 )
             else:
-                if enable_local_llm_from_env is True:
+                if effective_master_llm is True:
                     cfg.enabled = True
                 if cfg.enabled:
                     if readiness is None and not in_pytest:
@@ -255,7 +270,7 @@ class MeridianEndToEndPipeline:
                         )
 
                         readiness = SystemReadinessInspector.check_system_readiness(
-                            local_analysis_override=enable_local_llm_from_env
+                            local_analysis_override=effective_master_llm
                         )
                     if readiness is not None and not getattr(readiness, "ollama_reachable", False):
                         cfg.enabled = False
@@ -271,19 +286,37 @@ class MeridianEndToEndPipeline:
         llama_ok = True if readiness is None else bool(getattr(readiness, "llama3_2_installed", False))
         mistral_ok = True if readiness is None else bool(getattr(readiness, "mistral_installed", False))
 
+        triage_enabled = (
+            enable_triage_llm
+            if enable_triage_llm is not None
+            else self.model_router.config.enabled
+        )
+        cls_enabled = (
+            enable_classification_llm
+            if enable_classification_llm is not None
+            else self.model_router.config.enabled
+        )
+        sum_enabled = (
+            enable_summary_llm
+            if enable_summary_llm is not None
+            else self.model_router.config.enabled
+        )
+
         if triage_llm_provider is not None:
             resolved_triage_llm: Optional[URLTriageLLMProvider] = triage_llm_provider
-        elif self.model_router.config.enabled and llama_ok:
+        elif self.model_router.config.enabled and triage_enabled and llama_ok:
             resolved_triage_llm = OllamaURLTriageProvider(router=self.model_router)
         else:
             resolved_triage_llm = None
 
         if classification_llm_adapter is not None:
             resolved_cls_llm: Optional[LocalLLMClassificationAdapter] = classification_llm_adapter
-        elif self.model_router.config.enabled and mistral_ok:
+        elif self.model_router.config.enabled and cls_enabled and mistral_ok:
             resolved_cls_llm = OllamaClassificationAdapter(router=self.model_router)
         else:
-            if self.model_router.config.enabled and not mistral_ok:
+            if enable_classification_llm is False:
+                cls_reason = "Level 6 Local AI classification disabled by stage toggle; deterministic rules applied."
+            elif self.model_router.config.enabled and not mistral_ok:
                 cls_reason = (
                     f"Local analysis unavailable: required analysis model "
                     f"'{self.model_router.config.analysis_model}' is not installed."
@@ -296,7 +329,7 @@ class MeridianEndToEndPipeline:
 
         if risk_summary_llm_adapter is not None:
             resolved_sum_llm: Optional[RiskSummaryLLMProvider] = risk_summary_llm_adapter
-        elif self.model_router.config.enabled and mistral_ok:
+        elif self.model_router.config.enabled and sum_enabled and mistral_ok:
             resolved_sum_llm = OllamaRiskSummaryAdapter(router=self.model_router)
         else:
             resolved_sum_llm = None
@@ -305,10 +338,15 @@ class MeridianEndToEndPipeline:
         from meridian_assessment.services.readiness_and_exports import _check_huggingface_model_cached_locally
         import importlib.util
 
+        rag_enabled_flag = (
+            bool(enable_rag_embeddings)
+            if enable_rag_embeddings is not None
+            else bool(self.model_router.config.enable_rag_embeddings)
+        )
         if embedding_provider is not None:
             resolved_emb_provider: EmbeddingProvider = embedding_provider
         elif (
-            self.model_router.config.enable_rag_embeddings
+            rag_enabled_flag
             and importlib.util.find_spec("sentence_transformers") is not None
             and _check_huggingface_model_cached_locally(self.model_router.config.embedding_model)
         ):
@@ -319,9 +357,9 @@ class MeridianEndToEndPipeline:
         else:
             emb_reason = (
                 f"Embedding model '{self.model_router.config.embedding_model}' is disabled "
-                "(MERIDIAN_ENABLE_RAG_EMBEDDINGS=false); Level 5 runs deterministic 500-token chunking "
+                "(Level 5 RAG toggle off); Level 5 runs deterministic 500-token chunking "
                 "and passes all extracted evidence directly to Level 6."
-                if not self.model_router.config.enable_rag_embeddings
+                if not rag_enabled_flag
                 else f"Embedding model '{self.model_router.config.embedding_model}' or 'sentence-transformers' is not installed/cached locally; "
                 "Level 5 runs deterministic 500-token chunking and passes all extracted evidence directly to Level 6."
             )
@@ -366,10 +404,25 @@ class MeridianEndToEndPipeline:
         unavailable_integrations: list[str] = []
         limitations: list[str] = []
 
-        def _notify_progress(level_num: int, stage_title: str, detail: str) -> None:
+        _emitted_3arg_levels: set[int] = set()
+
+        def _notify_progress(
+            level_num: int,
+            stage_title: str,
+            detail: str,
+            completed: int = 0,
+            total: int = 1,
+        ) -> None:
             if callable(progress_callback):
                 try:
-                    progress_callback(level_num, stage_title, detail)
+                    progress_callback(level_num, stage_title, detail, completed, total)
+                except TypeError:
+                    if level_num not in _emitted_3arg_levels:
+                        _emitted_3arg_levels.add(level_num)
+                        try:
+                            progress_callback(level_num, stage_title, detail)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -378,7 +431,13 @@ class MeridianEndToEndPipeline:
         self.model_router.vram_unload_events.clear()
 
         # ── LEVEL 1: Criticality Tiering (D/P/R/O/V + O1–O5) ──
-        _notify_progress(1, "Level 1: Criticality Tiering", f"Evaluating D/P/R/O/V factors and O1–O5 overrides for {vendor.vendor_name}...")
+        _notify_progress(
+            1,
+            "Level 1: Criticality Tiering",
+            f"Evaluating D/P/R/O/V factors and O1–O5 overrides for {vendor.vendor_name}...",
+            completed=0,
+            total=1,
+        )
         crit_res = criticality_result or self.criticality_engine.evaluate(
             vendor, human_review=human_criticality_override
         )
@@ -390,6 +449,13 @@ class MeridianEndToEndPipeline:
             crit_res, human_criticality_override
         )
         crit_audit = self.criticality_engine.generate_audit_trail(crit_res)
+        _notify_progress(
+            1,
+            "Level 1: Criticality Tiering",
+            f"Completed criticality tiering: Effective Criticality='{effective_crit}' (Base={crit_res.base_score}).",
+            completed=1,
+            total=1,
+        )
         stage_ledger.append(
             StageExecutionRecord(
                 level_number=1,
@@ -407,12 +473,25 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 2: Assessment Depth Scoping ──
-        _notify_progress(2, "Level 2: Assessment Depth Scoping", f"Mapping '{effective_crit}' criticality to S1–S12 depth profile and query plan...")
+        _notify_progress(
+            2,
+            "Level 2: Assessment Depth Scoping",
+            f"Mapping '{effective_crit}' criticality to S1–S12 depth profile and query plan...",
+            completed=0,
+            total=1,
+        )
         plan = self.investigation_planner.plan_investigation(
             vendor=vendor,
             criticality_input=crit_res,
             human_review=human_criticality_override,
             existing_plan=existing_plan,
+        )
+        _notify_progress(
+            2,
+            "Level 2: Assessment Depth Scoping",
+            f"Scoped '{plan.selected_depth_profile}' profile ({len(plan.planned_queries)} queries across {len(plan.required_source_classes)} required sources).",
+            completed=1,
+            total=1,
         )
         stage_ledger.append(
             StageExecutionRecord(
@@ -439,18 +518,40 @@ class MeridianEndToEndPipeline:
             getattr(self.triage_service.llm_provider, "model_name", None)
             or self.model_router.resolve_model_for_task(LLMTaskType.URL_TRIAGE)
         )
+        total_planned_q = max(1, len(plan.planned_queries))
         _notify_progress(
             3,
             "Level 3: Source Identification & Reconnaissance",
-            f"Executing OSINT search ({self.search_backend.provider_name}) and Level 3B URL triage ({triage_model_name})...",
+            f"Starting Level 3A OSINT search ({self.search_backend.provider_name}) across {len(plan.planned_queries)} queries...",
+            completed=0,
+            total=total_planned_q,
         )
         if execute_searches:
             collector = OSINTSearchCollector(backend=self.search_backend, retry_backoff_seconds=0.0)
-            collector.execute_planned_queries(plan, persist=False)
+            collector.execute_planned_queries(
+                plan,
+                persist=False,
+                progress_callback=lambda q_done, q_tot, q_obj: _notify_progress(
+                    3,
+                    "Level 3: Source Identification & Reconnaissance (3A Search)",
+                    f"Executing search query {q_done}/{q_tot} ({max(0, q_tot - q_done)} left): {q_obj.query_id}",
+                    completed=q_done,
+                    total=q_tot,
+                ),
+            )
         if not search_ok:
             unavailable_integrations.append(f"Search Backend ({self.search_backend.provider_name}): {search_msg}")
 
-        triage_decisions: list[URLTriageDecision] = self.triage_service.triage_plan_candidates(plan)
+        triage_decisions: list[URLTriageDecision] = self.triage_service.triage_plan_candidates(
+            plan,
+            progress_callback=lambda c_done, c_tot, c_obj: _notify_progress(
+                3,
+                "Level 3: Source Identification & Reconnaissance (3B URL Triage)",
+                f"Triaging candidate URL {c_done}/{c_tot} ({max(0, c_tot - c_done)} left) [{triage_model_name if triage_llm_ok else 'Deterministic'}]: {c_obj.url[:60]}",
+                completed=c_done,
+                total=c_tot,
+            ),
+        )
         fetch_decisions = [d for d in triage_decisions if d.action == URLTriageAction.FETCH]
 
         triage_llm_succeeded = sum(1 for d in triage_decisions if d.decision_method.value == "LOCAL_LLM")
@@ -493,10 +594,13 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 4: Data Scraping & Point-of-Capture Traceability ──
+        total_fetches = max(1, len(fetch_decisions))
         _notify_progress(
             4,
             "Level 4: Data Scraping & Point-of-Capture Traceability",
             f"Extracting content and computing SHA-256 provenance from {len(fetch_decisions)} triaged URL(s)...",
+            completed=0,
+            total=total_fetches,
         )
         extracted_docs: list[ExtractedDocument] = []
         evidence_records: list[EvidenceRecord] = (
@@ -512,6 +616,13 @@ class MeridianEndToEndPipeline:
         if execute_extraction and fetch_decisions:
             seq_ev = len(evidence_records) + 1
             for doc_idx, t_dec in enumerate(fetch_decisions, start=1):
+                _notify_progress(
+                    4,
+                    "Level 4: Data Scraping & Point-of-Capture Traceability",
+                    f"Scraping & verifying URL {doc_idx}/{len(fetch_decisions)} ({max(0, len(fetch_decisions) - doc_idx)} left): {t_dec.url[:65]}",
+                    completed=doc_idx,
+                    total=len(fetch_decisions),
+                )
                 cand_obj = next((c for c in plan.candidate_urls if c.candidate_id == t_dec.candidate_id), None)
                 q_ids = cand_obj.query_ids if cand_obj else []
                 doc = self.extraction_service.extract_from_url(
@@ -604,12 +715,27 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 5: Semantic Filtering & RAG Chunking (Separate Embedding Model) ──
+        total_ev_l5 = max(1, len(evidence_records))
         _notify_progress(
             5,
             "Level 5: Semantic Filtering & RAG Chunking",
             f"Chunking {len(evidence_records)} evidence item(s) ({self.rag_service.model_name})...",
+            completed=0,
+            total=total_ev_l5,
         )
         _, rag_summary = self.rag_service.retrieve_relevant_chunks(evidence_records)
+        _notify_progress(
+            5,
+            "Level 5: Semantic Filtering & RAG Chunking",
+            f"Created {rag_summary.chunks_created} chunks; {len(rag_summary.matches)} semantic concept matches retrieved.",
+            completed=total_ev_l5,
+            total=total_ev_l5,
+        )
+        rag_candidate_ids = {
+            m.chunk.evidence_id
+            for m in rag_summary.matches
+            if m.chunk is not None and m.chunk.evidence_id
+        }
         emb_ok, emb_msg = self.rag_service.embedding_provider.is_available()
         if not emb_ok:
             unavailable_integrations.append(f"RAG Embedding Model ({self.rag_service.model_name}): {emb_msg}")
@@ -644,10 +770,13 @@ class MeridianEndToEndPipeline:
             getattr(self.classification_service.llm_adapter, "model_name", None)
             or self.model_router.resolve_model_for_task(LLMTaskType.EVIDENCE_CLASSIFICATION)
         )
+        total_ev_l6 = max(1, len(evidence_records))
         _notify_progress(
             6,
             "Level 6: Signal Classification",
-            f"Classifying {len(evidence_records)} evidence item(s) (Model B: {cls_model_name}, E14 prompt-injection guard active)...",
+            f"Classifying {len(evidence_records)} evidence item(s) (Model B: {cls_model_name if llm_ok else 'Deterministic'}, E14 prompt-injection guard active)...",
+            completed=0,
+            total=total_ev_l6,
         )
         if not llm_ok:
             unavailable_integrations.append(f"Local LLM Classifier ({cls_model_name}): {llm_msg}")
@@ -656,6 +785,14 @@ class MeridianEndToEndPipeline:
             evidence_records,
             meridian_service_scope=vendor.service_product_provided,
             meridian_business_process=vendor.business_process_supported,
+            rag_candidate_evidence_ids=rag_candidate_ids,
+            progress_callback=lambda ev_done, ev_tot, ev_obj: _notify_progress(
+                6,
+                "Level 6: Signal Classification",
+                f"Classifying evidence item {ev_done}/{ev_tot} ({max(0, ev_tot - ev_done)} left) [{cls_model_name if llm_ok else 'Deterministic'}]: {ev_obj.evidence_id}",
+                completed=ev_done,
+                total=ev_tot,
+            ),
         )
         cls_llm_succeeded = sum(
             1 for c in classifications if c.classification_method.value == "LOCAL_LLM_VALIDATED"
@@ -690,10 +827,13 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 7: Evidentiary Weighting (E1–E14), G1–G4 Gates & AI-Use Verdict ──
+        total_ev_l7 = max(1, len(evidence_records))
         _notify_progress(
             7,
             "Level 7: Evidentiary Weighting",
-            f"Applying deterministic E1–E14 rules, G1–G4 gates, and AI-use verdict logic...",
+            "Applying deterministic E1–E14 rules, G1–G4 gates, and AI-use verdict logic...",
+            completed=0,
+            total=total_ev_l7,
         )
         scalar_weights_cfg = self.scoring_engine.policy_data.get("evidentiary_weighting", {}).get("exact_scalar_weights")
         active_scalars = (
@@ -711,6 +851,13 @@ class MeridianEndToEndPipeline:
             analyst_gate_overrides=analyst_gate_overrides,
         )
         tracker.sync_plan_stop_status(plan)
+        _notify_progress(
+            7,
+            "Level 7: Evidentiary Weighting",
+            f"Completed E1–E14 weighting across {len(weighted_items)} items; AI-Use Verdict: {ai_verdict.verdict.value}.",
+            completed=total_ev_l7,
+            total=total_ev_l7,
+        )
 
         stage_ledger.append(
             StageExecutionRecord(
@@ -737,7 +884,9 @@ class MeridianEndToEndPipeline:
         _notify_progress(
             8,
             "Level 8: Risk Surfacing & Summarization",
-            f"Evaluating R1–R8 risk rules and drafting evidence-grounded explanations ({sum_model_name})...",
+            f"Evaluating R1–R8 risk rules and drafting evidence-grounded explanations ({sum_model_name if sum_llm_ok else 'Deterministic'})...",
+            completed=0,
+            total=8,
         )
         risk_findings = self.risk_analyzer.analyze_vendor_risks(
             vendor_id=vendor.vendor_id,
@@ -747,6 +896,13 @@ class MeridianEndToEndPipeline:
             verdict=ai_verdict,
             data_classification_accessed=vendor.data_classification_accessed,
             service_product_provided=vendor.service_product_provided,
+            progress_callback=lambda rf_done, rf_tot, rf_obj: _notify_progress(
+                8,
+                "Level 8: Risk Surfacing & Summarization",
+                f"Summarizing risk finding {rf_done}/{rf_tot} ({max(0, rf_tot - rf_done)} left) [{sum_model_name if sum_llm_ok else 'Deterministic'}]: {rf_obj.risk_rule_id}",
+                completed=rf_done,
+                total=rf_tot,
+            ),
         )
         sum_llm_succeeded = sum(1 for rf in risk_findings if rf.summary_method == "LOCAL_LLM_VALIDATED")
         sum_task_tel = self.model_router.get_task_telemetry_summary(LLMTaskType.RISK_SUMMARIZATION)
@@ -789,6 +945,8 @@ class MeridianEndToEndPipeline:
             9,
             "Level 9: Deterministic Risk Rating",
             "Evaluating deterministic risk formula (M_c * sum(S_i * W_i)) and policy readiness...",
+            completed=1,
+            total=1,
         )
         completeness_str = "COMPLETED" if ai_verdict.depth_completed else "INCOMPLETE"
         risk_score_res = self.scoring_engine.calculate_vendor_risk_score(

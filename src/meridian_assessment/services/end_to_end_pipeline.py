@@ -766,15 +766,35 @@ class MeridianEndToEndPipeline:
                             artifact_cache_hits += 1
 
                 if doc is None:
-                    doc = self.extraction_service.extract_from_url(
-                        vendor_id=vendor.vendor_id,
-                        url=t_dec.url,
-                        source_class=t_dec.candidate_source_class,
-                        query_ids=q_ids,
-                        triage_action=t_dec.action.value,
-                        document_index=doc_idx,
-                        is_synthetic_fixture=is_stub_fetch,
-                    )
+                    try:
+                        doc = self.extraction_service.extract_from_url(
+                            vendor_id=vendor.vendor_id,
+                            url=t_dec.url,
+                            source_class=t_dec.candidate_source_class,
+                            query_ids=q_ids,
+                            triage_action=t_dec.action.value,
+                            document_index=doc_idx,
+                            is_synthetic_fixture=is_stub_fetch,
+                        )
+                    except Exception as exc:
+                        doc = ExtractedDocument(
+                            document_id=doc_id_candidate,
+                            vendor_id=vendor.vendor_id,
+                            url=t_dec.url,
+                            canonical_url=t_dec.url,
+                            requested_url=t_dec.url,
+                            final_response_url="UNKNOWN",
+                            retrieval_method="FETCH_FAILED",
+                            source_integrity_status="FETCH_ERROR",
+                            source_class=t_dec.candidate_source_class,
+                            content_type="unknown",
+                            retrieved_at=now_iso,
+                            extraction_status=ExtractionStatus.FETCH_FAILED,
+                            extraction_limitations=[f"Extraction failed for candidate URL: {exc}"],
+                            query_ids=q_ids,
+                            triage_action=t_dec.action.value,
+                            is_synthetic_fixture=is_stub_fetch,
+                        )
 
                 extracted_docs.append(doc)
                 if doc.extraction_status == ExtractionStatus.EXTRACTED:

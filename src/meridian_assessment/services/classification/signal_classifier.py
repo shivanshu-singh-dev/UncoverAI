@@ -782,6 +782,13 @@ class SignalClassificationService:
             telemetry["llm_batches_executed"] += 1
             telemetry["llm_requests_sent"] += 1
 
+            if callable(progress_callback) and batch_evs:
+                try:
+                    # Notify progress so UI updates during LLM batch execution
+                    progress_callback(min(total, start_i + len(batch_indices)), total, batch_evs[0])
+                except Exception:
+                    pass
+
             batch_out_map = self.llm_adapter.classify_excerpt_batch(
                 batch_evs,
                 meridian_service_scope=meridian_service_scope,
@@ -824,6 +831,11 @@ class SignalClassificationService:
             if callable(checkpoint_callback):
                 try:
                     checkpoint_callback(b_num, telemetry)
+                except TypeError:
+                    try:
+                        checkpoint_callback(len(prevalidated_by_idx), total, [])
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 

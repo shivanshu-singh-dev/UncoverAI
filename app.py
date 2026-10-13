@@ -2580,18 +2580,25 @@ def _render_evidence_page() -> None:
             matching_items.append((rpt, ev, we, sup_gates))
 
     if rejected_docs:
-        for v_name, r_doc in rejected_docs:
-            st.markdown(
-                f"""
-                <div class="uc-callout uc-callout-danger">
-                    <strong>Rejected Upstream Document ({html.escape(v_name)} · {html.escape(r_doc.document_id)}):</strong>
-                    Requested <code>{html.escape(r_doc.requested_url or r_doc.url)}</code> via <code>{html.escape(r_doc.retrieval_method)}</code>,
-                    but received identity metadata for <code>{html.escape(r_doc.declared_og_url or r_doc.declared_canonical_url or r_doc.title or "unrelated site")}</code>.
-                    Status: <code>SOURCE_IDENTITY_MISMATCH</code> (blocked from evidence register).
-                </div>
-                """,
-                unsafe_allow_html=True,
+        with st.expander(
+            f"⚠️ Source Identity Verification: {len(rejected_docs)} upstream document(s) excluded from evidence register",
+            expanded=False,
+        ):
+            st.caption(
+                "In accordance with anti-poisoning controls, the following upstream documents returned metadata identifying an unrelated domain and were blocked from entering the vendor evidence register:"
             )
+            for v_name, r_doc in rejected_docs:
+                st.markdown(
+                    f"""
+                    <div class="uc-callout uc-callout-warning" style="margin-bottom: 8px;">
+                        <strong>Excluded ({html.escape(v_name)} · {html.escape(r_doc.document_id)}):</strong>
+                        Requested <code>{html.escape(r_doc.requested_url or r_doc.url)}</code> via <code>{html.escape(r_doc.retrieval_method)}</code>,
+                        received identity for <code>{html.escape(r_doc.declared_og_url or r_doc.declared_canonical_url or r_doc.title or "unrelated site")}</code>.
+                        Status: <code>SOURCE_IDENTITY_MISMATCH</code>.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
     if not matching_items:
         target_vid = vendor_choice if vendor_choice != "All Assessed Vendors" else cur_vid

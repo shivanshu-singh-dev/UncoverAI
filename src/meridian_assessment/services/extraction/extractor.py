@@ -18,10 +18,13 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 import hashlib
 from html.parser import HTMLParser
+import http.client
 import ipaddress
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import threading
 import time
 from typing import Any, Callable, Optional, Sequence
@@ -123,6 +126,19 @@ def _normalize_host_identity(url_or_host: Optional[str]) -> str:
     return host
 
 
+_KNOWN_STAGING_DOMAINS = frozenset({
+    "mystagingwebsite.com",
+    "wpenginepowered.com",
+    "wpengine.com",
+    "azurewebsites.net",
+    "pages.dev",
+    "webflow.io",
+    "vercel.app",
+    "netlify.app",
+    "github.io",
+})
+
+
 def _hosts_belong_to_same_identity(host_a: str, host_b: str) -> bool:
     """Return True if two normalized hostnames belong to the same domain family."""
     if not host_a or not host_b:
@@ -133,6 +149,12 @@ def _hosts_belong_to_same_identity(host_a: str, host_b: str) -> bool:
         return True
     parts_a = host_a.split(".")
     parts_b = host_b.split(".")
+    # Recognize legitimate vendor staging subdomains (e.g. automworx.mystagingwebsite.com vs automworx.com)
+    if parts_a[0] and parts_a[0] == parts_b[0] and len(parts_a[0]) >= 3:
+        if any(host_a.endswith("." + s) or host_a == s for s in _KNOWN_STAGING_DOMAINS) or any(
+            host_b.endswith("." + s) or host_b == s for s in _KNOWN_STAGING_DOMAINS
+        ):
+            return True
     if len(parts_a) >= 2 and len(parts_b) >= 2 and parts_a[-2:] == parts_b[-2:]:
         # Avoid matching shared multi-part public suffixes like co.uk
         if parts_a[-2] not in ("co", "com", "org", "net", "gov", "edu"):
@@ -742,7 +764,7 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
     def is_configured(self) -> tuple[bool, str]:
         return True, "UrllibPublicFetchAdapter ready."
 
-    def fetch(self, url: str, *, timeout_seconds: float = 10.0, max_bytes: int = 2_000_000) -> FetchResponse:
+    def fetch(self, url: str, *, timeout_seconds: float = 5.0, max_bytes: int = 2_000_000) -> FetchResponse:
         ok, reason = validate_safe_public_url(url)
         if not ok:
             return FetchResponse(
@@ -790,7 +812,7 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
                     content_type=ctype,
                     content_bytes=data,
                 )
-        except TimeoutError as exc:
+        except (TimeoutError, socket.timeout) as exc:
             return FetchResponse(
                 url=url,
                 requested_url=url,
@@ -800,6 +822,19 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
                 status_code=0,
                 error_status=ExtractionStatus.TIMEOUT,
                 error_message=f"Fetch timed out after {timeout_seconds}s: {exc}",
+            )
+        except ssl.SSLError as exc:
+            err_str = str(exc)
+            is_timeout = any(t in err_str.lower() for t in ("timed out", "timeout", "operation did not complete"))
+            return FetchResponse(
+                url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                redirect_chain=redirect_handler.redirect_chain,
+                retrieval_method="DIRECT_HTTP",
+                status_code=0,
+                error_status=ExtractionStatus.TIMEOUT if is_timeout else ExtractionStatus.FETCH_FAILED,
+                error_message=f"SSL transport error: {err_str}",
             )
         except urllib.error.HTTPError as exc:
             return FetchResponse(
@@ -844,6 +879,41 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
                 status_code=0,
                 error_status=ExtractionStatus.FETCH_FAILED,
                 error_message=f"Network error: {exc.reason}",
+            )
+        except http.client.HTTPException as exc:
+            return FetchResponse(
+                url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                redirect_chain=redirect_handler.redirect_chain,
+                retrieval_method="DIRECT_HTTP",
+                status_code=0,
+                error_status=ExtractionStatus.FETCH_FAILED,
+                error_message=f"HTTP protocol exception: {exc}",
+            )
+        except OSError as exc:
+            err_str = str(exc)
+            is_timeout = any(t in err_str.lower() for t in ("timed out", "timeout", "operation did not complete"))
+            return FetchResponse(
+                url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                redirect_chain=redirect_handler.redirect_chain,
+                retrieval_method="DIRECT_HTTP",
+                status_code=0,
+                error_status=ExtractionStatus.TIMEOUT if is_timeout else ExtractionStatus.FETCH_FAILED,
+                error_message=f"Network OS error: {err_str}",
+            )
+        except Exception as exc:
+            return FetchResponse(
+                url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                redirect_chain=redirect_handler.redirect_chain,
+                retrieval_method="DIRECT_HTTP",
+                status_code=0,
+                error_status=ExtractionStatus.FETCH_FAILED,
+                error_message=f"Unhandled fetch error: {exc}",
             )
 
 
@@ -892,7 +962,7 @@ class ScraperAPIFetchAdapter(ContentFetchAdapter):
         self,
         url: str,
         *,
-        timeout_seconds: float = 20.0,
+        timeout_seconds: float = 5.0,
         max_bytes: int = 2_000_000,
         render_js: Optional[bool] = None,
     ) -> FetchResponse:
@@ -971,7 +1041,7 @@ class ScraperAPIFetchAdapter(ContentFetchAdapter):
                             content_type=ctype,
                             content_bytes=data,
                         )
-                except TimeoutError as exc:
+                except (TimeoutError, socket.timeout) as exc:
                     last_resp = FetchResponse(
                         url=url,
                         requested_url=url,
@@ -980,6 +1050,22 @@ class ScraperAPIFetchAdapter(ContentFetchAdapter):
                         status_code=0,
                         error_status=ExtractionStatus.TIMEOUT,
                         error_message=self._redact(f"ScraperAPI request timed out after {timeout_seconds}s: {exc}"),
+                    )
+                    if attempt < max_attempts and self.retry_backoff_seconds > 0:
+                        self._sleep_fn(self.retry_backoff_seconds * attempt)
+                        continue
+                    return last_resp
+                except ssl.SSLError as exc:
+                    err_str = self._redact(str(exc))
+                    is_timeout = any(t in err_str.lower() for t in ("timed out", "timeout", "operation did not complete"))
+                    last_resp = FetchResponse(
+                        url=url,
+                        requested_url=url,
+                        final_url="UNKNOWN",
+                        retrieval_method="SCRAPERAPI",
+                        status_code=0,
+                        error_status=ExtractionStatus.TIMEOUT if is_timeout else ExtractionStatus.FETCH_FAILED,
+                        error_message=f"ScraperAPI SSL error: {err_str}",
                     )
                     if attempt < max_attempts and self.retry_backoff_seconds > 0:
                         self._sleep_fn(self.retry_backoff_seconds * attempt)
@@ -1027,6 +1113,41 @@ class ScraperAPIFetchAdapter(ContentFetchAdapter):
                     if attempt < max_attempts and self.retry_backoff_seconds > 0:
                         self._sleep_fn(self.retry_backoff_seconds * attempt)
                         continue
+                    return last_resp
+                except http.client.HTTPException as exc:
+                    last_resp = FetchResponse(
+                        url=url,
+                        requested_url=url,
+                        final_url="UNKNOWN",
+                        retrieval_method="SCRAPERAPI",
+                        status_code=0,
+                        error_status=ExtractionStatus.FETCH_FAILED,
+                        error_message=self._redact(f"ScraperAPI HTTP protocol exception: {exc}"),
+                    )
+                    return last_resp
+                except OSError as exc:
+                    err_str = self._redact(str(exc))
+                    is_timeout = any(t in err_str.lower() for t in ("timed out", "timeout", "operation did not complete"))
+                    last_resp = FetchResponse(
+                        url=url,
+                        requested_url=url,
+                        final_url="UNKNOWN",
+                        retrieval_method="SCRAPERAPI",
+                        status_code=0,
+                        error_status=ExtractionStatus.TIMEOUT if is_timeout else ExtractionStatus.FETCH_FAILED,
+                        error_message=f"ScraperAPI OS error: {err_str}",
+                    )
+                    return last_resp
+                except Exception as exc:
+                    last_resp = FetchResponse(
+                        url=url,
+                        requested_url=url,
+                        final_url="UNKNOWN",
+                        retrieval_method="SCRAPERAPI",
+                        status_code=0,
+                        error_status=ExtractionStatus.FETCH_FAILED,
+                        error_message=self._redact(f"ScraperAPI unexpected error: {exc}"),
+                    )
                     return last_resp
 
         return last_resp or FetchResponse(
@@ -1110,7 +1231,7 @@ class ResilientPublicFetchAdapter(ContentFetchAdapter):
             return True, "ScraperAPI retrieval ready."
         return False, direct_msg
 
-    def fetch(self, url: str, *, timeout_seconds: float = 10.0, max_bytes: int = 2_000_000) -> FetchResponse:
+    def fetch(self, url: str, *, timeout_seconds: float = 5.0, max_bytes: int = 2_000_000) -> FetchResponse:
         ok, reason = validate_safe_public_url(url)
         if not ok:
             return FetchResponse(
@@ -1130,7 +1251,7 @@ class ResilientPublicFetchAdapter(ContentFetchAdapter):
 
         # 1. Try direct HTTP fetch first
         self.telemetry["direct_attempts"] += 1
-        direct_resp = self.direct_adapter.fetch(url, timeout_seconds=timeout_seconds, max_bytes=max_bytes)
+        direct_resp = self.direct_adapter.fetch(url, timeout_seconds=min(timeout_seconds, 5.0), max_bytes=max_bytes)
         if direct_resp.error_status == ExtractionStatus.BLOCKED_UNSAFE_URL:
             self.telemetry["failures"] += 1
             return direct_resp
@@ -1148,7 +1269,7 @@ class ResilientPublicFetchAdapter(ContentFetchAdapter):
                 self.telemetry["scraperapi_attempts"] += 1
                 scraper_resp = self.scraperapi_adapter.fetch(
                     url,
-                    timeout_seconds=max(timeout_seconds, 20.0),
+                    timeout_seconds=min(timeout_seconds, 5.0),
                     max_bytes=max_bytes,
                 )
                 if scraper_resp.error_status is None and scraper_resp.content_bytes.strip():
@@ -1205,13 +1326,13 @@ class OSINTExtractionService:
         fetch_adapter: Optional[ContentFetchAdapter] = None,
         source_registry: Optional[OSINTSourceRegistry] = None,
         artifact_dir: Optional[Path] = None,
-        timeout_seconds: float = 10.0,
+        timeout_seconds: float = 5.0,
         max_bytes: int = 2_000_000,
     ) -> None:
         self.fetch_adapter: ContentFetchAdapter = fetch_adapter or DisabledOfflineFetchAdapter()
         self.source_registry: OSINTSourceRegistry = source_registry or OSINTSourceRegistry()
         self.artifact_dir = artifact_dir
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = min(timeout_seconds, 5.0)
         self.max_bytes = max_bytes
 
     def extract_from_url(
@@ -1251,7 +1372,20 @@ class OSINTExtractionService:
                 is_synthetic_fixture=is_synthetic_fixture,
             )
 
-        resp = self.fetch_adapter.fetch(url, timeout_seconds=self.timeout_seconds, max_bytes=self.max_bytes)
+        try:
+            resp = self.fetch_adapter.fetch(url, timeout_seconds=min(self.timeout_seconds, 5.0), max_bytes=self.max_bytes)
+        except Exception as exc:
+            err_str = str(exc)
+            is_to = any(t in err_str.lower() for t in ("timed out", "timeout", "operation did not complete"))
+            resp = FetchResponse(
+                url=url,
+                requested_url=url,
+                final_url="UNKNOWN",
+                retrieval_method="DIRECT_HTTP",
+                status_code=0,
+                error_status=ExtractionStatus.TIMEOUT if is_to else ExtractionStatus.FETCH_FAILED,
+                error_message=f"Network exception during fetch: {err_str}",
+            )
         final_resp_url = getattr(resp, "final_url", None) or (resp.url if resp.url != url else "UNKNOWN")
         retrieval_method = (
             "SYNTHETIC_SAMPLE"

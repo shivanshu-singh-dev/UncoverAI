@@ -647,3 +647,33 @@ def test_large_document_cleaning_and_per_stage_progress_callbacks(tmp_path: Path
     assert progress_events[0][0] == 1
     assert all(ev[4] >= 1 and 0 <= ev[3] <= ev[4] for ev in progress_events)
 
+
+def test_ssl_read_timeout_handled_cleanly_without_crashing_pipeline():
+    """Regression test: Verify ssl.SSLError 'The operation did not complete (read)' is gracefully caught."""
+    import ssl
+    from unittest.mock import MagicMock, patch
+    from meridian_assessment.services.extraction.extractor import UrllibPublicFetchAdapter
+
+    adapter = UrllibPublicFetchAdapter()
+    with patch("urllib.request.build_opener") as mock_opener:
+        mock_instance = MagicMock()
+        mock_instance.open.side_effect = ssl.SSLError("The operation did not complete (read) (_ssl.c:2559)")
+        mock_opener.return_value = mock_instance
+
+        resp = adapter.fetch("https://www.reddit.com/r/Futurology/test")
+        assert resp.error_status == ExtractionStatus.TIMEOUT
+        assert "SSL transport error" in resp.error_message
+        assert "_ssl.c:2559" in resp.error_message
+
+    # Also verify extraction service handles it cleanly when fetch raises directly
+    faulty_adapter = MagicMock()
+    faulty_adapter.fetch.side_effect = ssl.SSLError("The operation did not complete (read) (_ssl.c:2559)")
+    svc = OSINTExtractionService(fetch_adapter=faulty_adapter)
+    doc = svc.extract_from_url(
+        vendor_id="V-005",
+        url="https://www.reddit.com/r/Futurology/test",
+    )
+    assert doc.extraction_status in (ExtractionStatus.TIMEOUT, ExtractionStatus.FETCH_FAILED)
+    assert doc.source_integrity_status == "FETCH_ERROR"
+
+

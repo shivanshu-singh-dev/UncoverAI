@@ -23,6 +23,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -1220,6 +1221,16 @@ def build_canonical_vendor_inventory_record(
         )
 
     # ── 7. Field 6: How Vendor May Be Using AI ──
+    _NON_AI_CAP_MARKERS = (
+        "no operational ai",
+        "ordinary batch",
+        "without ml/llm",
+        "none identified",
+        "none detected",
+        "general product",
+        "promotional ai claim without technical mechanism",
+    )
+
     confirmed_signals = [
         c for c in report.signal_classifications
         if c.signal_category.value == "OPERATIONAL_AI"
@@ -1229,11 +1240,32 @@ def build_canonical_vendor_inventory_record(
     confirmed_caps = []
     seen_caps: set[str] = set()
     for c in confirmed_signals:
-        cap_desc = c.capability_summary or f"{c.ai_type.value} capability"
-        norm_cap = re.sub(r"\s+", " ", cap_desc.strip().lower())
-        if norm_cap in seen_caps:
+        raw_cap = (c.capability_summary or "").strip()
+        norm_cap = re.sub(r"\s+", " ", raw_cap.lower())
+        if any(marker in norm_cap for marker in _NON_AI_CAP_MARKERS):
             continue
-        seen_caps.add(norm_cap)
+
+        # Synthesize clear, factual capability description if raw summary is generic
+        if not raw_cap or norm_cap.startswith("operational genai_llm signal") or norm_cap.startswith("operational agentic_ai signal") or norm_cap.startswith("operational classical_ml signal"):
+            m_ctx = f" using {c.named_model or c.named_provider}" if (c.named_model or c.named_provider) else ""
+            txt_low = (c.supporting_verbatim_text or "").lower()
+            if any(k in txt_low for k in ("assistant", "mcp", "script", "troubleshoot", "powershell", "python")):
+                cap_desc = f"AI-assisted workflow building, log parsing, and script generation{m_ctx}"
+            elif any(k in txt_low for k in ("predict", "forecast", "anomaly", "maintenance", "bottleneck")):
+                cap_desc = f"Predictive workload analytics and proactive failure forecasting{m_ctx}"
+            elif any(k in txt_low for k in ("agent", "autonomous", "agentic", "decision")):
+                cap_desc = f"Autonomous agentic task orchestration and scheduled workflow execution{m_ctx}"
+            elif any(k in txt_low for k in ("reconcil", "extract", "document", "statement", "invoice")):
+                cap_desc = f"Automated document intelligence and transactional data reconciliation{m_ctx}"
+            else:
+                cap_desc = f"{c.ai_type.value} model integration for core automated processing{m_ctx}"
+        else:
+            cap_desc = raw_cap
+
+        norm_dedup = re.sub(r"\s+", " ", cap_desc.strip().lower())
+        if norm_dedup in seen_caps:
+            continue
+        seen_caps.add(norm_dedup)
 
         c_inputs = f" Inputs: {', '.join(c.known_inputs)}." if c.known_inputs else ""
         c_outputs = f" Outputs: {', '.join(c.known_outputs)}." if c.known_outputs else ""
@@ -1245,7 +1277,7 @@ def build_canonical_vendor_inventory_record(
         confirmed_caps.append(
             f"- Confirmed Production Capability: {cap_desc} ({c.ai_type.value}, Scope: {c.scope.value}).{c_inputs}{c_outputs}{cust_status}"
         )
-        if len(confirmed_caps) >= 8:
+        if len(confirmed_caps) >= 5:
             break
 
     how_sections = []

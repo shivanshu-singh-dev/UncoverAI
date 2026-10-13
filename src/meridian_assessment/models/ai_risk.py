@@ -135,6 +135,13 @@ class ExtractedDocument(BaseModel):
     query_ids: list[str] = Field(default_factory=list)
     triage_action: Optional[str] = None
     is_synthetic_fixture: bool = False
+    raw_blocks_count: int = 0
+    unique_passages_count: int = 0
+    boilerplate_filtered_count: int = 0
+    exact_duplicates_filtered_count: int = 0
+    near_duplicates_filtered_count: int = 0
+    reused_from_cache: bool = False
+    cleaning_version: str = "2.0"
 
 
 class EvidenceRecord(BaseModel):
@@ -158,6 +165,8 @@ class EvidenceRecord(BaseModel):
     char_start: Optional[int] = None
     char_end: Optional[int] = None
     content_sha256: str
+    raw_passage_hash: Optional[str] = None
+    normalized_hash: Optional[str] = None
     capture_artifact_ref: Optional[str] = None
     scope: EvidenceScope = EvidenceScope.UNRESOLVED
     ai_type: AIType = AIType.UNRESOLVED
@@ -183,9 +192,17 @@ class EvidenceRecord(BaseModel):
     triage_decision: Optional[str] = None
     extraction_status: ExtractionStatus = ExtractionStatus.EXTRACTED
     extraction_limitations: list[str] = Field(default_factory=list)
+    screening_status: str = "CANDIDATE"
+    analysis_state: str = "PENDING_ANALYSIS"
+    screening_reason: Optional[str] = None
+    semantic_score: Optional[float] = None
+    matched_concepts: list[str] = Field(default_factory=list)
+    corroborating_document_ids: list[str] = Field(default_factory=list)
+    corroborating_urls: list[str] = Field(default_factory=list)
     is_reviewed_and_accepted: bool = False
     reviewer_notes: Optional[str] = None
     is_synthetic_test_fixture: bool = False
+
 
 
 # ─── Level 5: Semantic Filtering & RAG Chunking Models ────────────────────────
@@ -214,10 +231,15 @@ class DocumentChunk(BaseModel):
     char_end: int
     token_estimate: int
     content_sha256: str
+    normalized_hash: Optional[str] = None
     section_heading: Optional[str] = None
     page_number: Optional[int] = None
     embedding_status: EmbeddingStatus = EmbeddingStatus.UNAVAILABLE_NOT_CONFIGURED
     embedding_model_version: Optional[str] = None
+    screening_status: str = "CANDIDATE"
+    screening_reason: Optional[str] = None
+    max_similarity_score: Optional[float] = None
+    matched_concepts: list[str] = Field(default_factory=list)
 
 
 class RetrievedChunkMatch(BaseModel):
@@ -234,10 +256,27 @@ class SemanticRetrievalSummary(BaseModel):
     status: str  # COMPLETED / MODEL_UNAVAILABLE_NOT_CONFIGURED / NO_DOCUMENTS
     model_name: str
     model_available: bool = False
+    retrieval_mode: str = "DETERMINISTIC_FALLBACK"
     chunk_size_tokens: int = 500
     chunk_overlap_tokens: int = 50
     chunks_created: int = 0
     chunks_embedded: int = 0
+    chunks_from_cache: int = 0
+    embedding_cache_hits: int = 0
+    unique_chunks_after_dedup: int = 0
+    duplicates_suppressed: int = 0
+    deterministic_candidates_retained: int = 0
+    deterministic_screened_out: int = 0
+    semantic_candidates_retained: int = 0
+    semantic_screened_out: int = 0
+    candidates_selected_for_llm: int = 0
+    candidates_screened_out_semantic: int = 0
+    chunks_screened_out_semantic: int = 0
+    broad_recall_fallback_retained: int = 0
+    broad_recall_fallback_triggered: bool = False
+    selected_candidate_evidence_ids: list[str] = Field(default_factory=list)
+    embedding_time_ms: float = 0.0
+    retrieval_duration_ms: float = 0.0
     matches: list[RetrievedChunkMatch] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
@@ -290,6 +329,9 @@ class SignalClassificationResult(BaseModel):
     prompt_injection_detected: bool = False
     security_events: list[str] = Field(default_factory=list)
     classification_method: ClassificationMethod = ClassificationMethod.DETERMINISTIC_RULES
+    analysis_state: str = "CLASSIFIED_DETERMINISTIC"
+    batch_id: Optional[str] = None
+    reused_from_cache: bool = False
     model_used: Optional[str] = None
     model_execution_status: Optional[str] = None
 
@@ -563,6 +605,7 @@ class VendorEndToEndAssessmentReport(BaseModel):
     # 11. Nine-Level Stage Execution Ledger, Model Routing Telemetry & Limitations
     stage_ledger: list[StageExecutionRecord] = Field(default_factory=list)
     model_routing_telemetry: dict[str, Any] = Field(default_factory=dict)
+    pipeline_performance_telemetry: dict[str, Any] = Field(default_factory=dict)
     unavailable_integrations: list[str] = Field(default_factory=list)
     assessment_limitations: list[str] = Field(default_factory=list)
 

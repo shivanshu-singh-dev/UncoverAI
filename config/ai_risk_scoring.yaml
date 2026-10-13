@@ -21,9 +21,13 @@ rag_chunking:
   chunk_size_tokens: 500
   chunk_overlap_tokens: 50
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
-  auto_load_model: false
+  auto_load_model: true
   similarity_threshold: 0.45
-  top_k_per_concept: 3
+  candidate_similarity_threshold: 0.24
+  top_k_per_concept: 5
+  max_total_candidates: 80
+  min_per_document_quota: 2
+  broad_recall_min_candidates: 10
   risk_query_concepts:
     - id: "RC_01_MODEL_TRAINING"
       name: "Third-Party & Customer-Data Model Training"
@@ -53,6 +57,10 @@ rag_chunking:
       name: "AI Governance, Tenant Isolation & Security Controls"
       query: "AI governance policy tenant isolation prompt injection guardrails SOC2 ISO42001"
       target_risks: ["R5", "R7", "R8"]
+    - id: "RC_08_NEGATIVE_AND_OPT_IN_CONTROLS"
+      name: "Negative AI Disclosures, Opt-In Controls & Deterministic Automation"
+      query: "we do not use AI customer data is never used to train models disabled by default opt-in human review deterministic rules engine batch scheduling"
+      target_risks: ["R1", "R3", "R6"]
 
 # ─── Dual-Model Local-LLM (Ollama) Routing Configuration (Levels 3B, 6 & 8) ──
 local_llm:
@@ -63,9 +71,11 @@ local_llm:
   analysis_model: "mistral:latest"    # Model B (~4.4 GB): Level 6 deeper semantic signal classification
   summary_model: "mistral:latest"     # Model B (~4.4 GB): Level 8 evidence-grounded risk summarization
   model_name: "mistral:latest"        # Legacy fallback alias for analysis_model
+  batch_size: 5                       # Passages per bounded Mistral classification request
   timeout_seconds: 25.0
   keep_alive: "2m"
   unload_on_model_switch: true        # Unloads prior model (keep_alive=0) before switching models on 6 GB VRAM GPUs
+
 
 
 # ─── Level 7: Evidentiary Weight Bands (Case-Study Brief Ranges) ──────────────

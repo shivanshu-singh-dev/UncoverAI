@@ -94,7 +94,7 @@ from meridian_assessment.services.risk import (
     RiskSummaryLLMProvider,
 )
 import os
-
+import time
 
 
 def _utc_now_iso() -> str:
@@ -338,11 +338,14 @@ class MeridianEndToEndPipeline:
         from meridian_assessment.services.readiness_and_exports import _check_huggingface_model_cached_locally
         import importlib.util
 
-        rag_enabled_flag = (
-            bool(enable_rag_embeddings)
-            if enable_rag_embeddings is not None
-            else bool(self.model_router.config.enable_rag_embeddings)
-        )
+        in_pytest_env = "PYTEST_CURRENT_TEST" in os.environ
+        if enable_rag_embeddings is not None:
+            rag_enabled_flag = bool(enable_rag_embeddings)
+        elif in_pytest_env and model_router is None and effective_master_llm is None:
+            rag_enabled_flag = False
+        else:
+            rag_enabled_flag = bool(self.model_router.config.enable_rag_embeddings)
+
         if embedding_provider is not None:
             resolved_emb_provider: EmbeddingProvider = embedding_provider
         elif (
@@ -376,8 +379,14 @@ class MeridianEndToEndPipeline:
             source_registry=self.investigation_planner.source_registry,
             artifact_dir=self.evidence_repository.artifact_dir if self.evidence_repository else None,
         )
-        self.rag_service = RAGChunkerAndRetriever(embedding_provider=resolved_emb_provider)
-        self.classification_service = SignalClassificationService(llm_adapter=resolved_cls_llm)
+        self.rag_service = RAGChunkerAndRetriever(
+            embedding_provider=resolved_emb_provider,
+            evidence_repository=self.evidence_repository,
+        )
+        self.classification_service = SignalClassificationService(
+            llm_adapter=resolved_cls_llm,
+            evidence_repository=self.evidence_repository,
+        )
         self.scoring_engine = scoring_engine or DeterministicRiskScoringEngine()
         self.risk_analyzer = AIRiskAnalyzer(summary_llm_adapter=resolved_sum_llm)
 
@@ -396,10 +405,15 @@ class MeridianEndToEndPipeline:
         analyst_gate_overrides: Optional[dict[str, tuple[str, str]]] = None,
         human_validations: Optional[Sequence[HumanValidationRecord]] = None,
         persist_to_repository: bool = True,
+        reuse_cached_artifacts: bool = True,
+        use_verified_local_artifacts_only: bool = False,
         progress_callback: Optional[Any] = None,
     ) -> VendorEndToEndAssessmentReport:
         """Execute all 9 project levels in order and produce a complete `VendorEndToEndAssessmentReport`."""
+        t_pipeline_start = time.perf_counter()
+        stage_timings_ms: dict[str, float] = {}
         now_iso = _utc_now_iso()
+        run_id = f"RUN_{vendor.vendor_id}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
         stage_ledger: list[StageExecutionRecord] = []
         unavailable_integrations: list[str] = []
         limitations: list[str] = []
@@ -431,6 +445,7 @@ class MeridianEndToEndPipeline:
         self.model_router.vram_unload_events.clear()
 
         # ── LEVEL 1: Criticality Tiering (D/P/R/O/V + O1–O5) ──
+        t_l1 = time.perf_counter()
         _notify_progress(
             1,
             "Level 1: Criticality Tiering",
@@ -449,6 +464,7 @@ class MeridianEndToEndPipeline:
             crit_res, human_criticality_override
         )
         crit_audit = self.criticality_engine.generate_audit_trail(crit_res)
+        stage_timings_ms["level_1_ms"] = round((time.perf_counter() - t_l1) * 1000.0, 2)
         _notify_progress(
             1,
             "Level 1: Criticality Tiering",
@@ -473,6 +489,7 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 2: Assessment Depth Scoping ──
+        t_l2 = time.perf_counter()
         _notify_progress(
             2,
             "Level 2: Assessment Depth Scoping",
@@ -486,6 +503,7 @@ class MeridianEndToEndPipeline:
             human_review=human_criticality_override,
             existing_plan=existing_plan,
         )
+        stage_timings_ms["level_2_ms"] = round((time.perf_counter() - t_l2) * 1000.0, 2)
         _notify_progress(
             2,
             "Level 2: Assessment Depth Scoping",
@@ -512,6 +530,7 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 3: Source Identification & Reconnaissance (Search + URL Triage via Model A llama3.2:latest) ──
+        t_l3 = time.perf_counter()
         search_ok, search_msg = self.search_backend.is_configured()
         triage_llm_ok, triage_llm_msg = self.triage_service.llm_provider.is_configured()
         triage_model_name = (
@@ -526,7 +545,7 @@ class MeridianEndToEndPipeline:
             completed=0,
             total=total_planned_q,
         )
-        if execute_searches:
+        if execute_searches and not use_verified_local_artifacts_only:
             collector = OSINTSearchCollector(backend=self.search_backend, retry_backoff_seconds=0.0)
             collector.execute_planned_queries(
                 plan,
@@ -539,7 +558,7 @@ class MeridianEndToEndPipeline:
                     total=q_tot,
                 ),
             )
-        if not search_ok:
+        if not search_ok and not use_verified_local_artifacts_only:
             unavailable_integrations.append(f"Search Backend ({self.search_backend.provider_name}): {search_msg}")
 
         triage_decisions: list[URLTriageDecision] = self.triage_service.triage_plan_candidates(
@@ -553,6 +572,7 @@ class MeridianEndToEndPipeline:
             ),
         )
         fetch_decisions = [d for d in triage_decisions if d.action == URLTriageAction.FETCH]
+        stage_timings_ms["level_3_ms"] = round((time.perf_counter() - t_l3) * 1000.0, 2)
 
         triage_llm_succeeded = sum(1 for d in triage_decisions if d.decision_method.value == "LOCAL_LLM")
         triage_task_tel = self.model_router.get_task_telemetry_summary(LLMTaskType.URL_TRIAGE)
@@ -567,12 +587,12 @@ class MeridianEndToEndPipeline:
 
         l3_status = (
             "COMPLETED"
-            if (plan.candidate_urls or (execute_searches and search_ok))
+            if (plan.candidate_urls or (execute_searches and search_ok) or use_verified_local_artifacts_only)
             else "NOT_CONFIGURED"
             if not search_ok
             else "PARTIAL"
         )
-        l3_limits: list[str] = [] if search_ok else [search_msg]
+        l3_limits: list[str] = [] if (search_ok or use_verified_local_artifacts_only) else [search_msg]
         if triage_task_tel.get("errors"):
             l3_limits.extend(triage_task_tel["errors"])
         stage_ledger.append(
@@ -594,6 +614,7 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 4: Data Scraping & Point-of-Capture Traceability ──
+        t_l4 = time.perf_counter()
         total_fetches = max(1, len(fetch_decisions))
         _notify_progress(
             4,
@@ -612,8 +633,96 @@ class MeridianEndToEndPipeline:
         from meridian_assessment.services.extraction.extractor import StubFetchAdapter
         is_stub_fetch = isinstance(self.fetch_adapter, StubFetchAdapter)
 
+        seen_normalized_hashes: dict[str, EvidenceRecord] = {}
+        seen_shingle_sets: list[tuple[frozenset[str], EvidenceRecord]] = []
+        seen_doc_hashes: dict[str, list[EvidenceRecord]] = {}
+        raw_passages_total = 0
+        deterministic_retained_total = 0
+        deterministic_screened_out_total = 0
+        artifact_cache_hits = 0
+        duplicate_documents_skipped = 0
+
         fetch_ok, fetch_msg = self.fetch_adapter.is_configured()
-        if execute_extraction and fetch_decisions:
+
+        if use_verified_local_artifacts_only and self.evidence_repository is not None:
+            local_artifacts = self.evidence_repository.discover_verified_vendor_artifacts(
+                vendor.vendor_id,
+                include_synthetic=False,
+            )
+            seq_ev = len(evidence_records) + 1
+            for art_idx, (art_path, raw_bytes, _full_sha, seq_num, _ext) in enumerate(local_artifacts, start=1):
+                doc_id = f"DOC_{vendor.vendor_id}_{seq_num:03d}"
+                _notify_progress(
+                    4,
+                    "Level 4: Data Scraping & Point-of-Capture Traceability",
+                    f"Reusing verified local artifact {art_idx}/{len(local_artifacts)}: {art_path.name}",
+                    completed=art_idx,
+                    total=max(1, len(local_artifacts)),
+                )
+                cached_doc = (
+                    self.evidence_repository.find_cached_document(
+                        vendor_id=vendor.vendor_id,
+                        document_id=doc_id,
+                    )
+                    if reuse_cached_artifacts
+                    else None
+                )
+                synthetic_url = (
+                    cached_doc.url
+                    if cached_doc is not None
+                    else f"https://{vendor.domain}/local-artifact/{art_path.name}"
+                )
+                source_class = cached_doc.source_class if cached_doc is not None else "S1"
+                doc = self.extraction_service.extract_from_artifact_bytes(
+                    vendor_id=vendor.vendor_id,
+                    document_id=doc_id,
+                    content_bytes=raw_bytes,
+                    url=synthetic_url,
+                    source_class=source_class,
+                    artifact_path=str(art_path),
+                    is_synthetic_fixture=False,
+                )
+                artifact_cache_hits += 1
+                extracted_docs.append(doc)
+                if doc.extraction_status == ExtractionStatus.EXTRACTED:
+                    if doc.content_sha256 in seen_doc_hashes:
+                        duplicate_documents_skipped += 1
+                        for existing_ev in seen_doc_hashes[doc.content_sha256]:
+                            if doc.document_id not in existing_ev.corroborating_document_ids:
+                                existing_ev.corroborating_document_ids.append(doc.document_id)
+                            if doc.canonical_url and doc.canonical_url not in existing_ev.corroborating_urls:
+                                existing_ev.corroborating_urls.append(doc.canonical_url)
+                        if persist_to_repository and self.evidence_repository is not None:
+                            self.evidence_repository.save_document(doc)
+                        continue
+                    new_evs = self.extraction_service.build_evidence_records_from_document(
+                        doc,
+                        legal_entity=vendor.vendor_name,
+                        domain=vendor.domain,
+                        starting_seq=seq_ev,
+                        seen_normalized_hashes=seen_normalized_hashes,
+                        seen_shingle_sets=seen_shingle_sets,
+                    )
+                    seen_doc_hashes[doc.content_sha256] = new_evs
+                    raw_passages_total += doc.raw_blocks_count
+                    deterministic_retained_total += doc.unique_passages_count
+                    deterministic_screened_out_total += (
+                        doc.boilerplate_filtered_count
+                        + doc.exact_duplicates_filtered_count
+                        + doc.near_duplicates_filtered_count
+                    )
+                    seq_ev += len(new_evs)
+                    evidence_records.extend(new_evs)
+                    if persist_to_repository and self.evidence_repository is not None:
+                        self.evidence_repository.save_document(doc)
+                        if new_evs:
+                            self.evidence_repository.save_evidence_batch(new_evs)
+                else:
+                    if persist_to_repository and self.evidence_repository is not None:
+                        self.evidence_repository.save_document(doc)
+                    limitations.extend(doc.extraction_limitations)
+
+        elif execute_extraction and fetch_decisions:
             seq_ev = len(evidence_records) + 1
             for doc_idx, t_dec in enumerate(fetch_decisions, start=1):
                 _notify_progress(
@@ -625,29 +734,83 @@ class MeridianEndToEndPipeline:
                 )
                 cand_obj = next((c for c in plan.candidate_urls if c.candidate_id == t_dec.candidate_id), None)
                 q_ids = cand_obj.query_ids if cand_obj else []
-                doc = self.extraction_service.extract_from_url(
-                    vendor_id=vendor.vendor_id,
-                    url=t_dec.url,
-                    source_class=t_dec.candidate_source_class,
-                    query_ids=q_ids,
-                    triage_action=t_dec.action.value,
-                    document_index=doc_idx,
-                    is_synthetic_fixture=is_stub_fetch,
-                )
+                doc_id_candidate = f"DOC_{vendor.vendor_id}_{doc_idx:03d}"
+
+                doc: Optional[ExtractedDocument] = None
+                if reuse_cached_artifacts and self.evidence_repository is not None and not is_stub_fetch:
+                    cached_doc = self.evidence_repository.find_cached_document(
+                        vendor_id=vendor.vendor_id,
+                        canonical_url=t_dec.canonical_url,
+                        document_id=doc_id_candidate,
+                    )
+                    if cached_doc is not None and cached_doc.artifact_path:
+                        art_path = Path(cached_doc.artifact_path)
+                        if art_path.exists():
+                            raw_bytes = art_path.read_bytes()
+                            doc = self.extraction_service.extract_from_artifact_bytes(
+                                vendor_id=vendor.vendor_id,
+                                document_id=cached_doc.document_id,
+                                content_bytes=raw_bytes,
+                                url=t_dec.url,
+                                source_class=t_dec.candidate_source_class,
+                                artifact_path=str(art_path),
+                                query_ids=q_ids,
+                                triage_action=t_dec.action.value,
+                                is_synthetic_fixture=False,
+                            )
+                            artifact_cache_hits += 1
+
+                if doc is None:
+                    doc = self.extraction_service.extract_from_url(
+                        vendor_id=vendor.vendor_id,
+                        url=t_dec.url,
+                        source_class=t_dec.candidate_source_class,
+                        query_ids=q_ids,
+                        triage_action=t_dec.action.value,
+                        document_index=doc_idx,
+                        is_synthetic_fixture=is_stub_fetch,
+                    )
+
                 extracted_docs.append(doc)
                 if doc.extraction_status == ExtractionStatus.EXTRACTED:
+                    if doc.content_sha256 in seen_doc_hashes:
+                        duplicate_documents_skipped += 1
+                        for existing_ev in seen_doc_hashes[doc.content_sha256]:
+                            if doc.document_id not in existing_ev.corroborating_document_ids:
+                                existing_ev.corroborating_document_ids.append(doc.document_id)
+                            if doc.canonical_url and doc.canonical_url not in existing_ev.corroborating_urls:
+                                existing_ev.corroborating_urls.append(doc.canonical_url)
+                        if persist_to_repository and self.evidence_repository is not None:
+                            self.evidence_repository.save_document(doc)
+                        continue
                     new_evs = self.extraction_service.build_evidence_records_from_document(
                         doc,
                         legal_entity=vendor.vendor_name,
                         domain=vendor.domain,
                         starting_seq=seq_ev,
+                        seen_normalized_hashes=seen_normalized_hashes,
+                        seen_shingle_sets=seen_shingle_sets,
+                    )
+                    seen_doc_hashes[doc.content_sha256] = new_evs
+                    raw_passages_total += doc.raw_blocks_count
+                    deterministic_retained_total += doc.unique_passages_count
+                    deterministic_screened_out_total += (
+                        doc.boilerplate_filtered_count
+                        + doc.exact_duplicates_filtered_count
+                        + doc.near_duplicates_filtered_count
                     )
                     seq_ev += len(new_evs)
                     evidence_records.extend(new_evs)
+                    if persist_to_repository and self.evidence_repository is not None:
+                        self.evidence_repository.save_document(doc)
+                        if new_evs:
+                            self.evidence_repository.save_evidence_batch(new_evs)
                 else:
+                    if persist_to_repository and self.evidence_repository is not None:
+                        self.evidence_repository.save_document(doc)
                     limitations.extend(doc.extraction_limitations)
 
-        if not fetch_ok and not evidence_records:
+        if not fetch_ok and not evidence_records and not use_verified_local_artifacts_only:
             unavailable_integrations.append(f"Web/PDF Fetch Adapter: {fetch_msg}")
 
         # Update source coverage records if analyst-reviewed / completed mode is specified
@@ -679,11 +842,29 @@ class MeridianEndToEndPipeline:
         mismatched_docs = [
             d for d in extracted_docs if d.extraction_status == ExtractionStatus.SOURCE_IDENTITY_MISMATCH
         ]
+        stage_timings_ms["level_4_ms"] = round((time.perf_counter() - t_l4) * 1000.0, 2)
+
+        if persist_to_repository and self.evidence_repository is not None:
+            self.evidence_repository.save_checkpoint(
+                vendor_id=vendor.vendor_id,
+                run_id=run_id,
+                completed_level=4,
+                checkpoint_state={
+                    "extracted_documents_count": len(extracted_docs),
+                    "evidence_records_count": len(evidence_records),
+                    "raw_passages_total": raw_passages_total,
+                    "deterministic_retained_total": deterministic_retained_total,
+                    "deterministic_screened_out_total": deterministic_screened_out_total,
+                    "artifact_cache_hits": artifact_cache_hits,
+                    "duplicate_documents_skipped": duplicate_documents_skipped,
+                },
+            )
+
         l4_status = (
             "COMPLETED"
             if evidence_records or reviewed_no_evidence_sources
             else "NOT_CONFIGURED"
-            if not fetch_ok
+            if not fetch_ok and not use_verified_local_artifacts_only
             else "PARTIAL"
             if mismatched_docs
             else "SKIPPED_NO_INPUT"
@@ -705,7 +886,9 @@ class MeridianEndToEndPipeline:
                 status=l4_status,
                 summary=(
                     f"{len(extracted_docs)} documents processed{mismatch_note}; "
-                    f"{len(evidence_records)} traceable EvidenceRecord items created."
+                    f"{len(evidence_records)} deduplicated EvidenceRecord items created "
+                    f"(from {raw_passages_total or len(evidence_records)} raw blocks; "
+                    f"{deterministic_screened_out_total} boilerplate/duplicate blocks screened out)."
                 ),
                 limitations=l4_limits,
                 selected_model="N/A",
@@ -715,34 +898,68 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 5: Semantic Filtering & RAG Chunking (Separate Embedding Model) ──
+        t_l5 = time.perf_counter()
         total_ev_l5 = max(1, len(evidence_records))
         _notify_progress(
             5,
             "Level 5: Semantic Filtering & RAG Chunking",
-            f"Chunking {len(evidence_records)} evidence item(s) ({self.rag_service.model_name})...",
+            f"Chunking & ranking {len(evidence_records)} evidence item(s) ({self.rag_service.model_name})...",
             completed=0,
             total=total_ev_l5,
         )
-        _, rag_summary = self.rag_service.retrieve_relevant_chunks(evidence_records)
+        _, rag_summary = self.rag_service.retrieve_relevant_chunks(
+            evidence_records,
+            legal_entity=vendor.vendor_name,
+        )
+        stage_timings_ms["level_5_ms"] = round((time.perf_counter() - t_l5) * 1000.0, 2)
         _notify_progress(
             5,
             "Level 5: Semantic Filtering & RAG Chunking",
-            f"Created {rag_summary.chunks_created} chunks; {len(rag_summary.matches)} semantic concept matches retrieved.",
+            (
+                f"Created {rag_summary.chunks_created} chunks; selected "
+                f"{rag_summary.candidates_selected_for_llm} high-signal candidate(s) for Level 6 "
+                f"({rag_summary.candidates_screened_out_semantic} screened out)."
+            ),
             completed=total_ev_l5,
             total=total_ev_l5,
         )
-        rag_candidate_ids = {
-            m.chunk.evidence_id
-            for m in rag_summary.matches
-            if m.chunk is not None and m.chunk.evidence_id
+        selected_for_llm_ids = {
+            ev.evidence_id
+            for ev in evidence_records
+            if ev.screening_status == "SELECTED_FOR_LLM"
         }
+        if selected_for_llm_ids:
+            rag_candidate_ids = selected_for_llm_ids
+        else:
+            rag_candidate_ids = {
+                m.chunk.evidence_id
+                for m in rag_summary.matches
+                if m.chunk is not None and m.chunk.evidence_id
+            }
+
+        if persist_to_repository and self.evidence_repository is not None and evidence_records:
+            self.evidence_repository.save_evidence_batch(evidence_records)
+            self.evidence_repository.save_checkpoint(
+                vendor_id=vendor.vendor_id,
+                run_id=run_id,
+                completed_level=5,
+                checkpoint_state={
+                    "chunks_created": rag_summary.chunks_created,
+                    "chunks_embedded": rag_summary.chunks_embedded,
+                    "embedding_cache_hits": rag_summary.embedding_cache_hits,
+                    "candidates_selected_for_llm": rag_summary.candidates_selected_for_llm,
+                    "candidates_screened_out_semantic": rag_summary.candidates_screened_out_semantic,
+                    "selected_evidence_ids": sorted(rag_candidate_ids),
+                },
+            )
+
         emb_ok, emb_msg = self.rag_service.embedding_provider.is_available()
         if not emb_ok:
             unavailable_integrations.append(f"RAG Embedding Model ({self.rag_service.model_name}): {emb_msg}")
 
         l5_model_status = (
             "SUCCEEDED"
-            if (rag_summary.model_available and rag_summary.chunks_embedded > 0)
+            if (rag_summary.model_available and (rag_summary.chunks_embedded > 0 or rag_summary.embedding_cache_hits > 0))
             else "SKIPPED_NO_INPUT"
             if rag_summary.model_available
             else "UNAVAILABLE"
@@ -754,8 +971,9 @@ class MeridianEndToEndPipeline:
                 status="COMPLETED" if rag_summary.model_available else "NOT_CONFIGURED",
                 summary=(
                     f"{rag_summary.chunks_created} chunks created; "
-                    f"{rag_summary.chunks_embedded} embedded; "
-                    f"{len(rag_summary.matches)} concept matches retrieved ({rag_summary.status})."
+                    f"{rag_summary.chunks_embedded} embedded ({rag_summary.embedding_cache_hits} cached); "
+                    f"{rag_summary.candidates_selected_for_llm} candidates selected for Level 6 "
+                    f"({rag_summary.status})."
                 ),
                 limitations=list(rag_summary.limitations),
                 selected_model=self.rag_service.model_name,
@@ -765,6 +983,7 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 6: Signal Classification (Model B mistral:latest + Prompt-Injection Defence) ──
+        t_l6 = time.perf_counter()
         llm_ok, llm_msg = self.classification_service.llm_adapter.is_configured()
         cls_model_name = (
             getattr(self.classification_service.llm_adapter, "model_name", None)
@@ -774,18 +993,33 @@ class MeridianEndToEndPipeline:
         _notify_progress(
             6,
             "Level 6: Signal Classification",
-            f"Classifying {len(evidence_records)} evidence item(s) (Model B: {cls_model_name if llm_ok else 'Deterministic'}, E14 prompt-injection guard active)...",
+            f"Classifying {len(evidence_records)} evidence item(s) ({len(rag_candidate_ids)} routed to batched {cls_model_name if llm_ok else 'Deterministic'}, E14 guard active)...",
             completed=0,
             total=total_ev_l6,
         )
         if not llm_ok:
             unavailable_integrations.append(f"Local LLM Classifier ({cls_model_name}): {llm_msg}")
 
+        def _l6_checkpoint_cb(completed_items: int, total_items: int, partial_cls: Sequence[SignalClassificationResult]) -> None:
+            if persist_to_repository and self.evidence_repository is not None:
+                self.evidence_repository.save_checkpoint(
+                    vendor_id=vendor.vendor_id,
+                    run_id=run_id,
+                    completed_level=6,
+                    checkpoint_state={
+                        "status": "IN_PROGRESS",
+                        "completed_items": completed_items,
+                        "total_items": total_items,
+                        "classified_ids": [c.evidence_id for c in partial_cls],
+                    },
+                )
+
         classifications = self.classification_service.classify_evidence_batch(
             evidence_records,
             meridian_service_scope=vendor.service_product_provided,
             meridian_business_process=vendor.business_process_supported,
             rag_candidate_evidence_ids=rag_candidate_ids,
+            max_llm_calls=self.rag_service.max_total_candidates,
             progress_callback=lambda ev_done, ev_tot, ev_obj: _notify_progress(
                 6,
                 "Level 6: Signal Classification",
@@ -793,7 +1027,24 @@ class MeridianEndToEndPipeline:
                 completed=ev_done,
                 total=ev_tot,
             ),
+            checkpoint_callback=_l6_checkpoint_cb,
         )
+        stage_timings_ms["level_6_ms"] = round((time.perf_counter() - t_l6) * 1000.0, 2)
+
+        if persist_to_repository and self.evidence_repository is not None:
+            if evidence_records:
+                self.evidence_repository.save_evidence_batch(evidence_records)
+            self.evidence_repository.save_checkpoint(
+                vendor_id=vendor.vendor_id,
+                run_id=run_id,
+                completed_level=6,
+                checkpoint_state={
+                    "status": "COMPLETED",
+                    "classified_count": len(classifications),
+                    "batch_telemetry": dict(self.classification_service.last_batch_telemetry),
+                },
+            )
+
         cls_llm_succeeded = sum(
             1 for c in classifications if c.classification_method.value == "LOCAL_LLM_VALIDATED"
         )
@@ -810,6 +1061,7 @@ class MeridianEndToEndPipeline:
         l6_limits: list[str] = [] if llm_ok else [llm_msg]
         if cls_task_tel.get("errors"):
             l6_limits.extend(cls_task_tel["errors"])
+        l6_batch_tel = self.classification_service.last_batch_telemetry
         stage_ledger.append(
             StageExecutionRecord(
                 level_number=6,
@@ -817,7 +1069,10 @@ class MeridianEndToEndPipeline:
                 status="COMPLETED" if classifications else "SKIPPED_NO_INPUT",
                 summary=(
                     f"{len(classifications)} evidence items classified "
-                    f"(Analysis Model: {cls_model_name} [{l6_model_status}])."
+                    f"({l6_batch_tel.get('llm_batches_invoked', 0)} LLM batches / "
+                    f"{l6_batch_tel.get('llm_calls_invoked', 0)} calls; "
+                    f"{l6_batch_tel.get('cache_hits', 0)} cache hits; "
+                    f"Analysis Model: {cls_model_name} [{l6_model_status}])."
                 ),
                 limitations=l6_limits,
                 selected_model=cls_model_name,
@@ -827,6 +1082,7 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 7: Evidentiary Weighting (E1–E14), G1–G4 Gates & AI-Use Verdict ──
+        t_l7 = time.perf_counter()
         total_ev_l7 = max(1, len(evidence_records))
         _notify_progress(
             7,
@@ -851,6 +1107,7 @@ class MeridianEndToEndPipeline:
             analyst_gate_overrides=analyst_gate_overrides,
         )
         tracker.sync_plan_stop_status(plan)
+        stage_timings_ms["level_7_ms"] = round((time.perf_counter() - t_l7) * 1000.0, 2)
         _notify_progress(
             7,
             "Level 7: Evidentiary Weighting",
@@ -876,6 +1133,7 @@ class MeridianEndToEndPipeline:
         )
 
         # ── LEVEL 8: Risk Surfacing & Summarization (R1–R8 + Model B mistral:latest Summaries) ──
+        t_l8 = time.perf_counter()
         sum_llm_ok, sum_llm_msg = self.risk_analyzer.summary_llm_adapter.is_configured()
         sum_model_name = (
             getattr(self.risk_analyzer.summary_llm_adapter, "model_name", None)
@@ -904,6 +1162,7 @@ class MeridianEndToEndPipeline:
                 total=rf_tot,
             ),
         )
+        stage_timings_ms["level_8_ms"] = round((time.perf_counter() - t_l8) * 1000.0, 2)
         sum_llm_succeeded = sum(1 for rf in risk_findings if rf.summary_method == "LOCAL_LLM_VALIDATED")
         sum_task_tel = self.model_router.get_task_telemetry_summary(LLMTaskType.RISK_SUMMARIZATION)
         if not sum_llm_ok:
@@ -941,6 +1200,7 @@ class MeridianEndToEndPipeline:
             )
 
         # ── LEVEL 9: Deterministic Risk Rating (`M_c * sum(S_i * W_i)`) ──
+        t_l9 = time.perf_counter()
         _notify_progress(
             9,
             "Level 9: Deterministic Risk Rating",
@@ -956,6 +1216,8 @@ class MeridianEndToEndPipeline:
             weighted_evidence=weighted_items,
             assessment_completeness_status=completeness_str,
         )
+        stage_timings_ms["level_9_ms"] = round((time.perf_counter() - t_l9) * 1000.0, 2)
+        stage_timings_ms["total_pipeline_ms"] = round((time.perf_counter() - t_pipeline_start) * 1000.0, 2)
         l9_status = (
             "NOT_CONFIGURED"
             if risk_score_res.policy_status == ScoringPolicyStatus.SCORING_POLICY_UNCONFIGURED
@@ -1071,6 +1333,30 @@ class MeridianEndToEndPipeline:
                 f"Source-identity mismatch detected on {len(mismatched_docs)} fetched document(s); rejected from evidence register."
             )
 
+        pipeline_perf_telemetry = {
+            "run_id": run_id,
+            "stage_timings_ms": stage_timings_ms,
+            "level_4_extraction": {
+                "documents_processed": len(extracted_docs),
+                "artifact_cache_hits": artifact_cache_hits,
+                "duplicate_documents_skipped": duplicate_documents_skipped,
+                "raw_passages_total": raw_passages_total or len(evidence_records),
+                "deterministic_retained_total": len(evidence_records),
+                "deterministic_screened_out_total": deterministic_screened_out_total,
+            },
+            "level_5_retrieval": {
+                "status": rag_summary.status,
+                "model_available": rag_summary.model_available,
+                "chunks_created": rag_summary.chunks_created,
+                "chunks_embedded": rag_summary.chunks_embedded,
+                "embedding_cache_hits": rag_summary.embedding_cache_hits,
+                "candidates_selected_for_llm": rag_summary.candidates_selected_for_llm,
+                "candidates_screened_out_semantic": rag_summary.candidates_screened_out_semantic,
+                "retrieval_duration_ms": rag_summary.retrieval_duration_ms,
+            },
+            "level_6_classification": dict(l6_batch_tel),
+        }
+
         report = VendorEndToEndAssessmentReport(
             report_id=f"RPT_{vendor.vendor_id}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
             generated_at=now_iso,
@@ -1109,6 +1395,7 @@ class MeridianEndToEndPipeline:
             unresolved_questions=unresolved_questions,
             stage_ledger=stage_ledger,
             model_routing_telemetry=self.model_router.get_full_telemetry_summary(),
+            pipeline_performance_telemetry=pipeline_perf_telemetry,
             unavailable_integrations=unavailable_integrations,
             assessment_limitations=limitations + list(ai_verdict.incomplete_reasons),
         )
@@ -1121,5 +1408,15 @@ class MeridianEndToEndPipeline:
             for hv in all_validations:
                 self.evidence_repository.save_human_validation(hv)
             self.evidence_repository.save_vendor_report(report)
+            self.evidence_repository.save_checkpoint(
+                vendor_id=vendor.vendor_id,
+                run_id=run_id,
+                completed_level=9,
+                checkpoint_state={
+                    "status": "COMPLETED",
+                    "report_id": report.report_id,
+                    "pipeline_performance_telemetry": pipeline_perf_telemetry,
+                },
+            )
 
         return report

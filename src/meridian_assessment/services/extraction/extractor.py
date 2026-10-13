@@ -419,6 +419,11 @@ class HTMLTextExtractor:
 class PDFDocumentExtractor:
     """Extracts text and page references from PDF bytes while detecting encrypted or scanned PDFs."""
 
+    _STREAM_PATTERN = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.DOTALL)
+    _TJ_SINGLE_RE = re.compile(rb"\(([^()\\]{0,2000}(?:\\.[^()\\]{0,2000})*)\)\s*Tj")
+    _TJ_ARRAY_RE = re.compile(rb"\[([^\[\]]{1,8000})\]\s*TJ")
+    _TJ_INNER_STR_RE = re.compile(rb"\(([^()\\]{0,2000}(?:\\.[^()\\]{0,2000})*)\)")
+
     @staticmethod
     def extract(pdf_bytes: bytes) -> tuple[Optional[str], str, dict[int, str], ExtractionStatus, list[str]]:
         if not pdf_bytes:
@@ -450,12 +455,10 @@ class PDFDocumentExtractor:
             title = title_match.group(1).decode("latin-1", errors="ignore").strip() or None
 
         # Parse streams and page text operators deterministically
-        page_texts: dict[int, str] = {}
-        stream_pattern = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.DOTALL)
-        streams = stream_pattern.findall(pdf_bytes)
+        streams = PDFDocumentExtractor._STREAM_PATTERN.findall(pdf_bytes)
+        raw_stream_texts: list[str] = []
 
-        extracted_chunks: list[str] = []
-        for idx, raw_stream in enumerate(streams, start=1):
+        for raw_stream in streams:
             decoded_bytes = raw_stream
             # Attempt zlib decompression if Flate-encoded
             try:
@@ -465,23 +468,74 @@ class PDFDocumentExtractor:
 
             text_fragments = PDFDocumentExtractor._extract_pdf_text_operators(decoded_bytes)
             if text_fragments:
-                page_str = " ".join(text_fragments).strip()
-                if page_str:
-                    page_num = len(page_texts) + 1
-                    page_texts[page_num] = page_str
-                    extracted_chunks.append(page_str)
+                stream_str = " ".join(text_fragments).strip()
+                if stream_str:
+                    raw_stream_texts.append(stream_str)
 
         # Also check uncompressed top-level text blocks if no stream text was found
-        if not extracted_chunks:
-            top_fragments = PDFDocumentExtractor._extract_pdf_text_operators(pdf_bytes)
+        if not raw_stream_texts:
+            # Only scan non-stream segments to avoid binary object streams
+            non_stream_bytes = PDFDocumentExtractor._STREAM_PATTERN.sub(b" ", pdf_bytes)
+            top_fragments = PDFDocumentExtractor._extract_pdf_text_operators(non_stream_bytes)
             if top_fragments:
                 page_str = " ".join(top_fragments).strip()
                 if page_str:
-                    page_texts[1] = page_str
-                    extracted_chunks.append(page_str)
+                    raw_stream_texts.append(page_str)
+
+        # Coalesce tiny PDF stream fragments (e.g. AcroForm field cells or line streams) into logical page blocks
+        # while deduplicating repeated form-cell labels within the same PDF.
+        page_texts: dict[int, str] = {}
+        if len(raw_stream_texts) == 1:
+            page_texts[1] = raw_stream_texts[0]
+        elif raw_stream_texts:
+            is_tiny_form_pdf = len(raw_stream_texts) > 80 and (
+                sum(len(s) for s in raw_stream_texts) / len(raw_stream_texts) < 60
+            )
+            seen_short_fragments: set[str] = set()
+            current_buf: list[str] = []
+            current_chars = 0
+            target_page_chars = 1400
+
+            for st_text in raw_stream_texts:
+                norm_st = re.sub(r"\s+", " ", st_text).strip()
+                if not norm_st:
+                    continue
+                if is_tiny_form_pdf:
+                    alpha_cnt = sum(1 for ch in norm_st if ch.isalpha())
+                    # Drop pure numeric/currency/checkbox form field micro-streams (e.g. "0.00", "X", "12")
+                    if alpha_cnt < 3:
+                        continue
+                    norm_key = norm_st.lower()
+                    if len(norm_key) < 80 and norm_key in seen_short_fragments:
+                        continue
+                    if len(norm_key) < 80:
+                        seen_short_fragments.add(norm_key)
+
+                # If a single stream is already a full page (>= 250 chars) and we aren't in a tiny-form PDF,
+                # flush any buffered fragments and emit it as a logical page block.
+                if not is_tiny_form_pdf and len(norm_st) >= 250:
+                    if current_buf:
+                        p_num = len(page_texts) + 1
+                        page_texts[p_num] = "\n".join(current_buf).strip()
+                        current_buf = []
+                        current_chars = 0
+                    p_num = len(page_texts) + 1
+                    page_texts[p_num] = norm_st
+                else:
+                    current_buf.append(norm_st)
+                    current_chars += len(norm_st) + 1
+                    if current_chars >= target_page_chars:
+                        p_num = len(page_texts) + 1
+                        page_texts[p_num] = "\n".join(current_buf).strip()
+                        current_buf = []
+                        current_chars = 0
+
+            if current_buf:
+                p_num = len(page_texts) + 1
+                page_texts[p_num] = "\n".join(current_buf).strip()
 
         full_text = "\n\n".join(
-            f"[Page {p_no}]\n{p_txt}" for p_no, p_txt in sorted(page_texts.items())
+            f"[Page {p_no}]\n{p_txt}" for p_no, p_txt in sorted(page_texts.items()) if p_txt
         ).strip()
 
         if full_text:
@@ -507,18 +561,19 @@ class PDFDocumentExtractor:
 
     @staticmethod
     def _extract_pdf_text_operators(data: bytes) -> list[str]:
-        """Extract readable strings from PDF `(...) Tj` and `[...] TJ` text operators."""
+        """Extract readable strings from PDF `(...) Tj` and `[...] TJ` text operators with bounded regexes."""
+        if not data or (b"Tj" not in data and b"TJ" not in data):
+            return []
         text_out: list[str] = []
-        # Match BT ... ET text blocks or direct (...) Tj / [...] TJ operators
-        for match in re.finditer(rb"\(([^()\\]*(?:\\.[^()\\]*)*)\)\s*Tj", data):
+        for match in PDFDocumentExtractor._TJ_SINGLE_RE.finditer(data):
             s = PDFDocumentExtractor._unescape_pdf_string(match.group(1))
             if s:
                 text_out.append(s)
-        for tj_arr in re.finditer(rb"\[(.*?)\]\s*TJ", data, re.DOTALL):
+        for tj_arr in PDFDocumentExtractor._TJ_ARRAY_RE.finditer(data):
             inner = tj_arr.group(1)
             parts = [
                 PDFDocumentExtractor._unescape_pdf_string(m.group(1))
-                for m in re.finditer(rb"\(([^()\\]*(?:\\.[^()\\]*)*)\)", inner)
+                for m in PDFDocumentExtractor._TJ_INNER_STR_RE.finditer(inner)
             ]
             joined = "".join(p for p in parts if p).strip()
             if joined:
@@ -534,6 +589,7 @@ class PDFDocumentExtractor:
         if any(ch.isalnum() for ch in s):
             return s
         return ""
+
 
 
 # ─── Content Fetch Adapters ───────────────────────────────────────────────────
@@ -1356,6 +1412,328 @@ class OSINTExtractionService:
             is_synthetic_fixture=is_synthetic_fixture,
         )
 
+    def extract_from_artifact_bytes(
+        self,
+        *,
+        vendor_id: str,
+        document_id: str,
+        content_bytes: bytes,
+        url: str,
+        source_class: str = "S2",
+        artifact_path: Optional[str] = None,
+        retrieved_at: Optional[str] = None,
+        query_ids: Optional[list[str]] = None,
+        triage_action: Optional[str] = None,
+        is_synthetic_fixture: bool = False,
+    ) -> ExtractedDocument:
+        """Extract an HTML or PDF document directly from verified local artifact bytes without network access."""
+        now_iso = retrieved_at or _utc_now_iso()
+        sha256_hex = compute_sha256(content_bytes)
+        is_pdf = (
+            (artifact_path or "").lower().endswith(".pdf")
+            or url.lower().split("?")[0].endswith(".pdf")
+            or content_bytes.lstrip().startswith(b"%PDF-")
+        )
+        canon_url = canonicalize_url(url) or url
+
+        if is_pdf:
+            title, cleaned_text, page_texts, status, limits = PDFDocumentExtractor.extract(content_bytes)
+            return ExtractedDocument(
+                document_id=document_id,
+                vendor_id=vendor_id,
+                url=url,
+                canonical_url=canon_url,
+                requested_url=url,
+                final_response_url=url,
+                http_status=200,
+                retrieval_method="LOCAL_VERIFIED_ARTIFACT_PDF",
+                source_integrity_status="VERIFIED",
+                source_class=source_class,
+                content_type="application/pdf",
+                title=title,
+                raw_text="",
+                cleaned_text=cleaned_text,
+                page_texts=page_texts,
+                content_sha256=sha256_hex,
+                byte_size=len(content_bytes),
+                retrieved_at=now_iso,
+                extraction_status=status,
+                extraction_limitations=limits,
+                artifact_path=artifact_path,
+                query_ids=list(query_ids or []),
+                triage_action=triage_action,
+                is_synthetic_fixture=is_synthetic_fixture,
+                reused_from_cache=True,
+                cleaning_version="2.0",
+            )
+
+        raw_html = content_bytes.decode("utf-8", errors="replace")
+        title, cleaned_text, _, status, decl_canon, decl_og = HTMLTextExtractor.extract_with_metadata(raw_html)
+        limits = [] if status == ExtractionStatus.EXTRACTED else ["HTML document contained no extractable body text."]
+        resolved_url = decl_canon or decl_og or url
+        resolved_canon = canonicalize_url(resolved_url) or canon_url
+
+        integrity_ok, integrity_status, integrity_warnings = validate_source_integrity(
+            requested_url=resolved_url,
+            final_response_url=resolved_url,
+            content_type="text/html",
+            declared_canonical_url=decl_canon,
+            declared_og_url=decl_og,
+            page_title=title,
+        )
+        if not integrity_ok:
+            status = ExtractionStatus.SOURCE_IDENTITY_MISMATCH
+            limits = list(limits) + list(integrity_warnings)
+
+        return ExtractedDocument(
+            document_id=document_id,
+            vendor_id=vendor_id,
+            url=resolved_url,
+            canonical_url=resolved_canon,
+            requested_url=url,
+            final_response_url=resolved_url,
+            http_status=200,
+            declared_canonical_url=decl_canon,
+            declared_og_url=decl_og,
+            retrieval_method="LOCAL_VERIFIED_ARTIFACT_HTML",
+            source_integrity_status=integrity_status,
+            source_integrity_warnings=integrity_warnings,
+            source_class=source_class,
+            content_type="text/html",
+            title=title,
+            raw_text=raw_html,
+            cleaned_text=cleaned_text,
+            page_texts={},
+            content_sha256=sha256_hex,
+            byte_size=len(content_bytes),
+            retrieved_at=now_iso,
+            extraction_status=status,
+            extraction_limitations=limits,
+            artifact_path=artifact_path,
+            query_ids=list(query_ids or []),
+            triage_action=triage_action,
+            is_synthetic_fixture=is_synthetic_fixture,
+            reused_from_cache=True,
+            cleaning_version="2.0",
+        )
+
+    @staticmethod
+    def normalize_passage_text(text: str) -> str:
+        """Deterministically normalize passage text for exact and near-duplicate hashing."""
+        low = text.lower()
+        # Normalize repeated punctuation and whitespace while preserving words and numbers
+        low = re.sub(r"[^\w\s]", " ", low)
+        low = re.sub(r"\s+", " ", low).strip()
+        return low
+
+    @classmethod
+    def compute_normalized_passage_hash(cls, text: str) -> str:
+        """Compute SHA-256 of normalized passage text."""
+        norm = cls.normalize_passage_text(text)
+        return compute_sha256(norm or text)
+
+    @staticmethod
+    def contains_protected_governance_disclosure(excerpt: str) -> bool:
+        """Return True if the passage contains any AI, ML, automation, training, ZDR, opt-in, human review, or subprocessor disclosure.
+
+        Short or negative disclosures (e.g., 'We do not use AI', 'Customer data is never used to train models',
+        'Zero data retention is enforced') are strictly protected from boilerplate/length pruning.
+        """
+        low = excerpt.lower()
+        protected_terms = (
+            "ignore previous",
+            "disregard all",
+            "system prompt",
+            "developer mode",
+            "openai",
+            "anthropic",
+            "bedrock",
+            "vertex ai",
+            "azure openai",
+            "cohere",
+            "mistral",
+            "hugging face",
+            "huggingface",
+            "gpt-",
+            "gpt4",
+            "gpt3",
+            "claude",
+            "llama",
+            "gemini",
+            "titan",
+            "xgboost",
+            "random forest",
+            "large language model",
+            "foundation model",
+            "llm",
+            "generative ai",
+            "genai",
+            "machine learning",
+            "artificial intelligence",
+            "neural network",
+            "deep learning",
+            "predictive model",
+            "anomaly detection",
+            "scoring model",
+            "classification model",
+            "agentic",
+            "autonomous agent",
+            "tool calling",
+            "automated decision",
+            "human-in-the-loop",
+            "human in the loop",
+            "human review",
+            "human oversight",
+            "manual review",
+            "retrieval-augmented",
+            "vector embedding",
+            "subprocessor",
+            "sub-processor",
+            "not used to train",
+            "never used to train",
+            "do not train",
+            "does not train",
+            "do not use ai",
+            "does not use ai",
+            "no ai ",
+            "model training",
+            "train models",
+            "fine-tun",
+            "zero data retention",
+            "zero-data-retention",
+            "zdr",
+            "opt-in",
+            "opt-out",
+            "disabled by default",
+            "ai-powered",
+            "ai powered",
+            "next-generation intelligence",
+            "smart automation",
+            "cutting-edge ai",
+            "intelligent platform",
+            "batch scheduling",
+            "batch job",
+            "job orchestration",
+            "cron schedule",
+            "rules engine",
+            "rule-based workflow",
+            "robotic process automation",
+            "rpa",
+            "deterministic workflow",
+            "tenant isolation",
+            "multi-tenant",
+            "iso 42001",
+            "soc 2",
+            "data processing addendum",
+        )
+        if any(term in low for term in protected_terms):
+            return True
+        if re.search(r"\bai\b", low):
+            return True
+        return False
+
+    _BOILERPLATE_NOISE_RE = re.compile(
+        r"("
+        r"all rights reserved|"
+        r"cookie preferences|manage cookies|accept all cookies|cookie settings|"
+        r"skip to (?:main )?content|back to top|"
+        r"subscribe to our newsletter|sign up for updates|"
+        r"follow us on (?:twitter|linkedin|facebook|instagram|youtube)|"
+        r"fec form 3p|report of receipts and disbursements|"
+        r"schedule a-p|itemized receipts|allocation of federal and non-federal|"
+        r"united states bankruptcy court|debtor in possession|chapter 11|"
+        r"affidavit of service|certificate of service|"
+        r"terms of use\s*\|\s*privacy|privacy policy\s*\|\s*terms"
+        r")",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def is_boilerplate_or_low_info_passage(
+        cls,
+        excerpt: str,
+        *,
+        legal_entity: str = "",
+        total_document_blocks: int = 1,
+    ) -> tuple[bool, str]:
+        """Deterministically identify non-substantive boilerplate, UI chrome, or form/table noise.
+
+        Never drops any passage matching `contains_protected_governance_disclosure`.
+        """
+        if cls.contains_protected_governance_disclosure(excerpt):
+            return False, ""
+
+        rel_score = cls._score_excerpt_relevance(excerpt, legal_entity=legal_entity)
+        words = re.findall(r"[A-Za-z0-9]+", excerpt)
+        word_count = len(words)
+        char_len = len(excerpt)
+
+        # 1. Explicit boilerplate / cookie / court-docket / FEC-form / nav patterns
+        if cls._BOILERPLATE_NOISE_RE.search(excerpt):
+            return True, "BOILERPLATE_PATTERN"
+
+        # 2. Short fragment filter (only when no governance/AI signal is present)
+        min_chars = 45 if total_document_blocks > 3 else 25
+        min_words = 7 if total_document_blocks > 3 else 4
+        if rel_score == 0 and (char_len < min_chars or word_count < min_words):
+            return True, "SHORT_LOW_SIGNAL_FRAGMENT"
+
+        # 3. Low alphabetic ratio or high numeric/symbol table density (e.g., PO grids, financial tables)
+        alpha_count = sum(1 for ch in excerpt if ch.isalpha())
+        digit_count = sum(1 for ch in excerpt if ch.isdigit())
+        if char_len > 0:
+            alpha_ratio = alpha_count / char_len
+            digit_ratio = digit_count / char_len
+            if rel_score == 0 and (alpha_ratio < 0.48 or digit_ratio > 0.25):
+                return True, "LOW_ALPHA_OR_NUMERIC_TABLE"
+
+        # 4. Link-list / menu / breadcrumb density (many short lines or pipe/chevron separators)
+        lines = [ln.strip() for ln in excerpt.splitlines() if ln.strip()]
+        if len(lines) >= 4 and rel_score == 0:
+            avg_words_per_line = word_count / len(lines)
+            if avg_words_per_line < 4.5:
+                return True, "MENU_OR_LINK_LIST"
+
+        sep_count = excerpt.count("|") + excerpt.count("•") + excerpt.count("›") + excerpt.count("»")
+        if sep_count >= 3 and rel_score == 0 and word_count < 40:
+            return True, "NAV_BREADCRUMB_CHROME"
+
+        return False, ""
+
+    @classmethod
+    def compute_word_shingles(cls, text: str, k: int = 4) -> set[str]:
+        """Compute k-word shingles from normalized text for fast near-duplicate Jaccard comparison."""
+        words = cls.normalize_passage_text(text).split()
+        if not words:
+            return set()
+        if len(words) < k:
+            return {" ".join(words)}
+        return {" ".join(words[i : i + k]) for i in range(len(words) - k + 1)}
+
+    @staticmethod
+    def is_near_duplicate_shingle(
+        shingles: set[str],
+        existing_shingles: list[tuple[set[str], EvidenceRecord]],
+        *,
+        threshold: float = 0.85,
+    ) -> Optional[EvidenceRecord]:
+        """Return the matching primary EvidenceRecord if Jaccard similarity >= threshold, else None."""
+        if not shingles or len(shingles) < 4:
+            return None
+        n_a = len(shingles)
+        for other_set, primary_rec in existing_shingles:
+            n_b = len(other_set)
+            if n_b == 0:
+                continue
+            # Fast size-bound check: even if one is a subset of the other, min(n_a, n_b)/max(n_a, n_b) must be >= threshold
+            if min(n_a, n_b) / max(n_a, n_b) < threshold:
+                continue
+            inter = len(shingles & other_set)
+            union = n_a + n_b - inter
+            if union > 0 and (inter / union) >= threshold:
+                return primary_rec
+        return None
+
     @staticmethod
     def _score_excerpt_relevance(excerpt: str, legal_entity: str = "") -> int:
         """Score an extracted paragraph block so large HTML/PDF documents prioritize AI, automation, and governance passages."""
@@ -1468,14 +1846,23 @@ class OSINTExtractionService:
         domain: str,
         starting_seq: int = 1,
         max_records_per_document: int = 25,
+        seen_normalized_hashes: Optional[dict[str, EvidenceRecord]] = None,
+        seen_shingle_sets: Optional[list[tuple[set[str], EvidenceRecord]]] = None,
+        screened_out_records_out: Optional[list[EvidenceRecord]] = None,
     ) -> list[EvidenceRecord]:
         """Construct traceable EvidenceRecord items from an ExtractedDocument.
 
         Every `verbatim_excerpt` is an exact substring of `doc.cleaned_text` with recorded
         `char_start` and `char_end` offsets. Never fabricates text for failed/empty extractions
         or documents flagged with `SOURCE_IDENTITY_MISMATCH`.
-        When a scraped document contains many blocks (> 20), deduplicates repeated boilerplate,
-        filters tiny noise fragments, and prioritizes AI/automation/governance-relevant passages.
+
+        Performs deterministic Level 4 cleaning and deduplication:
+          1. Preserves all short or negative AI/governance disclosures (`contains_protected_governance_disclosure`).
+          2. Filters non-substantive boilerplate, menus, footers, cookie chrome, and numeric/form noise.
+          3. Suppresses exact normalized duplicates within the document and across documents in the run,
+             recording corroborating document IDs and URLs on the primary EvidenceRecord.
+          4. Suppresses near-duplicate passages via 4-word shingle Jaccard similarity (>= 0.85).
+          5. Populates filtering telemetry on `doc` and optionally emits `SCREENED_OUT_DETERMINISTIC` records.
         """
         s_def = self.source_registry.get_source(doc.source_class)
         grade = s_def.default_evidence_grade if s_def else "C"
@@ -1527,75 +1914,229 @@ class OSINTExtractionService:
 
             raw_candidates.append((block_idx, excerpt, current_heading, current_page, char_start, char_end))
 
-        # For large scraped HTML/PDF documents (> 20 blocks), clean boilerplate, deduplicate, and bound to top passages
-        if len(raw_candidates) > 20:
-            seen_norm: set[str] = set()
-            scored_candidates: list[tuple[int, int, str, Optional[str], Optional[int], int, int]] = []
-            for block_idx, excerpt, heading, page_num, c_start, c_end in raw_candidates:
-                norm_key = re.sub(r"\s+", " ", excerpt.lower()).strip()
-                if norm_key in seen_norm:
-                    continue
-                seen_norm.add(norm_key)
+        total_raw = len(raw_candidates)
+        doc.raw_blocks_count = total_raw
+        doc.boilerplate_filtered_count = 0
+        doc.exact_duplicates_filtered_count = 0
+        doc.near_duplicates_filtered_count = 0
 
-                rel_score = self._score_excerpt_relevance(excerpt, legal_entity=legal_entity)
-                word_count = len(re.findall(r"[A-Za-z0-9]+", excerpt))
-                # Skip tiny menu/footer fragments unless they carry an explicit signal
-                if rel_score == 0 and (len(excerpt) < 35 or word_count < 5):
-                    continue
-                scored_candidates.append((rel_score, block_idx, excerpt, heading, page_num, c_start, c_end))
+        local_norm_hashes: dict[str, EvidenceRecord] = (
+            seen_normalized_hashes if seen_normalized_hashes is not None else {}
+        )
+        local_shingles: list[tuple[set[str], EvidenceRecord]] = (
+            seen_shingle_sets if seen_shingle_sets is not None else []
+        )
 
-            if len(scored_candidates) > max_records_per_document:
-                # Sort by relevance score descending, then earlier position in document
-                scored_candidates.sort(key=lambda item: (-item[0], item[1]))
-                top_subset = scored_candidates[:max_records_per_document]
-                # Restore natural document reading order
-                top_subset.sort(key=lambda item: item[1])
-                selected_candidates = [
-                    (item[1], item[2], item[3], item[4], item[5], item[6]) for item in top_subset
-                ]
-            else:
-                selected_candidates = [
-                    (item[1], item[2], item[3], item[4], item[5], item[6]) for item in scored_candidates
-                ]
+        doc_sha = doc.content_sha256 or compute_sha256(text)
+
+        def _make_record(
+            ev_id: str,
+            excerpt_str: str,
+            heading_val: Optional[str],
+            page_val: Optional[int],
+            c_start: int,
+            c_end: int,
+            norm_hash_val: str,
+            *,
+            screening_status: str = "CANDIDATE",
+            analysis_state: str = "PENDING_ANALYSIS",
+            screening_reason: Optional[str] = None,
+        ) -> EvidenceRecord:
+            return EvidenceRecord(
+                evidence_id=ev_id,
+                document_id=doc.document_id,
+                vendor_id=doc.vendor_id,
+                legal_entity=legal_entity,
+                domain=domain,
+                source_class=doc.source_class,
+                canonical_url=doc.canonical_url,
+                original_url=doc.url,
+                final_url=doc.final_response_url,
+                retrieval_method=doc.retrieval_method,
+                source_integrity_status=doc.source_integrity_status,
+                retrieved_at=doc.retrieved_at,
+                page_title=doc.title,
+                section_heading=heading_val,
+                verbatim_excerpt=excerpt_str,
+                page_number=page_val,
+                char_start=c_start,
+                char_end=c_end,
+                content_sha256=doc_sha,
+                raw_passage_hash=compute_sha256(excerpt_str),
+                normalized_hash=norm_hash_val,
+                capture_artifact_ref=doc.artifact_path,
+                source_reliability_grade=grade,
+                source_reliability_rating=rel_rating,
+                query_ids=list(doc.query_ids),
+                triage_decision=doc.triage_action,
+                extraction_status=doc.extraction_status,
+                extraction_limitations=list(doc.extraction_limitations),
+                screening_status=screening_status,
+                analysis_state=analysis_state,
+                screening_reason=screening_reason,
+                is_reviewed_and_accepted=False,
+                is_synthetic_test_fixture=doc.is_synthetic_fixture,
+            )
+
+        cleaned_candidates: list[tuple[int, int, str, Optional[str], Optional[int], int, int, str, set[str]]] = []
+        screened_seq = 1
+
+        for block_idx, excerpt, heading, page_num, c_start, c_end in raw_candidates:
+            norm_hash = self.compute_normalized_passage_hash(excerpt)
+
+            # 1. Exact normalized-hash duplicate check (within document and across documents)
+            if norm_hash in local_norm_hashes:
+                doc.exact_duplicates_filtered_count += 1
+                primary = local_norm_hashes[norm_hash]
+                if doc.document_id and doc.document_id != primary.document_id:
+                    if doc.document_id not in primary.corroborating_document_ids:
+                        primary.corroborating_document_ids.append(doc.document_id)
+                if doc.canonical_url and doc.canonical_url != primary.canonical_url:
+                    if doc.canonical_url not in primary.corroborating_urls:
+                        primary.corroborating_urls.append(doc.canonical_url)
+                if screened_out_records_out is not None:
+                    screened_out_records_out.append(
+                        _make_record(
+                            f"EV_SCR_{doc.document_id}_{screened_seq:03d}",
+                            excerpt,
+                            heading,
+                            page_num,
+                            c_start,
+                            c_end,
+                            norm_hash,
+                            screening_status="SCREENED_OUT_DETERMINISTIC",
+                            analysis_state="SCREENED_OUT_DETERMINISTIC",
+                            screening_reason="EXACT_DUPLICATE",
+                        )
+                    )
+                    screened_seq += 1
+                continue
+
+            # 2. Boilerplate / low-information deterministic filter (never drops protected disclosures)
+            is_bp, bp_reason = self.is_boilerplate_or_low_info_passage(
+                excerpt,
+                legal_entity=legal_entity,
+                total_document_blocks=total_raw,
+            )
+            if is_bp:
+                doc.boilerplate_filtered_count += 1
+                if screened_out_records_out is not None:
+                    screened_out_records_out.append(
+                        _make_record(
+                            f"EV_SCR_{doc.document_id}_{screened_seq:03d}",
+                            excerpt,
+                            heading,
+                            page_num,
+                            c_start,
+                            c_end,
+                            norm_hash,
+                            screening_status="SCREENED_OUT_DETERMINISTIC",
+                            analysis_state="SCREENED_OUT_DETERMINISTIC",
+                            screening_reason=bp_reason,
+                        )
+                    )
+                    screened_seq += 1
+                continue
+
+            # 3. Near-duplicate check via 4-word shingle Jaccard similarity
+            shingles = self.compute_word_shingles(excerpt, k=4)
+            near_dup_primary = self.is_near_duplicate_shingle(shingles, local_shingles, threshold=0.85)
+            if near_dup_primary is not None:
+                doc.near_duplicates_filtered_count += 1
+                if doc.document_id and doc.document_id != near_dup_primary.document_id:
+                    if doc.document_id not in near_dup_primary.corroborating_document_ids:
+                        near_dup_primary.corroborating_document_ids.append(doc.document_id)
+                if doc.canonical_url and doc.canonical_url != near_dup_primary.canonical_url:
+                    if doc.canonical_url not in near_dup_primary.corroborating_urls:
+                        near_dup_primary.corroborating_urls.append(doc.canonical_url)
+                if screened_out_records_out is not None:
+                    screened_out_records_out.append(
+                        _make_record(
+                            f"EV_SCR_{doc.document_id}_{screened_seq:03d}",
+                            excerpt,
+                            heading,
+                            page_num,
+                            c_start,
+                            c_end,
+                            norm_hash,
+                            screening_status="SCREENED_OUT_DETERMINISTIC",
+                            analysis_state="SCREENED_OUT_DETERMINISTIC",
+                            screening_reason="NEAR_DUPLICATE",
+                        )
+                    )
+                    screened_seq += 1
+                continue
+
+            rel_score = self._score_excerpt_relevance(excerpt, legal_entity=legal_entity)
+            cleaned_candidates.append(
+                (rel_score, block_idx, excerpt, heading, page_num, c_start, c_end, norm_hash, shingles)
+            )
+            # Register placeholder in local_norm_hashes / local_shingles once record is built below
+            placeholder_rec = _make_record(
+                f"EV_TMP_{block_idx}",
+                excerpt,
+                heading,
+                page_num,
+                c_start,
+                c_end,
+                norm_hash,
+            )
+            local_norm_hashes[norm_hash] = placeholder_rec
+            if len(shingles) >= 4:
+                local_shingles.append((shingles, placeholder_rec))
+
+        # Bound per-document records while always retaining protected governance disclosures
+        if len(cleaned_candidates) > max_records_per_document:
+            cleaned_candidates.sort(key=lambda item: (-item[0], item[1]))
+            top_subset = cleaned_candidates[:max_records_per_document]
+            dropped_by_cap = cleaned_candidates[max_records_per_document:]
+            for _, _, ex_d, hd_d, pg_d, cs_d, ce_d, nh_d, _ in dropped_by_cap:
+                doc.boilerplate_filtered_count += 1
+                if screened_out_records_out is not None:
+                    screened_out_records_out.append(
+                        _make_record(
+                            f"EV_SCR_{doc.document_id}_{screened_seq:03d}",
+                            ex_d,
+                            hd_d,
+                            pg_d,
+                            cs_d,
+                            ce_d,
+                            nh_d,
+                            screening_status="SCREENED_OUT_DETERMINISTIC",
+                            analysis_state="SCREENED_OUT_DETERMINISTIC",
+                            screening_reason="EXCEEDED_PER_DOCUMENT_PASSAGE_CAP",
+                        )
+                    )
+                    screened_seq += 1
+            top_subset.sort(key=lambda item: item[1])
+            selected_candidates = top_subset
         else:
-            selected_candidates = raw_candidates
+            selected_candidates = cleaned_candidates
 
         records: list[EvidenceRecord] = []
         seq = starting_seq
-        for _, excerpt, heading, page_num, char_start, char_end in selected_candidates:
+        for _, _, excerpt, heading, page_num, char_start, char_end, norm_hash, shingles in selected_candidates:
             ev_id = f"EV_{doc.vendor_id}_{seq:03d}"
             seq += 1
-            records.append(
-                EvidenceRecord(
-                    evidence_id=ev_id,
-                    document_id=doc.document_id,
-                    vendor_id=doc.vendor_id,
-                    legal_entity=legal_entity,
-                    domain=domain,
-                    source_class=doc.source_class,
-                    canonical_url=doc.canonical_url,
-                    original_url=doc.url,
-                    final_url=doc.final_response_url,
-                    retrieval_method=doc.retrieval_method,
-                    source_integrity_status=doc.source_integrity_status,
-                    retrieved_at=doc.retrieved_at,
-                    page_title=doc.title,
-                    section_heading=heading,
-                    verbatim_excerpt=excerpt,
-                    page_number=page_num,
-                    char_start=char_start,
-                    char_end=char_end,
-                    content_sha256=doc.content_sha256 or compute_sha256(text),
-                    capture_artifact_ref=doc.artifact_path,
-                    source_reliability_grade=grade,
-                    source_reliability_rating=rel_rating,
-                    query_ids=list(doc.query_ids),
-                    triage_decision=doc.triage_action,
-                    extraction_status=doc.extraction_status,
-                    extraction_limitations=list(doc.extraction_limitations),
-                    is_reviewed_and_accepted=False,
-                    is_synthetic_test_fixture=doc.is_synthetic_fixture,
-                )
+            prev_holder = local_norm_hashes.get(norm_hash)
+            rec = _make_record(
+                ev_id,
+                excerpt,
+                heading,
+                page_num,
+                char_start,
+                char_end,
+                norm_hash,
             )
+            if prev_holder is not None:
+                rec.corroborating_document_ids = list(prev_holder.corroborating_document_ids)
+                rec.corroborating_urls = list(prev_holder.corroborating_urls)
+            local_norm_hashes[norm_hash] = rec
+            for idx_sh, (sh_set, holder) in enumerate(local_shingles):
+                if holder is prev_holder:
+                    local_shingles[idx_sh] = (sh_set, rec)
+            records.append(rec)
 
+        doc.unique_passages_count = len(records)
         return records
+

@@ -138,6 +138,13 @@ PLAIN_STATUS_LABELS: dict[str, str] = {
     "DETERMINISTIC_RULES": "Rule-Based Analysis",
     "LOCAL_LLM_VALIDATED": "Local AI Analysis (Validated)",
     "MODEL_UNAVAILABLE_FALLBACK": "Semantic evidence retrieval unavailable",
+    "SEMANTIC_RETRIEVAL_ENABLED": "Semantic retrieval enabled",
+    "HYBRID_SEMANTIC_MINILM": "Semantic retrieval enabled",
+    "HYBRID_BROAD_RECALL_FALLBACK": "Semantic retrieval enabled",
+    "DETERMINISTIC_FALLBACK": "Deterministic retrieval fallback",
+    "MODEL_UNAVAILABLE_NOT_CONFIGURED": "Deterministic retrieval fallback",
+    "NO_DOCUMENTS": "Retrieval incomplete",
+    "RETRIEVAL_INCOMPLETE": "Retrieval incomplete",
     # Retrieval & Source Integrity
     "SOURCE_IDENTITY_MISMATCH": "Source Identity Mismatch (Rejected)",
     "VERIFIED": "Verified Source Identity",
@@ -225,6 +232,7 @@ class SystemReadinessReport(BaseModel):
 
     semantic_retrieval_ready: bool = False
     semantic_retrieval_label: str = "Semantic evidence retrieval unavailable"
+    retrieval_status_label: str = "Deterministic retrieval fallback"
 
     risk_score_calibration_ready: bool = False
     risk_score_calibration_label: str = "Calibrated numerical risk score unavailable"
@@ -457,6 +465,7 @@ class SystemReadinessInspector:
             )
             semantic_retrieval_ready = True
             semantic_retrieval_label = "Semantic evidence retrieval available"
+            retrieval_status_label = "Semantic retrieval enabled"
         elif routing_cfg.enable_rag_embeddings and not st_installed:
             rag_active_mode = "DETERMINISTIC_CHUNK_PASSTHROUGH_TO_L6"
             rag_status_msg = (
@@ -465,6 +474,7 @@ class SystemReadinessInspector:
             )
             semantic_retrieval_ready = False
             semantic_retrieval_label = "Semantic evidence retrieval unavailable"
+            retrieval_status_label = "Deterministic retrieval fallback"
         elif routing_cfg.enable_rag_embeddings and not emb_cached:
             rag_active_mode = "DETERMINISTIC_CHUNK_PASSTHROUGH_TO_L6"
             rag_status_msg = (
@@ -473,6 +483,7 @@ class SystemReadinessInspector:
             )
             semantic_retrieval_ready = False
             semantic_retrieval_label = "Semantic evidence retrieval unavailable"
+            retrieval_status_label = "Deterministic retrieval fallback"
         else:
             rag_active_mode = "DETERMINISTIC_CHUNK_PASSTHROUGH_TO_L6"
             rag_status_msg = (
@@ -481,6 +492,7 @@ class SystemReadinessInspector:
             )
             semantic_retrieval_ready = False
             semantic_retrieval_label = "Semantic evidence retrieval unavailable"
+            retrieval_status_label = "Deterministic retrieval fallback"
 
         # 4. Check Level 9 Production Risk-Scoring Policy Readiness
         scorer = DeterministicRiskScoringEngine(policy_path=scoring_policy_path)
@@ -510,6 +522,7 @@ class SystemReadinessInspector:
             local_analysis_label=local_analysis_label,
             semantic_retrieval_ready=semantic_retrieval_ready,
             semantic_retrieval_label=semantic_retrieval_label,
+            retrieval_status_label=retrieval_status_label,
             risk_score_calibration_ready=policy_ready,
             risk_score_calibration_label=risk_score_calibration_label,
             ollama_endpoint=routing_cfg.endpoint,
@@ -821,23 +834,30 @@ def build_nine_level_stage_tracker(
                 f"{rag.chunks_created} chunk(s) created | {rag.chunks_embedded} embedded | {len(rag.matches)} concept match(es)"
             )
             analyst_counts = f"{rag.chunks_created} passage chunk(s)"
-            if rag.model_available:
-                exec_method = f"Token Chunker + Semantic Embeddings ({rag.model_name})"
-                analyst_status = "Completed"
-                analyst_method = "Semantic Evidence Retrieval"
-                analyst_summary = (
-                    f"Segmented evidence into {rag.chunks_created} passage chunk(s) and matched "
-                    f"{len(rag.matches)} high-relevance AI risk concept(s)."
-                )
-            else:
-                exec_method = "Deterministic 500-Token Chunker (Passthrough to Level 6; Embeddings Disabled)"
+            if rag.status == "NO_DOCUMENTS" or rag.chunks_created == 0:
+                exec_method = "Token Chunker (No Upstream Documents)"
                 if rag.limitations:
                     blocker = rag.limitations[0]
-                analyst_status = "Semantic evidence retrieval unavailable"
-                analyst_method = "Standard Text Chunking (Full Evidence Passthrough)"
+                analyst_status = "Retrieval incomplete"
+                analyst_method = "Semantic Evidence Retrieval"
+                analyst_summary = "No upstream extracted evidence passages were available for retrieval."
+            elif rag.model_available:
+                exec_method = f"Token Chunker + Semantic Embeddings ({rag.model_name})"
+                analyst_status = "Semantic retrieval enabled"
+                analyst_method = "Semantic Evidence Retrieval"
                 analyst_summary = (
-                    f"Segmented {rag.chunks_created} passage chunk(s); all captured evidence passed directly "
-                    "to Signal Classification without filtering."
+                    f"Segmented evidence into {rag.chunks_created} passage chunk(s), matched "
+                    f"{len(rag.matches)} AI risk concept(s), and selected {rag.candidates_selected_for_llm} candidate(s)."
+                )
+            else:
+                exec_method = "Deterministic 500-Token Chunker (Deterministic Candidate Selection)"
+                if rag.limitations:
+                    blocker = rag.limitations[0]
+                analyst_status = "Deterministic retrieval fallback"
+                analyst_method = "Deterministic Candidate Retrieval"
+                analyst_summary = (
+                    f"Segmented {rag.chunks_created} passage chunk(s) and selected "
+                    f"{rag.candidates_selected_for_llm or rag.chunks_created} candidate(s) via deterministic retrieval fallback."
                 )
 
         elif lvl == 6:

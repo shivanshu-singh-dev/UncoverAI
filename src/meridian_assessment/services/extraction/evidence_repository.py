@@ -11,8 +11,10 @@ Provides:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Optional
 
@@ -26,10 +28,17 @@ from meridian_assessment.models.ai_risk import (
 DEFAULT_EVIDENCE_DB_PATH = Path("data/output/evidence_store/meridian_evidence.db")
 DEFAULT_ARTIFACT_STORE_DIR = Path("data/output/evidence_store/artifacts")
 SCHEMA_VERSION = "1.0.0"
+CLEANING_LOGIC_VERSION = "2.0"
+CLASSIFIER_PROMPT_VERSION = "2.0"
+EMBEDDING_MODEL_DEFAULT = "sentence-transformers/all-MiniLM-L6-v2"
+SYNTHETIC_FIXTURE_HASH_PREFIXES = frozenset({"e3cf1468698b", "02b5b6376a51", "9f4122cb1170", "a84f39c02d11"})
+_ARTIFACT_FILENAME_RE = re.compile(r"^DOC_(?P<vendor_id>V-\d+)_(?P<seq>\d+)_(?P<sha12>[0-9a-f]{12})\.(?P<ext>html|pdf|txt)$")
+
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 
 class EvidenceRepository:
@@ -119,6 +128,47 @@ class EvidenceRepository:
                     vendor_id TEXT NOT NULL,
                     generated_at TEXT NOT NULL,
                     is_synthetic_evidence_run INTEGER NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunk_embeddings_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    chunk_sha256 TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    cleaning_version TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    vector_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS classification_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    vendor_id TEXT NOT NULL,
+                    passage_hash TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    classifier_version TEXT NOT NULL,
+                    analysis_state TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assessment_checkpoints (
+                    vendor_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    cleaning_version TEXT NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    classifier_version TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 )
                 """
@@ -361,3 +411,425 @@ class EvidenceRepository:
         finally:
             if self._persistent_conn is None:
                 conn.close()
+
+    # ─── Artifact Reuse & Integrity Verification (Level 4) ────────────────────
+
+    def verify_artifact_integrity(
+        self,
+        vendor_id: str,
+        artifact_path: Path | str,
+        *,
+        expected_sha256: Optional[str] = None,
+    ) -> tuple[bool, Optional[bytes], str]:
+        """Verify an artifact exists, belongs to vendor_id, is non-empty, and matches its SHA-256."""
+        path = Path(artifact_path)
+        if not path.exists() or not path.is_file():
+            return False, None, "Artifact file does not exist on disk."
+        m = _ARTIFACT_FILENAME_RE.match(path.name)
+        if m is not None and m.group("vendor_id") != vendor_id:
+            return False, None, f"Artifact vendor mismatch: expected {vendor_id}, got {m.group('vendor_id')}."
+        try:
+            raw_bytes = path.read_bytes()
+        except Exception as exc:
+            return False, None, f"Failed to read artifact bytes: {exc}"
+        if not raw_bytes:
+            return False, None, "Artifact file is empty (0 bytes)."
+        actual_sha = hashlib.sha256(raw_bytes).hexdigest()
+        if expected_sha256 and actual_sha != expected_sha256:
+            return False, None, f"Artifact SHA-256 mismatch: expected {expected_sha256[:12]}, got {actual_sha[:12]}."
+        if m is not None and not actual_sha.startswith(m.group("sha12")):
+            return (
+                False,
+                None,
+                f"Artifact filename prefix mismatch: expected {m.group('sha12')}, got {actual_sha[:12]}.",
+            )
+        return True, raw_bytes, actual_sha
+
+    def find_cached_document(
+        self,
+        vendor_id: str,
+        canonical_url: Optional[str] = None,
+        *,
+        document_id: Optional[str] = None,
+        cleaning_version: str = CLEANING_LOGIC_VERSION,
+        allow_synthetic: bool = False,
+    ) -> Optional[ExtractedDocument]:
+        """Look up a previously extracted document for (vendor_id, canonical_url or document_id) with verified integrity."""
+        conn = self._connect()
+        try:
+            rows = []
+            if canonical_url:
+                rows = conn.execute(
+                    """
+                    SELECT payload_json FROM extracted_documents
+                    WHERE vendor_id = ? AND canonical_url = ?
+                    ORDER BY retrieved_at DESC
+                    """,
+                    (vendor_id, canonical_url),
+                ).fetchall()
+            if not rows and document_id:
+                rows = conn.execute(
+                    """
+                    SELECT payload_json FROM extracted_documents
+                    WHERE vendor_id = ? AND document_id = ?
+                    ORDER BY retrieved_at DESC
+                    """,
+                    (vendor_id, document_id),
+                ).fetchall()
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
+        for (pjson,) in rows:
+            try:
+                doc = ExtractedDocument.model_validate(json.loads(pjson))
+            except Exception:
+                continue
+            if not allow_synthetic and doc.content_sha256 and doc.content_sha256[:12] in SYNTHETIC_FIXTURE_HASH_PREFIXES:
+                continue
+            if doc.extraction_status.value != "EXTRACTED" or not doc.cleaned_text:
+                continue
+            if doc.cleaning_version != cleaning_version:
+                # If raw artifact exists and passes verification, caller can re-extract with new cleaning version
+                continue
+            if doc.artifact_path:
+                ok, _, _ = self.verify_artifact_integrity(
+                    vendor_id,
+                    doc.artifact_path,
+                    expected_sha256=doc.content_sha256,
+                )
+                if not ok:
+                    continue
+            doc.reused_from_cache = True
+            return doc
+        return None
+
+    def find_cached_artifact_bytes_for_document(
+        self,
+        vendor_id: str,
+        canonical_url: str,
+        *,
+        allow_synthetic: bool = False,
+    ) -> Optional[tuple[ExtractedDocument, bytes]]:
+        """Find a stored document record whose raw artifact bytes on disk pass integrity verification."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT payload_json FROM extracted_documents
+                WHERE vendor_id = ? AND canonical_url = ?
+                ORDER BY retrieved_at DESC
+                """,
+                (vendor_id, canonical_url),
+            ).fetchall()
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
+        for (pjson,) in rows:
+            try:
+                doc = ExtractedDocument.model_validate(json.loads(pjson))
+            except Exception:
+                continue
+            if not allow_synthetic and doc.content_sha256 and doc.content_sha256[:12] in SYNTHETIC_FIXTURE_HASH_PREFIXES:
+                continue
+            if not doc.artifact_path:
+                continue
+            ok, raw_bytes, _ = self.verify_artifact_integrity(
+                vendor_id,
+                doc.artifact_path,
+                expected_sha256=doc.content_sha256,
+            )
+            if ok and raw_bytes is not None:
+                return doc, raw_bytes
+        return None
+
+
+    def discover_verified_vendor_artifacts(
+        self,
+        vendor_id: str,
+        *,
+        exclude_synthetic: bool = True,
+        include_synthetic: Optional[bool] = None,
+    ) -> list[tuple[Path, bytes, str, int, str]]:
+        """Discover and integrity-verify all local artifact files on disk for `vendor_id`.
+
+        Returns a sorted list of tuples:
+            (artifact_path, raw_bytes, full_sha256, sequence_number, file_extension)
+        """
+        if include_synthetic is not None:
+            exclude_synthetic = not bool(include_synthetic)
+        if self.artifact_dir is None or not self.artifact_dir.exists():
+            return []
+        verified: list[tuple[Path, bytes, str, int, str]] = []
+        for path in sorted(self.artifact_dir.glob(f"DOC_{vendor_id}_*")):
+            m = _ARTIFACT_FILENAME_RE.match(path.name)
+            if m is None or m.group("vendor_id") != vendor_id:
+                continue
+            sha12 = m.group("sha12")
+            if exclude_synthetic and sha12 in SYNTHETIC_FIXTURE_HASH_PREFIXES:
+                continue
+            ok, raw_bytes, full_sha = self.verify_artifact_integrity(vendor_id, path)
+            if not ok or raw_bytes is None:
+                continue
+            verified.append((path, raw_bytes, full_sha, int(m.group("seq")), m.group("ext")))
+        verified.sort(key=lambda item: (item[3], item[0].name))
+        return verified
+
+    # ─── Level 5 Embedding Cache ──────────────────────────────────────────────
+
+    @staticmethod
+    def _embedding_cache_key(chunk_sha256: str, model_name: str, cleaning_version: str) -> str:
+        raw = f"{chunk_sha256}|{model_name}|{cleaning_version}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def get_cached_embeddings(
+        self,
+        chunk_hashes: list[str],
+        model_name: str,
+        *,
+        cleaning_version: str = CLEANING_LOGIC_VERSION,
+    ) -> dict[str, list[float]]:
+        """Return cached embedding vectors keyed by chunk_sha256 for the given model and cleaning version."""
+        if not chunk_hashes:
+            return {}
+        unique_hashes = list(dict.fromkeys(chunk_hashes))
+        key_to_hash = {
+            self._embedding_cache_key(ch, model_name, cleaning_version): ch for ch in unique_hashes
+        }
+        keys = list(key_to_hash.keys())
+        result: dict[str, list[float]] = {}
+        conn = self._connect()
+        try:
+            # Query in batches of 500 to stay below SQLite parameter limits
+            for i in range(0, len(keys), 500):
+                batch_keys = keys[i : i + 500]
+                placeholders = ",".join("?" for _ in batch_keys)
+                rows = conn.execute(
+                    f"SELECT cache_key, vector_json FROM chunk_embeddings_cache WHERE cache_key IN ({placeholders})",
+                    batch_keys,
+                ).fetchall()
+                for ck, vec_json in rows:
+                    ch = key_to_hash.get(str(ck))
+                    if ch is not None:
+                        try:
+                            vec = json.loads(vec_json)
+                            if isinstance(vec, list) and vec:
+                                result[ch] = [float(x) for x in vec]
+                        except Exception:
+                            continue
+            return result
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
+    def save_cached_embeddings(
+        self,
+        embeddings_by_hash: dict[str, list[float]],
+        model_name: str,
+        *,
+        cleaning_version: str = CLEANING_LOGIC_VERSION,
+    ) -> None:
+        """Persist embedding vectors keyed by chunk_sha256."""
+        if not embeddings_by_hash:
+            return
+        now = _utc_now_iso()
+        rows_to_insert = []
+        for ch, vec in embeddings_by_hash.items():
+            if not vec:
+                continue
+            ck = self._embedding_cache_key(ch, model_name, cleaning_version)
+            rows_to_insert.append(
+                (ck, ch, model_name, cleaning_version, len(vec), json.dumps(vec), now)
+            )
+        if not rows_to_insert:
+            return
+        conn = self._connect()
+        try:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO chunk_embeddings_cache
+                (cache_key, chunk_sha256, model_name, cleaning_version, dimension, vector_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows_to_insert,
+            )
+            conn.commit()
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
+    # ─── Level 6 Classification Cache ─────────────────────────────────────────
+
+    @staticmethod
+    def _classification_cache_key(
+        vendor_id: str,
+        passage_hash: str,
+        source_class: str,
+        service_scope: str,
+        model_name: str,
+        classifier_version: str,
+    ) -> str:
+        raw = f"{vendor_id}|{passage_hash}|{source_class}|{service_scope}|{model_name}|{classifier_version}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def get_cached_classification(
+        self,
+        vendor_id: str,
+        passage_hash: str,
+        source_class: str,
+        service_scope: str,
+        model_name: str,
+        *,
+        classifier_version: str = CLASSIFIER_PROMPT_VERSION,
+    ) -> Optional[dict[str, Any]]:
+        """Retrieve a cached classification result for a normalized passage hash."""
+        ck = self._classification_cache_key(
+            vendor_id, passage_hash, source_class, service_scope, model_name, classifier_version
+        )
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT analysis_state, payload_json FROM classification_cache WHERE cache_key = ?",
+                (ck,),
+            ).fetchone()
+            if not row:
+                return None
+            payload = json.loads(row[1])
+            if isinstance(payload, dict):
+                payload["analysis_state"] = str(row[0])
+                return payload
+            return None
+        except Exception:
+            return None
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
+    def save_cached_classification(
+        self,
+        vendor_id: str,
+        passage_hash: str,
+        source_class: str,
+        service_scope: str,
+        model_name: str,
+        analysis_state: str,
+        payload: dict[str, Any],
+        *,
+        classifier_version: str = CLASSIFIER_PROMPT_VERSION,
+    ) -> None:
+        """Save a classification result to cache."""
+        ck = self._classification_cache_key(
+            vendor_id, passage_hash, source_class, service_scope, model_name, classifier_version
+        )
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO classification_cache
+                (cache_key, vendor_id, passage_hash, model_name, classifier_version, analysis_state, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ck,
+                    vendor_id,
+                    passage_hash,
+                    model_name,
+                    classifier_version,
+                    analysis_state,
+                    json.dumps(payload),
+                    _utc_now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
+    # ─── Resumable Assessment Checkpointing (Section 7) ───────────────────────
+
+    def save_checkpoint(
+        self,
+        vendor_id: str,
+        run_id: str,
+        status: str = "IN_PROGRESS",
+        payload: Optional[dict[str, Any]] = None,
+        *,
+        completed_level: Optional[int] = None,
+        checkpoint_state: Optional[dict[str, Any]] = None,
+        cleaning_version: str = CLEANING_LOGIC_VERSION,
+        embedding_model: str = EMBEDDING_MODEL_DEFAULT,
+        classifier_version: str = CLASSIFIER_PROMPT_VERSION,
+    ) -> None:
+        """Persist a resumable assessment checkpoint for `vendor_id`."""
+        resolved_payload: dict[str, Any] = dict(payload or checkpoint_state or {})
+        if completed_level is not None:
+            resolved_payload["completed_level"] = completed_level
+            if status == "IN_PROGRESS" and "status" not in resolved_payload:
+                status = f"LEVEL_{completed_level}_CHECKPOINT"
+            elif "status" in resolved_payload:
+                status = str(resolved_payload["status"])
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO assessment_checkpoints
+                (vendor_id, run_id, status, cleaning_version, embedding_model, classifier_version, updated_at, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    vendor_id,
+                    run_id,
+                    status,
+                    cleaning_version,
+                    embedding_model,
+                    classifier_version,
+                    _utc_now_iso(),
+                    json.dumps(resolved_payload),
+                ),
+            )
+            conn.commit()
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
+    def load_checkpoint(
+        self,
+        vendor_id: str,
+        *,
+        cleaning_version: str = CLEANING_LOGIC_VERSION,
+        embedding_model: str = EMBEDDING_MODEL_DEFAULT,
+        classifier_version: str = CLASSIFIER_PROMPT_VERSION,
+    ) -> Optional[dict[str, Any]]:
+        """Load a persisted checkpoint for `vendor_id` if processing versions match."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT run_id, status, cleaning_version, embedding_model, classifier_version, updated_at, payload_json
+                FROM assessment_checkpoints
+                WHERE vendor_id = ?
+                """,
+                (vendor_id,),
+            ).fetchone()
+            if not row:
+                return None
+            run_id, status, c_ver, e_mod, clf_ver, updated_at, pjson = row
+            if c_ver != cleaning_version or e_mod != embedding_model or clf_ver != classifier_version:
+                return None
+            data = json.loads(pjson)
+            if not isinstance(data, dict):
+                return None
+            data["run_id"] = str(run_id)
+            data["status"] = str(status)
+            data["cleaning_version"] = str(c_ver)
+            data["embedding_model"] = str(e_mod)
+            data["classifier_version"] = str(clf_ver)
+            data["updated_at"] = str(updated_at)
+            return data
+        except Exception:
+            return None
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+

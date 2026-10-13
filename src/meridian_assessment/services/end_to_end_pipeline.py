@@ -561,15 +561,19 @@ class MeridianEndToEndPipeline:
         if not search_ok and not use_verified_local_artifacts_only:
             unavailable_integrations.append(f"Search Backend ({self.search_backend.provider_name}): {search_msg}")
 
-        triage_decisions: list[URLTriageDecision] = self.triage_service.triage_plan_candidates(
-            plan,
-            progress_callback=lambda c_done, c_tot, c_obj: _notify_progress(
+        def _on_triage_progress(c_done: int, c_tot: int, c_obj: Any, is_llm: bool = False) -> None:
+            method_str = triage_model_name if (is_llm and triage_llm_ok) else "Deterministic"
+            _notify_progress(
                 3,
                 "Level 3: Source Identification & Reconnaissance (3B URL Triage)",
-                f"Triaging candidate URL {c_done}/{c_tot} ({max(0, c_tot - c_done)} left) [{triage_model_name if triage_llm_ok else 'Deterministic'}]: {c_obj.url[:60]}",
+                f"Triaging candidate URL {c_done}/{c_tot} ({max(0, c_tot - c_done)} left) [{method_str}]: {c_obj.url[:60]}",
                 completed=c_done,
                 total=c_tot,
-            ),
+            )
+
+        triage_decisions: list[URLTriageDecision] = self.triage_service.triage_plan_candidates(
+            plan,
+            progress_callback=_on_triage_progress,
         )
         fetch_decisions = [d for d in triage_decisions if d.action == URLTriageAction.FETCH]
         stage_timings_ms["level_3_ms"] = round((time.perf_counter() - t_l3) * 1000.0, 2)
@@ -738,9 +742,10 @@ class MeridianEndToEndPipeline:
 
                 doc: Optional[ExtractedDocument] = None
                 if reuse_cached_artifacts and self.evidence_repository is not None and not is_stub_fetch:
+                    t_url = getattr(t_dec, "url", getattr(t_dec, "canonical_url", None))
                     cached_doc = self.evidence_repository.find_cached_document(
                         vendor_id=vendor.vendor_id,
-                        canonical_url=t_dec.canonical_url,
+                        canonical_url=t_url,
                         document_id=doc_id_candidate,
                     )
                     if cached_doc is not None and cached_doc.artifact_path:
@@ -1258,14 +1263,14 @@ class MeridianEndToEndPipeline:
                     all_validations.append(sv)
 
         valid_non_hostile = [e for e in evidence_records if not e.hostile_instruction_detected]
-        ai_types_found = sorted({
-            e.ai_type.value
-            for e in valid_non_hostile
-            if e.ai_type.value not in ("NONE", "UNRESOLVED")
-        })
-        named_models = sorted({e.named_model for e in valid_non_hostile if e.named_model})
-        named_providers = sorted({e.named_provider for e in valid_non_hostile if e.named_provider})
-        hosting_infras = sorted({e.hosting_infrastructure for e in valid_non_hostile if e.hosting_infrastructure})
+        valid_ai_evidence = [
+            e for e in valid_non_hostile
+            if e.ai_type.value in ("GENAI_LLM", "CLASSICAL_ML", "AGENTIC_AI")
+        ]
+        ai_types_found = sorted({e.ai_type.value for e in valid_ai_evidence})
+        named_models = sorted({e.named_model for e in valid_ai_evidence if e.named_model})
+        named_providers = sorted({e.named_provider for e in valid_ai_evidence if e.named_provider})
+        hosting_infras = sorted({e.hosting_infrastructure for e in valid_ai_evidence if e.hosting_infrastructure})
 
         if any(e.scope == EvidenceScope.MERIDIAN_SERVICE for e in valid_non_hostile):
             det_scope = EvidenceScope.MERIDIAN_SERVICE.value
@@ -1368,6 +1373,9 @@ class MeridianEndToEndPipeline:
             vendor_description=vendor.vendor_description,
             service_product_provided=vendor.service_product_provided,
             business_process_supported=vendor.business_process_supported,
+            data_classification_accessed=vendor.data_classification_accessed,
+            operational_dependency=vendor.operational_dependency,
+            data_volume_annual=vendor.data_volume_annual,
             criticality_summary=crit_audit,
             osint_plan_summary=osint_summary,
             url_triage_decisions=triage_decisions,

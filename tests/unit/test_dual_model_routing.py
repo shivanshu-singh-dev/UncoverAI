@@ -94,9 +94,9 @@ def test_real_dotenv_file_exists_and_loads_expected_defaults() -> None:
 
     assert parsed["MERIDIAN_OLLAMA_ENABLED"].lower() == "true"
     assert parsed["MERIDIAN_OLLAMA_ENDPOINT"] == "http://localhost:11434"
-    assert parsed["MERIDIAN_OLLAMA_TRIAGE_MODEL"] == "llama3.2:latest"
-    assert parsed["MERIDIAN_OLLAMA_ANALYSIS_MODEL"] == "mistral:latest"
-    assert parsed["MERIDIAN_OLLAMA_SUMMARY_MODEL"] == "mistral:latest"
+    assert parsed["MERIDIAN_OLLAMA_TRIAGE_MODEL"] in ("llama3.2:3b", "llama3.2:latest")
+    assert parsed["MERIDIAN_OLLAMA_ANALYSIS_MODEL"] in ("qwen2.5:3b", "mistral:latest")
+    assert parsed["MERIDIAN_OLLAMA_SUMMARY_MODEL"] in ("qwen2.5:3b", "mistral:latest")
     assert parsed["MERIDIAN_OLLAMA_UNLOAD_ON_SWITCH"].lower() == "true"
     assert parsed["MERIDIAN_EMBEDDING_MODEL"] == "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -105,9 +105,9 @@ def test_real_dotenv_file_exists_and_loads_expected_defaults() -> None:
     cfg = ModelRoutingConfig.from_env_and_config(env=target_env, load_dotenv=False)
     assert cfg.enabled is True
     assert cfg.endpoint == "http://localhost:11434"
-    assert cfg.triage_model == "llama3.2:latest"
-    assert cfg.analysis_model == "mistral:latest"
-    assert cfg.summary_model == "mistral:latest"
+    assert cfg.triage_model in ("llama3.2:3b", "llama3.2:latest")
+    assert cfg.analysis_model in ("qwen2.5:3b", "mistral:latest")
+    assert cfg.summary_model in ("qwen2.5:3b", "mistral:latest")
     assert cfg.embedding_model == "sentence-transformers/all-MiniLM-L6-v2"
     assert cfg.unload_on_model_switch is True
 

@@ -171,6 +171,96 @@ def test_url_triage_optional_llm_provider() -> None:
     assert decision.decision_method == TriageDecisionMethod.LOCAL_LLM
 
 
+def test_url_triage_regression_llm_ok_unbound_when_allow_llm_false() -> None:
+    """Regression test: verify allow_llm=False does not trigger UnboundLocalError for llm_ok."""
+    triage = OSINTURLTriageService(llm_provider=_StubTriageLLM())
+    cand = CandidateURL(
+        candidate_id="C-26",
+        vendor_id="V-002",
+        url="https://github.com/Fiserv/checkout-sample-app",
+        title="Fiserv Checkout Sample App",
+        snippet="Sample code repository demonstrating checkout integration.",
+        source_class="S2",
+        source_classes=["S2"],
+    )
+    # This was the exact crashing call path at candidate 26
+    decision = triage.triage_candidate(
+        cand,
+        vendor_name="Fiserv, Inc.",
+        domain="fiserv.com",
+        service_scope="Core Banking",
+        allow_llm=False,
+    )
+    assert decision is not None
+    assert decision.decision_method == TriageDecisionMethod.DETERMINISTIC_HEURISTIC
+    assert decision.model_execution_status == "DETERMINISTIC_HEURISTIC"
+
+
+def test_url_triage_regression_batch_cap_exceeded_completes_all_urls() -> None:
+    """Regression test: verify triage_plan_candidates handles batch exceeding max_llm_triage_calls."""
+    from types import SimpleNamespace
+    triage = OSINTURLTriageService(llm_provider=_StubTriageLLM())
+
+    candidates = [
+        CandidateURL(
+            candidate_id=f"C-{i:03d}",
+            vendor_id="V-002",
+            url=f"https://fiserv.com/ai-product-{i}" if i <= 5 else f"https://github.com/Fiserv/sample-repo-{i}",
+            title=f"Fiserv AI Title {i}" if i <= 5 else f"Sample Repo {i}",
+            snippet="Generative AI integration and LLM capabilities" if i <= 5 else "Generic sample app",
+            source_class="S1" if i <= 5 else "S2",
+            source_classes=["S1"] if i <= 5 else ["S2"],
+            rank=i,
+        )
+        for i in range(1, 31)
+    ]
+    plan = SimpleNamespace(
+        candidate_urls=candidates,
+        vendor_name="Fiserv, Inc.",
+        domain="fiserv.com",
+        service_product_provided="Core Banking",
+        business_process_supported="Payments",
+    )
+
+    decisions = triage.triage_plan_candidates(plan, max_llm_triage_calls=5)
+    assert len(decisions) == 30
+    llm_count = sum(1 for d in decisions if d.decision_method == TriageDecisionMethod.LOCAL_LLM)
+    assert llm_count <= 5
+    # URLs after cap must have completed cleanly via deterministic triage
+    det_count = sum(1 for d in decisions if d.decision_method == TriageDecisionMethod.DETERMINISTIC_HEURISTIC)
+    assert det_count >= 25
+
+
+def test_url_triage_resilience_to_provider_exceptions() -> None:
+    """Verify that exceptions raised inside the LLM provider fall back cleanly to deterministic triage."""
+    class _FailingTriageLLM(URLTriageLLMProvider):
+        model_name = "failing-model"
+        def is_configured(self) -> tuple[bool, str]:
+            return True, "Configured"
+        def evaluate_candidate(self, candidate, *, vendor_name, domain, service_scope=None):
+            raise RuntimeError("Simulated Ollama connection timeout or JSON failure")
+
+    triage = OSINTURLTriageService(llm_provider=_FailingTriageLLM())
+    cand = CandidateURL(
+        candidate_id="C-FAIL",
+        vendor_id="V-TEST",
+        url="https://vendor.com/privacy-notice",
+        title="Privacy Notice",
+        snippet="Data processing and privacy notice.",
+        source_class="S1",
+        source_classes=["S1"],
+    )
+    decision = triage.triage_candidate(
+        cand,
+        vendor_name="Vendor",
+        domain="vendor.com",
+        allow_llm=True,
+    )
+    assert decision is not None
+    assert decision.decision_method == TriageDecisionMethod.DETERMINISTIC_HEURISTIC
+
+
+
 # ==============================================================================
 # LEVEL 4: SSRF SAFETY, HTML/PDF EXTRACTION & SQLITE PERSISTENCE TESTS
 # ==============================================================================

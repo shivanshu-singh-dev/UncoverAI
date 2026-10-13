@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+import os
 import re
 from typing import Optional, Sequence
 import urllib.parse
@@ -69,7 +70,7 @@ _KNOWN_EXTERNAL_DISCOVERY_HOSTS: dict[str, tuple[str, str]] = {
     "gitlab.com": ("S2", "Public code repository host"),
     "pypi.org": ("S2", "Python package registry"),
     "npmjs.com": ("S2", "Node.js package registry"),
-    " central.sonatype.com": ("S2", "Maven package registry"),
+    "central.sonatype.com": ("S2", "Maven package registry"),
     "mvnrepository.com": ("S2", "Maven repository index"),
     "hub.docker.com": ("S2", "Container image registry"),
     "huggingface.co": ("S4", "Model & dataset card hub"),
@@ -89,6 +90,32 @@ _KNOWN_EXTERNAL_DISCOVERY_HOSTS: dict[str, tuple[str, str]] = {
     "youtube.com": ("S4", "Technical conference talk / product demo video"),
     "web.archive.org": ("S1", "Wayback Machine historical archive"),
 }
+
+# Unreliable third-party hosts (bankruptcy claims dockets, court scrapers, generic lead aggregators)
+# that must never be treated as authoritative vendor documentation
+_BLOCKED_UNRELIABLE_DISCOVERY_HOSTS: frozenset[str] = frozenset({
+    "stretto.com",
+    "cases.stretto.com",
+    "epiq11.com",
+    "ra.kroll.com",
+    "courtlistener.com",
+    "justia.com",
+    "docketbird.com",
+    "trellis.law",
+    "pacermonitor.com",
+    "pacer.gov",
+    "rankiteo.com",
+    "zoominfo.com",
+    "dnb.com",
+    "owler.com",
+})
+
+
+def _is_blocked_unreliable_host(host: str) -> bool:
+    if not host:
+        return False
+    h = host.lower().strip()
+    return any(h == b or h.endswith("." + b) for b in _BLOCKED_UNRELIABLE_DISCOVERY_HOSTS)
 
 
 class URLTriageLLMProvider(ABC):
@@ -211,6 +238,25 @@ class OllamaURLTriageProvider(URLTriageLLMProvider):
                     model_execution_status=LLMExecutionStatus.PROMPT_INJECTION_BLOCKED.value,
                 )
 
+        # 1b. Reject untrusted legal claims dockets, bankruptcy aggregators, and directory scrapers
+        if _is_blocked_unreliable_host(host):
+            return URLTriageDecision(
+                candidate_id=candidate.candidate_id,
+                vendor_id=candidate.vendor_id,
+                url=url_str,
+                action=URLTriageAction.REJECT,
+                triage_status=URLTriageStatus.IRRELEVANT.value,
+                vendor_match=False,
+                product_scope_relevance="UNRELATED",
+                candidate_source_class=candidate.source_class or "S12",
+                target_gates=[],
+                evidence_questions_addressed=[],
+                rationale=f"Host '{host}' is an untrusted court docket or directory aggregator; rejected from vendor technical assessment.",
+                decision_method=TriageDecisionMethod.DETERMINISTIC_HEURISTIC,
+                confidence="HIGH",
+                triaged_at=_utc_now_iso(),
+            )
+
         # 2. Enforce deterministic guardrails for auth portals and completely unrelated domains
         if any(
             seg in path_low for seg in ("/login", "/signin", "/sign-in", "/auth/", "/sso/", "/account/login")
@@ -230,6 +276,19 @@ class OllamaURLTriageProvider(URLTriageLLMProvider):
         )
         if not (is_vendor_domain or mentions_vendor):
             return None  # Never let an LLM accept an unassociated domain without vendor reference
+
+        # Screen generic code repos without technical AI signals
+        if host in ("github.com", "gitlab.com"):
+            has_ai_repo_signal = any(
+                kw in combined_text
+                for kw in (
+                    "ai", "artificial intelligence", "machine learning", "llm", "genai",
+                    "generative", "copilot", "model", "weights", "dataset", "neural",
+                    "sdk", "api", "subprocessor", "openai", "anthropic", "bedrock"
+                )
+            )
+            if not has_ai_repo_signal:
+                return None  # Let fast deterministic triage handle sample code repos
 
         prompt = (
             f"Vendor Name: {vendor_name}\n"
@@ -335,34 +394,136 @@ class OSINTURLTriageService:
     def __init__(self, llm_provider: Optional[URLTriageLLMProvider] = None) -> None:
         self.llm_provider: URLTriageLLMProvider = llm_provider or UnconfiguredURLTriageLLMProvider()
 
+    @staticmethod
+    def _compute_candidate_llm_priority(
+        candidate: CandidateURL,
+        *,
+        vendor_name: str,
+        domain: str,
+    ) -> int:
+        """Compute an integer priority rank (lower is higher priority) for LLM triage budget.
+
+        High-signal AI/governance sources on vendor domains get top priority (10-20).
+        Generic code repos without AI terms, login walls, and vendor mismatches get lowest priority (70-99).
+        """
+        url_str = candidate.url or ""
+        parsed = urllib.parse.urlsplit(url_str)
+        host = (parsed.hostname or "").lower()
+        path_low = (parsed.path or "/").lower()
+        combined_text = " ".join(
+            filter(None, [url_str, candidate.title or "", candidate.snippet or ""])
+        ).lower()
+
+        clean_v = OSINTQueryPlanner.clean_vendor_name(vendor_name).lower()
+        clean_d = OSINTQueryPlanner.clean_domain(domain).lower()
+        if _is_blocked_unreliable_host(host):
+            return 99  # Legal docket / lead aggregator: reject immediately
+        is_vendor_domain = bool(clean_d and (host == clean_d or host.endswith("." + clean_d)))
+        vendor_tokens = [tok for tok in re.split(r"\W+", clean_v) if len(tok) >= 3]
+        mentions_vendor = bool(
+            (clean_v and clean_v in combined_text)
+            or (vendor_tokens and any(tok in combined_text for tok in vendor_tokens))
+        )
+        if not (is_vendor_domain or mentions_vendor):
+            return 99  # Vendor mismatch: deterministic REJECT
+
+        # Auth walls
+        if any(seg in path_low for seg in ("/login", "/signin", "/sign-in", "/auth/", "/sso/", "/account/login")):
+            return 90  # Deterministic MANUAL_REVIEW
+
+        # Code repos without AI terms
+        if host in ("github.com", "gitlab.com"):
+            has_ai_repo_terms = any(
+                kw in combined_text
+                for kw in ("ai", "llm", "genai", "model", "copilot", "openai", "machine learning", "subprocessor", "training")
+            )
+            if not has_ai_repo_terms:
+                return 80  # Generic sample app: deterministic fast-path
+
+        # Explicit AI keywords
+        has_ai_signal = any(
+            kw in combined_text
+            for kw in (
+                "ai", "artificial intelligence", "machine learning", "llm", "genai",
+                "generative", "copilot", "openai", "anthropic", "bedrock", "vertex",
+                "subprocessor", "dpa", "data processing", "not used to train", "training",
+                "model", "deepseek", "llama", "mistral", "rag", "neural"
+            )
+        )
+
+        if is_vendor_domain and has_ai_signal:
+            return 10  # Top priority: vendor official domain with explicit AI/governance signal
+        if has_ai_signal:
+            return 20  # High priority: external source with AI signal
+        if is_vendor_domain:
+            return 40  # Medium priority: vendor official domain without explicit AI signal
+        return 70  # Low priority: other external pages
+
     def triage_plan_candidates(
         self,
         plan: OSINTInvestigationPlan,
         *,
         unload_model_after_batch: bool = True,
         progress_callback: Optional[Any] = None,
+        max_llm_triage_calls: Optional[int] = None,
     ) -> list[URLTriageDecision]:
         """Triage all CandidateURL items on an OSINTInvestigationPlan and update their triage_status.
 
         When `unload_model_after_batch=True` and `self.llm_provider` is backed by `OllamaModelRouter`,
         unloads Model A (`llama3.2:latest`) after completing the Level 3B batch so VRAM is freed
         before Level 6 & Level 8 load Model B (`mistral:latest`).
+        Caps LLM triage calls to `max_llm_triage_calls` (default configurable via MERIDIAN_MAX_LLM_TRIAGE_CALLS)
+        and prioritizes high-signal vendor AI/governance candidates.
         """
+        if max_llm_triage_calls is None:
+            try:
+                max_llm_triage_calls = int(os.environ.get("MERIDIAN_MAX_LLM_TRIAGE_CALLS", "15"))
+            except (ValueError, TypeError):
+                max_llm_triage_calls = 15
+
         decisions: list[URLTriageDecision] = []
         total_cands = len(plan.candidate_urls)
+
+        # Pre-select candidate IDs eligible for LLM triage based on priority score
+        llm_eligible_ids: set[str] = set()
+        if max_llm_triage_calls > 0:
+            scored_candidates = []
+            for cand in plan.candidate_urls:
+                pri = self._compute_candidate_llm_priority(
+                    cand,
+                    vendor_name=plan.vendor_name,
+                    domain=plan.domain,
+                )
+                if pri < 50:  # Only candidates with vendor match + AI/governance or official domain
+                    scored_candidates.append((pri, cand.rank or 999, cand.candidate_id))
+            scored_candidates.sort(key=lambda x: (x[0], x[1]))
+            for _, _, cid in scored_candidates[:max_llm_triage_calls]:
+                llm_eligible_ids.add(cid)
+
+        llm_calls_made = 0
         for idx, cand in enumerate(plan.candidate_urls, start=1):
+            allow_llm = (cand.candidate_id in llm_eligible_ids and llm_calls_made < max_llm_triage_calls)
             if callable(progress_callback):
                 try:
-                    progress_callback(idx, max(1, total_cands), cand)
+                    progress_callback(idx, max(1, total_cands), cand, allow_llm)
+                except TypeError:
+                    try:
+                        progress_callback(idx, max(1, total_cands), cand)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
+
             decision = self.triage_candidate(
                 cand,
                 vendor_name=plan.vendor_name,
                 domain=plan.domain,
                 service_scope=plan.service_product_provided,
                 business_process=plan.business_process_supported,
+                allow_llm=allow_llm,
             )
+            if decision.decision_method == TriageDecisionMethod.LOCAL_LLM:
+                llm_calls_made += 1
             decisions.append(decision)
 
         router = getattr(self.llm_provider, "router", None)
@@ -385,23 +546,38 @@ class OSINTURLTriageService:
         domain: str,
         service_scope: Optional[str] = None,
         business_process: Optional[str] = None,
+        allow_llm: bool = True,
     ) -> URLTriageDecision:
         """Evaluate a single CandidateURL using optional LLM provider or deterministic heuristics."""
-        llm_ok, _ = self.llm_provider.is_configured()
-        if llm_ok:
-            llm_decision = self.llm_provider.evaluate_candidate(
-                candidate,
-                vendor_name=vendor_name,
-                domain=domain,
-                service_scope=service_scope,
-            )
-            if llm_decision is not None:
-                if not llm_decision.model_used:
-                    llm_decision.model_used = getattr(self.llm_provider, "model_name", None)
-                if not llm_decision.model_execution_status:
-                    llm_decision.model_execution_status = LLMExecutionStatus.SUCCEEDED.value
-                self._apply_decision_to_candidate(candidate, llm_decision)
-                return llm_decision
+        llm_ok: bool = False
+        llm_attempted: bool = False
+        llm_decision: Optional[URLTriageDecision] = None
+
+        if allow_llm:
+            try:
+                llm_ok, _ = self.llm_provider.is_configured()
+            except Exception:
+                llm_ok = False
+
+            if llm_ok:
+                llm_attempted = True
+                try:
+                    llm_decision = self.llm_provider.evaluate_candidate(
+                        candidate,
+                        vendor_name=vendor_name,
+                        domain=domain,
+                        service_scope=service_scope,
+                    )
+                except Exception:
+                    llm_decision = None
+
+                if llm_decision is not None:
+                    if not llm_decision.model_used:
+                        llm_decision.model_used = getattr(self.llm_provider, "model_name", None)
+                    if not llm_decision.model_execution_status:
+                        llm_decision.model_execution_status = LLMExecutionStatus.SUCCEEDED.value
+                    self._apply_decision_to_candidate(candidate, llm_decision)
+                    return llm_decision
 
         decision = self._deterministic_triage(
             candidate,
@@ -410,10 +586,15 @@ class OSINTURLTriageService:
             service_scope=service_scope,
             business_process=business_process,
         )
-        if llm_ok:
+        if llm_attempted:
             decision.model_used = getattr(self.llm_provider, "model_name", None)
             last_st = getattr(self.llm_provider, "last_call_status", None)
-            decision.model_execution_status = f"FALLBACK_DETERMINISTIC ({last_st})" if last_st else "FALLBACK_DETERMINISTIC"
+            decision.model_execution_status = (
+                f"FALLBACK_DETERMINISTIC ({last_st})" if last_st else "FALLBACK_DETERMINISTIC"
+            )
+        else:
+            decision.model_execution_status = "DETERMINISTIC_HEURISTIC"
+
         self._apply_decision_to_candidate(candidate, decision)
         return decision
 
@@ -448,6 +629,37 @@ class OSINTURLTriageService:
 
         clean_v = OSINTQueryPlanner.clean_vendor_name(vendor_name).lower()
         clean_d = OSINTQueryPlanner.clean_domain(domain).lower()
+        is_vendor_domain = bool(clean_d and (host == clean_d or host.endswith("." + clean_d)))
+        vendor_tokens = [tok for tok in re.split(r"\W+", clean_v) if len(tok) >= 3]
+        mentions_vendor = bool(
+            (clean_v and clean_v in combined_text)
+            or (vendor_tokens and any(tok in combined_text for tok in vendor_tokens))
+        )
+        external_host_info = None
+        for ext_host, info in _KNOWN_EXTERNAL_DISCOVERY_HOSTS.items():
+            eh = ext_host.strip()
+            if host == eh or host.endswith("." + eh):
+                external_host_info = info
+                break
+
+        # 0. Reject untrusted legal claims dockets, bankruptcy aggregators, and directory scrapers
+        if _is_blocked_unreliable_host(host):
+            return URLTriageDecision(
+                candidate_id=candidate.candidate_id,
+                vendor_id=candidate.vendor_id,
+                url=url_str,
+                action=URLTriageAction.REJECT,
+                triage_status=URLTriageStatus.IRRELEVANT.value,
+                vendor_match=False,
+                product_scope_relevance="UNRELATED",
+                candidate_source_class=candidate.source_class or "S12",
+                target_gates=[],
+                evidence_questions_addressed=[],
+                rationale=f"Host '{host}' is an untrusted court docket or directory aggregator; rejected from vendor technical assessment.",
+                decision_method=TriageDecisionMethod.DETERMINISTIC_HEURISTIC,
+                confidence="HIGH",
+                triaged_at=_utc_now_iso(),
+            )
 
         # 1. Check for gated login / portal / auth walls -> MANUAL_REVIEW
         if any(
@@ -457,7 +669,9 @@ class OSINTURLTriageService:
             phrase in combined_text
             for phrase in ("sign in to view", "login required", "customer portal login", "request access to trust center")
         ):
-            src_cls = self._infer_source_class(candidate, host, path_low, combined_text)
+            src_cls = self._infer_source_class(
+                candidate, host, path_low, combined_text, external_host_info, is_vendor_domain=is_vendor_domain
+            )
             return URLTriageDecision(
                 candidate_id=candidate.candidate_id,
                 vendor_id=candidate.vendor_id,
@@ -476,19 +690,6 @@ class OSINTURLTriageService:
             )
 
         # 2. Check vendor association
-        is_vendor_domain = bool(clean_d and (host == clean_d or host.endswith("." + clean_d)))
-        vendor_tokens = [tok for tok in re.split(r"\W+", clean_v) if len(tok) >= 3]
-        mentions_vendor = bool(
-            (clean_v and clean_v in combined_text)
-            or (vendor_tokens and any(tok in combined_text for tok in vendor_tokens))
-        )
-        external_host_info = None
-        for ext_host, info in _KNOWN_EXTERNAL_DISCOVERY_HOSTS.items():
-            eh = ext_host.strip()
-            if host == eh or host.endswith("." + eh):
-                external_host_info = info
-                break
-
         vendor_match = is_vendor_domain or mentions_vendor
 
         if not vendor_match:
@@ -513,7 +714,9 @@ class OSINTURLTriageService:
             )
 
         # 3. Infer source class and scope relevance
-        src_cls = self._infer_source_class(candidate, host, path_low, combined_text, external_host_info)
+        src_cls = self._infer_source_class(
+            candidate, host, path_low, combined_text, external_host_info, is_vendor_domain=is_vendor_domain
+        )
         scope_rel = self._assess_scope_relevance(
             combined_text,
             service_scope=service_scope,
@@ -599,11 +802,13 @@ class OSINTURLTriageService:
         path_low: str,
         combined_text: str,
         external_host_info: Optional[tuple[str, str]] = None,
+        *,
+        is_vendor_domain: bool = False,
     ) -> str:
         if any(k in path_low or k in combined_text for k in ("subprocessor", "trust-center", "/trust", "/dpa", "data-processing-addendum", "ai-policy")):
-            return "S1"
+            return "S1" if (is_vendor_domain or external_host_info is not None) else "S12"
         if any(k in path_low for k in ("/docs", "/api", "/developer", "/sdk", "release-notes", "changelog")):
-            return "S2"
+            return "S2" if (is_vendor_domain or external_host_info is not None) else "S12"
         if any(k in path_low or k in combined_text for k in ("/privacy", "/terms", "/legal", "security-whitepaper", "whitepaper")):
             return "S3"
         if any(k in path_low for k in ("/blog", "/engineering", "model-card")):
@@ -616,11 +821,13 @@ class OSINTURLTriageService:
             return "S7"
         if external_host_info is not None:
             return external_host_info[0]
-        if candidate.source_classes:
-            return candidate.source_classes[0]
-        if candidate.source_class:
-            return candidate.source_class
-        return "S2"
+        if is_vendor_domain:
+            if candidate.source_classes:
+                return candidate.source_classes[0]
+            if candidate.source_class:
+                return candidate.source_class
+            return "S2"
+        return "S12"
 
     @staticmethod
     def _assess_scope_relevance(

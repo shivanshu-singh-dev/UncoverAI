@@ -153,4 +153,23 @@ class OSINTQueryPlanner:
                 )
             )
 
+        # Prioritize high-signal queries first:
+        # 1. Authoritative domain-scoped queries (`site:`)
+        # 2. Key vendor governance, DPA, and subprocessor queries
+        # 3. Model partnership & hyperscaler cloud integration queries
+        # 4. General exploratory queries
+        def _query_sort_key(q: PlannedQuery) -> tuple[int, int, str]:
+            q_str = q.rendered_query.lower()
+            is_site = 0 if "site:" in q_str else 1
+            if any(k in q_str for k in ("subprocessor", "dpa", "data processing", "not used to train", "training")):
+                topic_pri = 0
+            elif any(k in q_str for k in ("azure openai", "bedrock", "vertex", "openai", "anthropic", "claude")):
+                topic_pri = 1
+            elif any(k in q_str for k in (" llm", '"llm"', " ai", '"ai"', "genai", "copilot", "copilots")):
+                topic_pri = 2
+            else:
+                topic_pri = 3
+            return (is_site, topic_pri, q.query_id)
+
+        planned_queries.sort(key=_query_sort_key)
         return planned_queries

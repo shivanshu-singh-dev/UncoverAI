@@ -67,10 +67,11 @@ local_llm:
   enabled: false
   provider: "ollama"
   endpoint: "http://localhost:11434"
-  triage_model: "llama3.2:latest"     # Model A (~2.0 GB): Level 3B URL & search-result triage
-  analysis_model: "mistral:latest"    # Model B (~4.4 GB): Level 6 deeper semantic signal classification
-  summary_model: "mistral:latest"     # Model B (~4.4 GB): Level 8 evidence-grounded risk summarization
-  model_name: "mistral:latest"        # Legacy fallback alias for analysis_model
+  triage_model: "llama3.2:3b"         # Model A (~2.0 GB): Level 3B URL & search-result triage
+  analysis_model: "qwen2.5:3b"        # High-Speed Priority (~1.9 GB): Level 6 structured signal classification
+  summary_model: "qwen2.5:3b"         # High-Speed Priority (~1.9 GB): Level 8 evidence-grounded risk summarization
+  fallback_model: "mistral:latest"    # Secondary Priority / Deep Reasoning Fallback (~4.4 GB)
+  model_name: "qwen2.5:3b"            # Legacy alias for analysis_model
   batch_size: 5                       # Passages per bounded Mistral classification request
   timeout_seconds: 25.0
   keep_alive: "2m"

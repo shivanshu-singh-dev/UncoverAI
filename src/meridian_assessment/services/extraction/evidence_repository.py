@@ -382,25 +382,45 @@ class EvidenceRepository:
             if self._persistent_conn is None:
                 conn.close()
 
-    def get_latest_vendor_report(self, vendor_id: str) -> Optional[VendorEndToEndAssessmentReport]:
+    def get_latest_vendor_report(
+        self,
+        vendor_id: str,
+        *,
+        only_live: bool = False,
+    ) -> Optional[VendorEndToEndAssessmentReport]:
         conn = self._connect()
         try:
-            row = conn.execute(
-                "SELECT payload_json FROM vendor_reports WHERE vendor_id = ? ORDER BY generated_at DESC LIMIT 1",
-                (vendor_id,),
-            ).fetchone()
+            if only_live:
+                row = conn.execute(
+                    "SELECT payload_json FROM vendor_reports WHERE vendor_id = ? AND is_synthetic_evidence_run = 0 ORDER BY generated_at DESC LIMIT 1",
+                    (vendor_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT payload_json FROM vendor_reports WHERE vendor_id = ? ORDER BY generated_at DESC LIMIT 1",
+                    (vendor_id,),
+                ).fetchone()
             return VendorEndToEndAssessmentReport.model_validate(json.loads(row[0])) if row else None
         finally:
             if self._persistent_conn is None:
                 conn.close()
 
-    def load_latest_reports_by_vendor(self) -> dict[str, VendorEndToEndAssessmentReport]:
+    def load_latest_reports_by_vendor(
+        self,
+        *,
+        only_live: bool = False,
+    ) -> dict[str, VendorEndToEndAssessmentReport]:
         """Return a mapping of `vendor_id -> latest VendorEndToEndAssessmentReport` across all persisted reports."""
         conn = self._connect()
         try:
-            rows = conn.execute(
-                "SELECT vendor_id, payload_json FROM vendor_reports ORDER BY generated_at ASC"
-            ).fetchall()
+            if only_live:
+                rows = conn.execute(
+                    "SELECT vendor_id, payload_json FROM vendor_reports WHERE is_synthetic_evidence_run = 0 ORDER BY generated_at ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT vendor_id, payload_json FROM vendor_reports ORDER BY generated_at ASC"
+                ).fetchall()
             latest: dict[str, VendorEndToEndAssessmentReport] = {}
             for vid, pjson in rows:
                 try:

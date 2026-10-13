@@ -100,16 +100,28 @@ _KNOWN_AI_MODELS: tuple[tuple[str, str], ...] = (
     ("gpt-3.5", "GPT-3.5"),
     ("claude 3.5", "Claude 3.5"),
     ("claude 3", "Claude 3"),
+    ("claude 2", "Claude 2"),
+    ("anthropic claude", "Claude"),
     ("claude", "Claude"),
     ("llama 3", "Llama 3"),
     ("llama-3", "Llama 3"),
+    ("meta llama", "Llama"),
+    ("llama", "Llama"),
+    ("google gemini", "Gemini"),
+    ("gemini 1.5", "Gemini 1.5"),
+    ("gemini pro", "Gemini Pro"),
     ("gemini", "Gemini"),
+    ("amazon titan", "Amazon Titan"),
+    ("titan embed", "Amazon Titan"),
+    ("titan text", "Amazon Titan"),
     ("titan", "Amazon Titan"),
     ("text-embedding-3", "text-embedding-3"),
     ("all-minilm-l6-v2", "all-MiniLM-L6-v2"),
     ("xgboost", "XGBoost"),
     ("random forest", "Random Forest"),
 )
+
+_CLASSICAL_ML_MODELS: frozenset[str] = frozenset({"XGBoost", "Random Forest"})
 
 _KNOWN_HOSTING_INFRA: tuple[tuple[str, str], ...] = (
     ("aws", "Amazon Web Services (AWS)"),
@@ -976,7 +988,11 @@ class SignalClassificationService:
             k in low
             for k in ("autonomous agent", "agentic", "tool calling", "automated decision-making", "autonomous execution")
         )
-        has_genai = bool(provider or model) or any(
+        is_genai_model_or_provider = (
+            bool(provider)
+            or (bool(model) and model not in _CLASSICAL_ML_MODELS)
+        )
+        has_genai = is_genai_model_or_provider or any(
             k in low
             for k in (
                 "large language model",
@@ -991,7 +1007,7 @@ class SignalClassificationService:
                 "foundation model",
             )
         )
-        has_classical_ml = any(
+        has_classical_ml = (model in _CLASSICAL_ML_MODELS) or any(
             k in low
             for k in (
                 "machine learning model",
@@ -1186,9 +1202,14 @@ class SignalClassificationService:
         # Synchronize enriched fields back onto EvidenceRecord
         evidence.scope = scope
         evidence.ai_type = ai_type
-        evidence.named_provider = provider
-        evidence.named_model = model
-        evidence.hosting_infrastructure = hosting
+        if ai_type in (AIType.GENAI_LLM, AIType.CLASSICAL_ML, AIType.AGENTIC_AI):
+            evidence.named_provider = provider
+            evidence.named_model = model
+            evidence.hosting_infrastructure = hosting
+        else:
+            evidence.named_provider = None
+            evidence.named_model = None
+            evidence.hosting_infrastructure = hosting if hosting else None
         evidence.is_opt_in_only = is_opt_in
         evidence.analysis_state = analysis_state
         if is_opt_in:
@@ -1196,16 +1217,17 @@ class SignalClassificationService:
         evidence.no_training_commitment = no_train
         evidence.zdr_commitment = zdr
 
-        if trains_on_customer_data and "R1" not in evidence.risk_tags:
-            evidence.risk_tags.append("R1")
-        if (provider or "subprocessor" in low) and "R2" not in evidence.risk_tags:
-            evidence.risk_tags.append("R2")
-        if any(k in low for k in ("retention", "zdr", "zero data retention", "logs")) and "R3" not in evidence.risk_tags:
-            evidence.risk_tags.append("R3")
-        if customer_data_flag and signal_cat == SignalCategory.OPERATIONAL_AI and "R4" not in evidence.risk_tags:
-            evidence.risk_tags.append("R4")
-        if has_agentic and "R6" not in evidence.risk_tags:
-            evidence.risk_tags.append("R6")
+        if signal_cat == SignalCategory.OPERATIONAL_AI:
+            if trains_on_customer_data and "R1" not in evidence.risk_tags:
+                evidence.risk_tags.append("R1")
+            if (provider or "subprocessor" in low) and "R2" not in evidence.risk_tags:
+                evidence.risk_tags.append("R2")
+            if any(k in low for k in ("retention", "zdr", "zero data retention", "logs")) and "R3" not in evidence.risk_tags:
+                evidence.risk_tags.append("R3")
+            if customer_data_flag and "R4" not in evidence.risk_tags:
+                evidence.risk_tags.append("R4")
+            if has_agentic and "R6" not in evidence.risk_tags:
+                evidence.risk_tags.append("R6")
 
         return SignalClassificationResult(
             classification_id=cls_id,
@@ -1214,9 +1236,9 @@ class SignalClassificationService:
             signal_category=signal_cat,
             ai_type=ai_type,
             scope=scope,
-            named_provider=provider,
-            named_model=model,
-            hosting_infrastructure=hosting,
+            named_provider=evidence.named_provider,
+            named_model=evidence.named_model,
+            hosting_infrastructure=evidence.hosting_infrastructure,
             capability_summary=cap_summary,
             known_inputs=["Customer/transaction records"] if customer_data_flag else [],
             known_outputs=["AI inference / generated output"] if signal_cat == SignalCategory.OPERATIONAL_AI else [],
@@ -1243,10 +1265,39 @@ class SignalClassificationService:
 
 
 
-    @staticmethod
-    def _detect_entity(low_text: str, lexicon: tuple[tuple[str, str], ...]) -> Optional[str]:
+    _AMBIGUOUS_MODEL_NEEDLES: frozenset[str] = frozenset({"titan", "claude", "gemini", "llama"})
+    _AMBIGUOUS_HOSTING_NEEDLES: frozenset[str] = frozenset({"aws", "gcp", "azure"})
+    _AI_DISAMBIGUATION_KEYWORDS: tuple[str, ...] = (
+        "ai", "artificial intelligence", "machine learning", "ml", "llm", "genai", "generative",
+        "model", "models", "embedding", "embeddings", "prompt", "inference", "neural", "bedrock",
+        "vertex", "subprocessor", "sub-processor", "algorithm", "nlp", "chatbot", "rag"
+    )
+    _CLOUD_INFRA_KEYWORDS: tuple[str, ...] = (
+        "cloud", "host", "infra", "server", "deploy", "compute", "database", "bedrock",
+        "marketplace", "platform", "datacenter", "storage", "vpc", "tenant", "cluster"
+    )
+
+    @classmethod
+    def _detect_entity(cls, low_text: str, lexicon: tuple[tuple[str, str], ...]) -> Optional[str]:
+        low_str = low_text.lower()
         for needle, canonical_name in lexicon:
-            if needle in low_text:
+            pattern = rf"\b{re.escape(needle)}\b"
+            if re.search(pattern, low_str):
+                # If the needle is an ambiguous standalone word, require relevant context
+                if needle in cls._AMBIGUOUS_MODEL_NEEDLES:
+                    has_ai_ctx = any(
+                        re.search(rf"\b{re.escape(kw)}\b", low_str)
+                        for kw in cls._AI_DISAMBIGUATION_KEYWORDS
+                    )
+                    if not has_ai_ctx:
+                        continue
+                elif needle in cls._AMBIGUOUS_HOSTING_NEEDLES:
+                    has_infra_ctx = any(
+                        re.search(rf"\b{re.escape(kw)}\b", low_str)
+                        for kw in cls._CLOUD_INFRA_KEYWORDS
+                    )
+                    if not has_infra_ctx:
+                        continue
                 return canonical_name
         return None
 

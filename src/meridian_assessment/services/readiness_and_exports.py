@@ -23,8 +23,9 @@ import importlib.util
 import io
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1014,8 +1015,410 @@ def gates_for_evidence(report: VendorEndToEndAssessmentReport, evidence_id: str)
     return supported
 
 
+CANONICAL_VENDOR_INVENTORY_COLUMNS: list[str] = [
+    # 10 Supplied Vendor Input Fields (Verbatim preservation)
+    "Vendor ID",
+    "Vendor Name",
+    "Vendor Description",
+    "Service / Product Provided to Meridian",
+    "Category",
+    "Public Website",
+    "Business Process Supported",
+    "Operational Dependency",
+    "Data Classification Accessed",
+    "Data Volume (annual)",
+    # 11 Student-Derived Fields (Larkspur worked example analytical rigor)
+    "Criticality Tier",
+    "Criticality Rationale",
+    "Assessment Depth Applied",
+    "AI Usage Detected",
+    "Evidence Description along with OSINT Source(s) / Evidence Link",
+    "How Vendor May Be Using AI",
+    "Named AI Sub-processors / Model Providers",
+    "AI Security Risk Classification",
+    "Risk Rationale",
+    "Recommended Action",
+    "Assessed By / Date",
+]
+
+
+def build_canonical_vendor_inventory_record(
+    report: VendorEndToEndAssessmentReport,
+    vendor: Optional[MeridianVendor] = None,
+) -> dict[str, str]:
+    """Synthesize the canonical 21-field Meridian Vendor Inventory assessment record.
+
+    Strictly preserves the 10 supplied vendor input fields without mutation and derives
+    the 11 governance fields matching the analytical rigor, evidence traceability,
+    and structural completeness of the Larkspur worked example.
+    """
+    # ── 1. 10 Supplied Vendor Input Fields (Verbatim Preservation) ──
+    v_id = (vendor.vendor_id if vendor else None) or report.vendor_id or ""
+    v_name = (vendor.vendor_name if vendor else None) or report.legal_entity or ""
+    v_desc = (vendor.vendor_description if vendor else None) or report.vendor_description or ""
+    v_svc = (vendor.service_product_provided if vendor else None) or report.service_product_provided or ""
+    v_cat = (vendor.category if vendor else None) or report.category or ""
+    v_web = (vendor.domain if vendor else None) or report.domain or ""
+    v_proc = (vendor.business_process_supported if vendor else None) or report.business_process_supported or ""
+    v_op = (vendor.operational_dependency if vendor else None) or report.operational_dependency or ""
+    v_data = (vendor.data_classification_accessed if vendor else None) or report.data_classification_accessed or ""
+    v_vol = (vendor.data_volume_annual if vendor else None) or report.data_volume_annual or ""
+
+    # ── 2. Field 1: Criticality Tier ──
+    crit = report.criticality_summary or {}
+    crit_tier = crit.get("final_criticality") or crit.get("criticality_tier") or "Unrated"
+
+    # ── 3. Field 2: Criticality Rationale ──
+    base_score = crit.get("base_score")
+    prov_tier = crit.get("provisional_criticality")
+    factors = crit.get("factors") or {}
+    d_f = factors.get("D") or {}
+    o_f = factors.get("O") or {}
+    p_f = factors.get("P") or {}
+    r_f = factors.get("R") or {}
+    v_f = factors.get("V") or {}
+
+    rat_parts: list[str] = [f"Assigned {crit_tier} Criticality Tier."]
+    if base_score is not None and prov_tier:
+        rat_parts.append(
+            f"Base scoring calculation yielded {base_score:.1f} (Provisional Tier: {prov_tier})."
+        )
+
+    overrides = crit.get("overrides_evaluated") or []
+    triggered = [o for o in overrides if o.get("triggered")]
+    if triggered:
+        ov_notes = []
+        for o in triggered:
+            ov_id = o.get("override_id", "Override")
+            ov_rat = o.get("rationale") or o.get("description")
+            ov_fl = o.get("resulting_floor")
+            ov_notes.append(f"Safeguard {ov_id} triggered ({ov_rat}), enforcing a mandatory floor of {ov_fl}")
+        rat_parts.append(f"Automated Governance Safeguards: {'; '.join(ov_notes)}.")
+    elif crit.get("automatic_override_applied"):
+        rat_parts.append("Automated governance safeguards evaluated and applied.")
+
+    factor_items = []
+    if d_f:
+        factor_items.append(
+            f"Data Sensitivity D={d_f.get('score', 'N/A')} ({d_f.get('rationale', 'Assessed data access')})"
+        )
+    if o_f:
+        factor_items.append(
+            f"Operational Dependency O={o_f.get('score', 'N/A')} ({o_f.get('rationale', 'Direct dependency mapping')})"
+        )
+    if p_f:
+        factor_items.append(
+            f"Payment Flow Exposure P={p_f.get('score', 'N/A')} ({p_f.get('rationale', 'Evaluated funds transfer')})"
+        )
+    if r_f:
+        factor_items.append(
+            f"Regulatory Exposure R={r_f.get('score', 'N/A')} ({r_f.get('rationale', 'Evaluated regulatory obligations')})"
+        )
+    if v_f:
+        factor_items.append(
+            f"Annual Volume V={v_f.get('score', 'N/A')} ({v_f.get('rationale', 'Evaluated data volume')})"
+        )
+
+    if factor_items:
+        rat_parts.append("Methodology Breakdown: " + " | ".join(factor_items))
+    crit_rationale = " ".join(rat_parts)
+
+    # ── 4. Field 3: Assessment Depth Applied ──
+    osint = report.osint_plan_summary or {}
+    depth_profile = osint.get("selected_depth_profile") or crit.get("assessment_depth") or "Standard"
+    sel_reason = osint.get("selection_reason") or f"{crit_tier} criticality tier mandates proportional investigation depth"
+
+    depth_exec: list[str] = [
+        f"Executed {depth_profile} OSINT investigation ({sel_reason}).",
+        f"Reconnaissance triaged {len(report.url_triage_decisions)} candidate URLs across prioritized source classes.",
+        f"Ingested and verified {len(report.extracted_documents)} primary documents yielding {len(report.evidence_records)} point-of-capture evidence items.",
+    ]
+    if report.semantic_retrieval and report.semantic_retrieval.chunks_created > 0:
+        depth_exec.append(
+            f"Level 5 semantic retrieval evaluated {report.semantic_retrieval.chunks_created} text chunks."
+        )
+    depth_exec.append(
+        f"Level 6 signal classification evaluated {len(report.signal_classifications)} signals under prompt-injection defenses."
+    )
+    depth_exec.append(
+        f"Level 7 evidentiary weighting evaluated E1–E14 rules across {len(report.weighted_evidence)} weighted items and evaluated G1–G4 gates."
+    )
+    depth_applied = " ".join(depth_exec)
+
+    # ── 5. Field 4: AI Usage Detected ──
+    verdict_raw = (
+        report.ai_use_verdict.verdict.value
+        if hasattr(report.ai_use_verdict.verdict, "value")
+        else str(report.ai_use_verdict.verdict)
+    )
+    if verdict_raw == "YES":
+        ai_detected = "Yes"
+    elif verdict_raw == "NO":
+        ai_detected = "No"
+    else:
+        ai_detected = "Inconclusive"
+
+    # ── 6. Field 5: Evidence Description along with OSINT Source(s) / Evidence Link ──
+    weight_map = {w.evidence_id: w for w in report.weighted_evidence}
+
+    def _ev_priority_key(ev: EvidenceRecord) -> tuple[int, int, str]:
+        we = weight_map.get(ev.evidence_id)
+        strength = we.evidence_strength if we else ev.evidence_strength
+        gates = gates_for_evidence(report, ev.evidence_id)
+        is_op_ai = ev.ai_type.value in ("GENAI_LLM", "CLASSICAL_ML", "AGENTIC_AI")
+        has_gate = bool(gates)
+        if is_op_ai and has_gate:
+            p = 0
+        elif is_op_ai:
+            p = 1
+        elif strength.value in ("CONFIRMED", "STRONG"):
+            p = 2
+        else:
+            p = 3
+        s_rank = {"CONFIRMED": 0, "STRONG": 1, "INDICATIVE": 2, "MARKETING": 3, "NONE": 4}.get(strength.value, 5)
+        return (p, s_rank, ev.evidence_id)
+
+    sorted_records = sorted(report.evidence_records, key=_ev_priority_key)
+    max_detailed_ev = 15
+    selected_ev = sorted_records[:max_detailed_ev]
+
+    ev_entries: list[str] = []
+    for ev in selected_ev:
+        we = weight_map.get(ev.evidence_id)
+        gates = gates_for_evidence(report, ev.evidence_id)
+        erules = we.fired_e_rule_ids if we else ev.e_rule_ids
+        strength = we.evidence_strength.value if we else ev.evidence_strength.value
+
+        entry_parts = [
+            f"[{ev.evidence_id} | Class {ev.source_class} (Reliability {ev.source_reliability_grade})]",
+            f"Direct URL: {ev.canonical_url}",
+            f"Retrieval Date: {ev.retrieved_at}" + (f" (Published/Observed: {ev.published_or_observed_date})" if ev.published_or_observed_date else ""),
+            f"SHA-256: {ev.content_sha256}",
+            f"Verbatim Excerpt: \"{ev.verbatim_excerpt}\"",
+            f"Evidentiary Analysis: Strength={strength}, Scope={ev.scope.value}, AI-Type={ev.ai_type.value}, E-Rules={'; '.join(erules) or 'None'}, Supported Gates={'; '.join(gates) or 'None'}",
+        ]
+        if ev.corroborating_urls:
+            entry_parts.append(f"Corroborating Sources: {'; '.join(ev.corroborating_urls)}")
+        if ev.extraction_limitations:
+            entry_parts.append(f"Source Limitations: {'; '.join(ev.extraction_limitations)}")
+        ev_entries.append(" | ".join(entry_parts))
+
+    if ev_entries:
+        evidence_desc = "\n\n".join(ev_entries)
+        if len(report.evidence_records) > len(selected_ev):
+            overflow = len(report.evidence_records) - len(selected_ev)
+            evidence_desc += (
+                f"\n\n[Evidentiary Register Note: {overflow} additional point-of-capture evidence items "
+                f"verified and retained in complete evidentiary ledger.]"
+            )
+    else:
+        lim_str = "; ".join(report.assessment_limitations) or "Proprietary vendor platform with no public developer disclosures"
+        evidence_desc = (
+            f"No qualifying public AI evidence detected during OSINT reconnaissance. "
+            f"Assessment Limitations: {lim_str}. "
+            f"Notice: Absence of public documentation does not confirm absence of internal or sub-processor AI usage; direct vendor diligence required."
+        )
+
+    # ── 7. Field 6: How Vendor May Be Using AI ──
+    confirmed_signals = [
+        c for c in report.signal_classifications
+        if c.signal_category.value == "OPERATIONAL_AI"
+        and c.ai_type.value in ("GENAI_LLM", "CLASSICAL_ML", "AGENTIC_AI")
+        and c.confidence in ("HIGH", "CONFIRMED", "MEDIUM")
+    ]
+    confirmed_caps = []
+    seen_caps: set[str] = set()
+    for c in confirmed_signals:
+        cap_desc = c.capability_summary or f"{c.ai_type.value} capability"
+        norm_cap = re.sub(r"\s+", " ", cap_desc.strip().lower())
+        if norm_cap in seen_caps:
+            continue
+        seen_caps.add(norm_cap)
+
+        c_inputs = f" Inputs: {', '.join(c.known_inputs)}." if c.known_inputs else ""
+        c_outputs = f" Outputs: {', '.join(c.known_outputs)}." if c.known_outputs else ""
+        cust_status = (
+            f" Customer data involved: {'Yes' if c.customer_data_involved else 'No / Unverified'}."
+            if c.customer_data_involved is not None
+            else ""
+        )
+        confirmed_caps.append(
+            f"- Confirmed Production Capability: {cap_desc} ({c.ai_type.value}, Scope: {c.scope.value}).{c_inputs}{c_outputs}{cust_status}"
+        )
+        if len(confirmed_caps) >= 8:
+            break
+
+    how_sections = []
+    if confirmed_caps:
+        how_sections.append("CONFIRMED AI USE CASES (EVIDENCED):\n" + "\n".join(confirmed_caps))
+    else:
+        how_sections.append(
+            f"CONFIRMED AI USE CASES:\nNone evidenced in public technical documentation for contracted service '{v_svc}'."
+        )
+
+    hypothesized = (
+        f"POTENTIAL / HYPOTHESIZED AI INTEGRATION VECTORS:\n"
+        f"Given vendor's operational role providing '{v_svc}' supporting '{v_proc}', "
+        f"potential unconfirmed AI integration vectors include: "
+        f"(1) Automated telemetry anomaly detection and predictive failure analytics in production workloads; "
+        f"(2) Internal developer code assistance and automated batch script maintenance; "
+        f"(3) Automated customer support and ticketing classification. "
+        f"These represent potential operational exposures pending bilateral questionnaire verification."
+    )
+    how_sections.append(hypothesized)
+    how_ai_used = "\n\n".join(how_sections)
+
+    # ── 8. Field 7: Named AI Sub-processors / Model Providers ──
+    is_operational_ai = (ai_detected == "Yes") or bool(confirmed_caps)
+    conf_prov = [p for p in report.named_providers if p and p != "UNSPECIFIED"] if is_operational_ai else []
+    conf_mod = [m for m in report.named_models if m and m != "UNSPECIFIED"] if is_operational_ai else []
+    conf_infra = [h for h in report.hosting_infrastructures if h and h != "UNSPECIFIED"]
+
+    sp_parts = []
+    if conf_prov or conf_mod:
+        sp_parts.append(f"Confirmed AI Sub-processors: {', '.join(conf_prov) if conf_prov else 'None explicitly confirmed'}")
+        sp_parts.append(f"Confirmed Foundation Models: {', '.join(conf_mod) if conf_mod else 'None explicitly confirmed'}")
+    else:
+        sp_parts.append("Confirmed AI Sub-processors: None evidenced in public documentation.")
+        sp_parts.append("Confirmed Foundation Models: None evidenced in public documentation.")
+
+    sp_parts.append(f"Hosting Infrastructure: {', '.join(conf_infra) if conf_infra else 'Not disclosed in public documentation'}")
+    sp_parts.append(f"Supply Chain Identity Status: {report.supply_chain_identity_status if is_operational_ai else 'NOT_APPLICABLE'}")
+    sp_parts.append(
+        "Unidentified / Unverified Providers: Upstream foundation model providers, API inference routing, and third-party data sub-processors remain unverified due to lack of public sub-processor transparency; requires contractual sub-processor list submission."
+    )
+    named_subprocessors = "\n".join(sp_parts)
+
+    # ── 9. Field 8: AI Security Risk Classification ──
+    ds = report.deterministic_risk_score
+    if ds.policy_status == ScoringPolicyStatus.APPROVED_ACTIVE and ds.final_risk_score is not None:
+        risk_class = f"{ds.overall_risk_rating} (Calibrated Deterministic Score: {ds.final_risk_score:.2f})"
+    elif report.risk_findings:
+        severities = [rf.severity.value for rf in report.risk_findings]
+        order = ["Critical", "High", "Medium", "Low", "UNRESOLVED"]
+        top_sev = next((s for s in order if s in severities), "Medium")
+        rule_summary = ", ".join(f"{rf.risk_rule_id} ({rf.severity.value})" for rf in report.risk_findings)
+        risk_class = f"{top_sev} (Qualitative Risk Rules: {rule_summary} — Policy Unconfigured)"
+    else:
+        risk_class = "Low (No AI-specific security risk findings identified — Policy Unconfigured)"
+
+    # ── 10. Field 9: Risk Rationale ──
+    rr_parts = [
+        f"Risk classification synthesizes {crit_tier} criticality tier, {v_op} operational dependency, "
+        f"and access to data classification: '{v_data}'."
+    ]
+    if report.risk_findings:
+        rf_items = []
+        for rf in report.risk_findings:
+            rf_items.append(
+                f"- {rf.risk_rule_id} ({rf.risk_title}): Severity {rf.severity.value}. Exposure: {rf.exposure_determination.value}. {rf.finding_description}"
+            )
+        rr_parts.append("Evaluated AI Risk Findings:\n" + "\n".join(rf_items))
+    else:
+        rr_parts.append("Evaluated AI Risk Findings: No evidence-backed R1–R8 risk findings surfaced in public documentation.")
+
+    if report.known_controls_summary:
+        rr_parts.append("Observed Mitigations & Controls: " + "; ".join(report.known_controls_summary))
+    else:
+        rr_parts.append("Observed Mitigations: No contractual AI controls or Zero-Data-Retention commitments publicly verified.")
+    risk_rationale = "\n\n".join(rr_parts)
+
+    # ── 11. Field 10: Recommended Action ──
+    is_high_or_crit = crit_tier in ("Critical", "High")
+    deadline = "Prior to contract renewal or within 30 days" if is_high_or_crit else "Within 60 days of assessment"
+    action_items = [
+        f"1. Governance & Diligence Review (Owner: Meridian Third-Party Risk Management / Deadline: {deadline}):",
+        "   - Issue Meridian Supplementary AI Diligence Questionnaire to vendor security team to resolve identified disclosure gaps.",
+        "2. Contractual Safeguards (Owner: Legal & Procurement / Deadline: Next Contract Renewal):",
+        "   - Execute formal AI Data Processing Addendum (DPA) incorporating: (a) explicit prohibition against training or fine-tuning models on Meridian data; (b) enforceable Zero Data Retention (ZDR) commitment for inference prompts and outputs; (c) mandatory 60-day prior written notice for new AI sub-processors.",
+        "3. Technical & Security Controls (Owner: Information Security Architecture / Deadline: Ongoing):",
+        "   - Validate vendor's SOC 2 Type II with AI Trust Services Criteria or ISO/IEC 42001 certification.",
+        "   - Ensure continuous API telemetry logging and strict tenant vector/RAG isolation.",
+    ]
+    if report.remediation_recommendations:
+        action_items.append("4. Finding-Specific Remediation Requirements:")
+        for r in report.remediation_recommendations:
+            action_items.append(f"   - [{r.get('risk_rule_id')}] {r.get('risk_title')} ({r.get('severity')}): {r.get('recommended_remediation')}")
+    recommended_action = "\n".join(action_items)
+
+    # ── 12. Field 11: Assessed By / Date ──
+    date_str = report.generated_at[:10] if report.generated_at else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assessed_by = f"Meridian Third-Party AI Risk Governance Team / {date_str}"
+
+    return {
+        "Vendor ID": v_id,
+        "Vendor Name": v_name,
+        "Vendor Description": v_desc,
+        "Service / Product Provided to Meridian": v_svc,
+        "Category": v_cat,
+        "Public Website": v_web,
+        "Business Process Supported": v_proc,
+        "Operational Dependency": v_op,
+        "Data Classification Accessed": v_data,
+        "Data Volume (annual)": v_vol,
+        "Criticality Tier": crit_tier,
+        "Criticality Rationale": crit_rationale,
+        "Assessment Depth Applied": depth_applied,
+        "AI Usage Detected": ai_detected,
+        "Evidence Description along with OSINT Source(s) / Evidence Link": evidence_desc,
+        "How Vendor May Be Using AI": how_ai_used,
+        "Named AI Sub-processors / Model Providers": named_subprocessors,
+        "AI Security Risk Classification": risk_class,
+        "Risk Rationale": risk_rationale,
+        "Recommended Action": recommended_action,
+        "Assessed By / Date": assessed_by,
+    }
+
+
 class AssessmentReportExporter:
-    """Generates clean, secret-free JSON, Evidence CSV, Markdown, and HTML exports for an assessment report."""
+    """Generates clean, secret-free JSON, Evidence CSV, Markdown, HTML, and Canonical Inventory exports."""
+
+    @staticmethod
+    def to_inventory_dict(
+        report: VendorEndToEndAssessmentReport,
+        vendor: Optional[MeridianVendor] = None,
+    ) -> dict[str, str]:
+        """Produce the canonical 21-column Meridian Vendor Inventory assessment record as a dictionary."""
+        return build_canonical_vendor_inventory_record(report, vendor)
+
+    @staticmethod
+    def to_inventory_csv(
+        report: VendorEndToEndAssessmentReport,
+        vendor: Optional[MeridianVendor] = None,
+    ) -> str:
+        """Export the single vendor's canonical 21-column inventory record as RFC 4180 CSV (Excel-compatible)."""
+        buf = io.StringIO()
+        writer = csv.DictWriter(
+            buf,
+            fieldnames=CANONICAL_VENDOR_INVENTORY_COLUMNS,
+            quoting=csv.QUOTE_MINIMAL,
+            lineterminator="\r\n",
+        )
+        writer.writeheader()
+        rec = build_canonical_vendor_inventory_record(report, vendor)
+        writer.writerow(rec)
+        return buf.getvalue()
+
+    @staticmethod
+    def to_batch_inventory_csv(
+        reports: Sequence[VendorEndToEndAssessmentReport],
+        vendors: Optional[Sequence[MeridianVendor]] = None,
+    ) -> str:
+        """Export a portfolio batch of canonical 21-column inventory records as RFC 4180 CSV (Excel-compatible)."""
+        buf = io.StringIO()
+        writer = csv.DictWriter(
+            buf,
+            fieldnames=CANONICAL_VENDOR_INVENTORY_COLUMNS,
+            quoting=csv.QUOTE_MINIMAL,
+            lineterminator="\r\n",
+        )
+        writer.writeheader()
+        vendor_map = {v.vendor_id: v for v in (vendors or [])}
+        for r in reports:
+            v_match = vendor_map.get(r.vendor_id)
+            rec = build_canonical_vendor_inventory_record(r, v_match)
+            writer.writerow(rec)
+        return buf.getvalue()
 
     @staticmethod
     def to_json(report: VendorEndToEndAssessmentReport) -> str:

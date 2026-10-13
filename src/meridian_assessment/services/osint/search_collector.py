@@ -1101,7 +1101,8 @@ class OSINTSearchCollector:
                 skipped_count += 1
                 continue
 
-            if queries_processed >= self.max_queries_per_run:
+            backend_configured, _ = self.backend.is_configured()
+            if backend_configured and queries_processed >= self.max_queries_per_run:
                 skipped_count += 1
                 continue
 

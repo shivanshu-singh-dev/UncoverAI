@@ -56,6 +56,11 @@ class URLTriageDecision(BaseModel):
     model_used: Optional[str] = None
     model_execution_status: Optional[str] = None
 
+    @property
+    def canonical_url(self) -> str:
+        """Alias for url to preserve uniform URL naming across pipeline stages."""
+        return self.url
+
 
 
 # ─── Level 4: Web/PDF Extraction & Evidence Models ────────────────────────────
@@ -550,7 +555,7 @@ class VendorEndToEndAssessmentReport(BaseModel):
     generated_at: str
     is_synthetic_evidence_run: bool = False
 
-    # 1. Vendor Identity & Scope
+    # 1. Vendor Identity & Scope (Preserving all 10 Meridian Inventory Inputs)
     vendor_id: str
     legal_entity: str
     domain: str
@@ -558,6 +563,9 @@ class VendorEndToEndAssessmentReport(BaseModel):
     vendor_description: Optional[str] = None
     service_product_provided: Optional[str] = None
     business_process_supported: Optional[str] = None
+    data_classification_accessed: Optional[str] = None
+    operational_dependency: Optional[str] = None
+    data_volume_annual: Optional[str] = None
 
     # 2. Level 1: Criticality Tiering & O1–O5 Governance
     criticality_summary: dict[str, Any] = Field(default_factory=dict)

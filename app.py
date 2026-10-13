@@ -666,12 +666,18 @@ def _update_global_job_progress(
         _GLOBAL_JOB_STATE["remaining"] = rem
         _GLOBAL_JOB_STATE["level_pct"] = lvl_pct
         _GLOBAL_JOB_STATE["overall_pct"] = ov_pct
-        if report_id is not None:
-            _GLOBAL_JOB_STATE["report_id"] = report_id
-        _GLOBAL_JOB_STATE["error"] = error
-        _GLOBAL_JOB_STATE["updated_at"] = datetime.now(timezone.utc).isoformat()
-        if latest_report is not None:
-            _GLOBAL_JOB_STATE["latest_report"] = latest_report
+        if status == "RUNNING":
+            _GLOBAL_JOB_STATE["error"] = None
+            if report_id is None:
+                _GLOBAL_JOB_STATE["report_id"] = None
+            if latest_report is None:
+                _GLOBAL_JOB_STATE["latest_report"] = None
+        else:
+            if report_id is not None:
+                _GLOBAL_JOB_STATE["report_id"] = report_id
+            if latest_report is not None:
+                _GLOBAL_JOB_STATE["latest_report"] = latest_report
+            _GLOBAL_JOB_STATE["error"] = error
         if latest_vendor is not None:
             _GLOBAL_JOB_STATE["latest_vendor"] = latest_vendor
         snapshot = dict(_GLOBAL_JOB_STATE)
@@ -683,13 +689,24 @@ def _update_global_job_progress(
 def _get_global_job_snapshot() -> dict[str, Any]:
     with _GLOBAL_JOB_LOCK:
         snap = dict(_GLOBAL_JOB_STATE)
-    if snap["status"] == "IDLE" and _DEFAULT_ACTIVE_STATUS_PATH.is_file() and "PYTEST_CURRENT_TEST" not in os.environ:
+    if _DEFAULT_ACTIVE_STATUS_PATH.is_file() and "PYTEST_CURRENT_TEST" not in os.environ:
         try:
             disk_data = json.loads(_DEFAULT_ACTIVE_STATUS_PATH.read_text(encoding="utf-8"))
-            if isinstance(disk_data, dict) and disk_data.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
-                for k, v in disk_data.items():
-                    if k in snap:
-                        snap[k] = v
+            if isinstance(disk_data, dict):
+                st_val = disk_data.get("status")
+                # Auto-heal stale jobs if no update for > 3 minutes (e.g. process was killed)
+                if st_val == "RUNNING" and disk_data.get("updated_at"):
+                    try:
+                        last_t = datetime.fromisoformat(disk_data["updated_at"])
+                        if (datetime.now(timezone.utc) - last_t).total_seconds() > 180:
+                            disk_data["status"] = "CANCELLED"
+                            disk_data["error"] = "Previous run was interrupted or timed out."
+                    except Exception:
+                        pass
+                if disk_data.get("status") in ("RUNNING", "COMPLETED", "FAILED", "CANCELLED"):
+                    for k, v in disk_data.items():
+                        if k in snap:
+                            snap[k] = v
         except Exception:
             pass
     return snap
@@ -721,13 +738,12 @@ def _init_session_state() -> None:
         st.session_state["human_crit_overrides"] = {}
 
     if "reports_by_vendor" not in st.session_state:
-        # Load only genuine live OSINT assessment reports by default so synthetic fixtures
-        # are never silently presented as completed real assessments on first load.
-        persisted = repo.load_latest_reports_by_vendor()
-        live_reports = {
-            vid: rpt for vid, rpt in persisted.items() if not rpt.is_synthetic_evidence_run
-        }
-        st.session_state["reports_by_vendor"] = live_reports
+        # Load genuine live OSINT assessment reports, preserving sample reports for vendors without live runs
+        all_persisted = repo.load_latest_reports_by_vendor(only_live=False)
+        live_persisted = repo.load_latest_reports_by_vendor(only_live=True)
+        merged = dict(all_persisted)
+        merged.update(live_persisted)
+        st.session_state["reports_by_vendor"] = merged
     elif "PYTEST_CURRENT_TEST" not in os.environ:
         # Sync any completed background job or newly persisted live report after browser refresh
         snap = _get_global_job_snapshot()
@@ -774,6 +790,14 @@ def _get_vendor_assessment_status(
     report: Optional[VendorEndToEndAssessmentReport],
 ) -> tuple[str, str, bool]:
     """Return `(status_label, badge_variant, is_completed_real_assessment)`."""
+    snap = _get_global_job_snapshot()
+    if snap.get("vendor_id") == vid:
+        job_st = snap.get("status")
+        if job_st == "FAILED":
+            return "Live Run Failed", "critical", False
+        if job_st == "RUNNING":
+            return "Running (Live OSINT)", "purple", False
+
     if report is None:
         if crit.requires_review:
             return "Awaiting Tier Review", "high", False
@@ -786,7 +810,7 @@ def _get_vendor_assessment_status(
     if verdict_val == "INCOMPLETE_ASSESSMENT" or not report.ai_use_verdict.depth_completed:
         return "Incomplete (Blocked)", "high", False
 
-    if report.human_Review_required:
+    if report.human_review_required:
         return "Awaiting Analyst Review", "high", True
 
     return "Completed", "success", True
@@ -956,6 +980,17 @@ def _start_background_vendor_assessment(
             with _GLOBAL_JOB_LOCK:
                 if _GLOBAL_JOB_STATE.get("cancel_requested"):
                     raise _AssessmentCancelledError("Assessment cancelled by analyst.")
+            if _DEFAULT_ACTIVE_STATUS_PATH.is_file():
+                try:
+                    _disk_check = json.loads(_DEFAULT_ACTIVE_STATUS_PATH.read_text(encoding="utf-8"))
+                    if _disk_check.get("cancel_requested"):
+                        with _GLOBAL_JOB_LOCK:
+                            _GLOBAL_JOB_STATE["cancel_requested"] = True
+                        raise _AssessmentCancelledError("Assessment cancelled by analyst.")
+                except _AssessmentCancelledError:
+                    raise
+                except Exception:
+                    pass
             _update_global_job_progress(
                 status="RUNNING",
                 vendor_id=vendor.vendor_id,
@@ -1837,51 +1872,68 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
 
     if (run_clicked or alt_sample_clicked) and validated_vendor is not None:
         target_mode = "SAMPLE" if (is_sample_mode or alt_sample_clicked) else "LIVE"
-        in_pytest = "PYTEST_CURRENT_TEST" in os.environ
 
-        if target_mode == "LIVE" and not in_pytest:
-            _start_background_vendor_assessment(
-                validated_vendor,
+        prog_overall = overall_progress_container.progress(
+            0,
+            text=f"Overall Pipeline (Level 1 of 9 — 0%): Initializing 9-level assessment pipeline for {validated_vendor.vendor_name}...",
+        )
+        prog_level = level_progress_container.progress(
+            0,
+            text="Current Level Progress: 0 / 1 completed (1 left — 0%) — Starting Level 1...",
+        )
+
+        with _GLOBAL_JOB_LOCK:
+            _GLOBAL_JOB_STATE["cancel_requested"] = False
+
+        def _on_stage(
+            lvl_num: int,
+            stage_title: str,
+            detail: str,
+            completed: int = 0,
+            total: int = 1,
+        ) -> None:
+            with _GLOBAL_JOB_LOCK:
+                if _GLOBAL_JOB_STATE.get("cancel_requested"):
+                    raise _AssessmentCancelledError("Assessment cancelled by analyst.")
+            safe_tot = max(1, int(total))
+            safe_comp = max(0, min(int(completed), safe_tot))
+            rem = max(0, safe_tot - safe_comp)
+            lvl_pct = int(round((safe_comp / float(safe_tot)) * 100))
+            ov_pct = min(99, max(1, int(round(((lvl_num - 1 + (safe_comp / float(safe_tot))) / 9.0) * 100))))
+            prog_overall.progress(
+                ov_pct,
+                text=f"Overall Pipeline (Level {lvl_num} of 9 — {ov_pct}%): {stage_title}",
+            )
+            prog_level.progress(
+                lvl_pct,
+                text=f"Current Level Progress: {safe_comp} / {safe_tot} completed ({rem} left — {lvl_pct}%) — {detail}",
+            )
+            _update_global_job_progress(
+                status="RUNNING",
+                vendor_id=validated_vendor.vendor_id,
+                vendor_name=validated_vendor.vendor_name,
                 mode=target_mode,
-                enable_local_llm=use_local_ai,
-                enable_triage_llm=use_ai_l3b,
-                enable_rag_embeddings=use_ai_l5,
-                enable_classification_llm=use_ai_l6,
-                enable_summary_llm=use_ai_l8,
-                human_crit_override=st.session_state["human_crit_overrides"].get(validated_vendor.vendor_id),
-            )
-            st.rerun()
-        else:
-            prog_overall = overall_progress_container.progress(
-                0,
-                text="Overall Pipeline (Level 1 of 9 — 0%): Initializing 9-level assessment pipeline...",
-            )
-            prog_level = level_progress_container.progress(
-                0,
-                text="Current Level Progress: 0 / 1 completed (1 left — 0%) — Starting Level 1...",
+                level_num=lvl_num,
+                stage_title=stage_title,
+                detail=detail,
+                completed=safe_comp,
+                total=safe_tot,
             )
 
-            def _on_stage(
-                lvl_num: int,
-                stage_title: str,
-                detail: str,
-                completed: int = 0,
-                total: int = 1,
-            ) -> None:
-                safe_tot = max(1, int(total))
-                safe_comp = max(0, min(int(completed), safe_tot))
-                rem = max(0, safe_tot - safe_comp)
-                lvl_pct = int(round((safe_comp / float(safe_tot)) * 100))
-                ov_pct = min(99, max(1, int(round(((lvl_num - 1 + (safe_comp / float(safe_tot))) / 9.0) * 100))))
-                prog_overall.progress(
-                    ov_pct,
-                    text=f"Overall Pipeline (Level {lvl_num} of 9 — {ov_pct}%): {stage_title}",
-                )
-                prog_level.progress(
-                    lvl_pct,
-                    text=f"Current Level Progress: {safe_comp} / {safe_tot} completed ({rem} left — {lvl_pct}%) — {detail}",
-                )
+        _update_global_job_progress(
+            status="RUNNING",
+            vendor_id=validated_vendor.vendor_id,
+            vendor_name=validated_vendor.vendor_name,
+            mode=target_mode,
+            level_num=1,
+            stage_title="Level 1: Criticality Tiering",
+            detail=f"Initializing 9-level assessment pipeline for {validated_vendor.vendor_name}...",
+            completed=0,
+            total=1,
+            latest_vendor=validated_vendor,
+        )
 
+        try:
             report = _execute_vendor_assessment(
                 validated_vendor,
                 mode=target_mode,
@@ -1898,6 +1950,50 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
             status_container.markdown(
                 f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
                 f'Report <code>{html.escape(report.report_id)}</code> generated for <strong>{html.escape(report.legal_entity)}</strong>.</div>',
+                unsafe_allow_html=True,
+            )
+            _update_global_job_progress(
+                status="COMPLETED",
+                vendor_id=validated_vendor.vendor_id,
+                vendor_name=validated_vendor.vendor_name,
+                mode=target_mode,
+                level_num=9,
+                stage_title="Assessment Completed",
+                detail=f"Report {report.report_id} generated and persisted for {report.legal_entity}.",
+                completed=1,
+                total=1,
+                report_id=report.report_id,
+                latest_report=report,
+                latest_vendor=validated_vendor,
+            )
+        except _AssessmentCancelledError as exc:
+            _update_global_job_progress(
+                status="CANCELLED",
+                vendor_id=validated_vendor.vendor_id,
+                vendor_name=validated_vendor.vendor_name,
+                mode=target_mode,
+                level_num=1,
+                stage_title="Assessment Cancelled",
+                detail=str(exc),
+                error=str(exc),
+            )
+            status_container.markdown(
+                f'<div class="uc-callout uc-callout-warn"><strong>Assessment Cancelled:</strong> {html.escape(str(exc))}</div>',
+                unsafe_allow_html=True,
+            )
+        except Exception as exc:
+            _update_global_job_progress(
+                status="FAILED",
+                vendor_id=validated_vendor.vendor_id,
+                vendor_name=validated_vendor.vendor_name,
+                mode=target_mode,
+                level_num=1,
+                stage_title="Assessment Failed",
+                detail=str(exc),
+                error=str(exc),
+            )
+            status_container.markdown(
+                f'<div class="uc-callout uc-callout-danger"><strong>Assessment Failed:</strong> {html.escape(str(exc))}</div>',
                 unsafe_allow_html=True,
             )
     elif "PYTEST_CURRENT_TEST" not in os.environ:
@@ -1979,14 +2075,51 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
         )
         return
 
+    # Clear separation for failed live runs vs historical/sample dossiers
+    if job_snap.get("vendor_id") == active_vid and job_snap.get("status") == "FAILED":
+        st.markdown(
+            f"""
+            <div class="uc-callout uc-callout-danger" style="margin-bottom:12px;">
+                <strong>⚠️ Live OSINT Assessment Failed for {html.escape(active_vid)}:</strong><br>
+                The run encountered an execution error:<br>
+                <code>{html.escape(str(job_snap.get("error") or "Unknown execution failure"))}</code><br>
+                <em>No new live assessment dossier was generated. Any dossier displayed below is historical or demonstration fixture data.</em>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     # Mode banner (Sample vs Live)
     if active_report.is_synthetic_evidence_run:
+        if job_snap.get("vendor_id") == active_vid and job_snap.get("status") == "FAILED":
+            st.markdown(
+                """
+                <div class="uc-callout uc-callout-warn">
+                    <strong>Notice — Displaying Baseline Demonstration Fixture:</strong>
+                    The assessment results shown below are from a <em>pre-computed synthetic demonstration fixture</em>,
+                    <strong>NOT</strong> from the live assessment that failed above.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div class="uc-callout uc-callout-warn">
+                    <strong>Sample Assessment Mode (Pre-Collected Demonstration Fixtures):</strong>
+                    This report was generated using deterministic sample fixtures to demonstrate the nine-level workflow.
+                    It is labeled as synthetic sample data and is never counted as a completed live vendor assessment.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    elif job_snap.get("vendor_id") == active_vid and job_snap.get("status") == "FAILED":
         st.markdown(
-            """
-            <div class="uc-callout uc-callout-warn">
-                <strong>Sample Assessment Mode (Pre-Collected Demonstration Fixtures):</strong>
-                This report was generated using deterministic sample fixtures to demonstrate the nine-level workflow.
-                It is labeled as synthetic sample data and is never counted as a completed live vendor assessment.
+            f"""
+            <div class="uc-callout uc-callout-info">
+                <strong>Notice — Displaying Prior Historical Assessment ({html.escape(active_report.report_id)}):</strong>
+                The assessment results shown below are from a <em>prior completed run</em> ({html.escape(active_report.generated_at)}).
+                They do <strong>NOT</strong> reflect the failed run above.
             </div>
             """,
             unsafe_allow_html=True,
@@ -2296,6 +2429,14 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
                 mime="text/csv",
                 use_container_width=True,
                 key="dl_assess_csv",
+            )
+            st.download_button(
+                "Download Vendor Inventory Record (21 Cols CSV)",
+                data=AssessmentReportExporter.to_inventory_csv(active_report),
+                file_name=f"{active_report.vendor_id}_inventory_record.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_assess_inventory_csv",
             )
             st.download_button(
                 "Download Full Audit JSON (.json)",
@@ -2633,7 +2774,7 @@ def _render_reports_page() -> None:
     if cur_vid not in vendors_by_id:
         cur_vid = all_vids[0]
 
-    sel_col, dl1, dl2, dl3, dl4 = st.columns([2.2, 1.0, 1.0, 1.0, 1.0], gap="small")
+    sel_col, dl1, dl2, dl3, dl4, dl5 = st.columns([1.8, 0.8, 0.8, 0.8, 0.8, 1.2], gap="small")
     chosen_vid = sel_col.selectbox(
         "Select Vendor Dossier",
         options=all_vids,
@@ -2695,6 +2836,14 @@ def _render_reports_page() -> None:
         mime="application/json",
         use_container_width=True,
         key="btn_rpt_dl_json",
+    )
+    dl5.download_button(
+        "Inventory CSV (21 Cols)",
+        data=AssessmentReportExporter.to_inventory_csv(report, vendors_by_id.get(chosen_vid)),
+        file_name=f"{report.vendor_id}_inventory_record.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="btn_rpt_dl_inv_csv",
     )
 
     if report.is_synthetic_evidence_run:
@@ -2856,6 +3005,46 @@ def _render_reports_page() -> None:
     if notices or report.assessment_limitations:
         lim_html = "".join(f"<li>{html.escape(item)}</li>" for item in (notices + list(report.assessment_limitations)))
         st.markdown(f"<ul style='font-size:0.84rem;color:#334155;'>{lim_html}</ul>", unsafe_allow_html=True)
+
+    # Section 5: Meridian Vendor Inventory Assessment Record (Canonical 21 Columns)
+    inv_rec = AssessmentReportExporter.to_inventory_dict(report, vendors_by_id.get(chosen_vid))
+    st.markdown(
+        """
+        <div class="uc-section-header" style="margin-top:20px;">
+            <div>
+                <h2 class="uc-section-title">5. Meridian Vendor Inventory Assessment Record (Canonical 21 Columns)</h2>
+                <p class="uc-section-subtitle">Preserves all 10 supplied vendor input fields and delivers the 11 derived governance fields matching the Larkspur worked example.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander("View 21-Field Canonical Inventory Record (Full Detail)", expanded=True):
+        st.markdown("#### A. Preserved Vendor Input Fields (10 Columns)")
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"**Vendor ID:** `{inv_rec['Vendor ID']}`\n\n**Vendor Name:** {inv_rec['Vendor Name']}")
+        c2.markdown(f"**Public Website:** `{inv_rec['Public Website']}`\n\n**Category:** {inv_rec['Category']}")
+        c3.markdown(f"**Operational Dependency:** `{inv_rec['Operational Dependency']}`\n\n**Data Volume (annual):** {inv_rec['Data Volume (annual)']}")
+        st.markdown(f"**Vendor Description:** {inv_rec['Vendor Description']}")
+        st.markdown(f"**Service / Product Provided to Meridian:** {inv_rec['Service / Product Provided to Meridian']}")
+        st.markdown(f"**Business Process Supported:** {inv_rec['Business Process Supported']}")
+        st.markdown(f"**Data Classification Accessed:** {inv_rec['Data Classification Accessed']}")
+
+        st.markdown("---")
+        st.markdown("#### B. Student-Derived Assessment Fields (11 Columns)")
+        d1, d2, d3 = st.columns(3)
+        d1.markdown(f"**Criticality Tier:** `{inv_rec['Criticality Tier']}`")
+        d2.markdown(f"**AI Usage Detected:** `{inv_rec['AI Usage Detected']}`")
+        d3.markdown(f"**AI Security Risk Classification:** `{inv_rec['AI Security Risk Classification']}`")
+
+        st.markdown(f"**Criticality Rationale:**\n\n{inv_rec['Criticality Rationale']}")
+        st.markdown(f"**Assessment Depth Applied:**\n\n{inv_rec['Assessment Depth Applied']}")
+        st.markdown(f"**How Vendor May Be Using AI:**\n\n{inv_rec['How Vendor May Be Using AI']}")
+        st.markdown(f"**Named AI Sub-processors / Model Providers:**\n\n{inv_rec['Named AI Sub-processors / Model Providers']}")
+        st.markdown(f"**Risk Rationale:**\n\n{inv_rec['Risk Rationale']}")
+        st.markdown(f"**Recommended Action:**\n\n{inv_rec['Recommended Action']}")
+        st.markdown(f"**Evidence Description along with OSINT Source(s) / Evidence Link:**\n\n{inv_rec['Evidence Description along with OSINT Source(s) / Evidence Link']}")
+        st.markdown(f"**Assessed By / Date:** `{inv_rec['Assessed By / Date']}`")
 
 
 # ─── Page 5: Settings & Technical Diagnostics ─────────────────────────────────

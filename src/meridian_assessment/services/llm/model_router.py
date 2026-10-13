@@ -71,9 +71,9 @@ class ModelRoutingConfig(BaseModel):
     enabled: bool = False
     provider: str = "ollama"
     endpoint: str = "http://localhost:11434"
-    triage_model: str = "llama3.2:latest"
-    analysis_model: str = "mistral:latest"
-    summary_model: str = "mistral:latest"
+    triage_model: str = "llama3.2:3b"
+    analysis_model: str = "qwen2.5:3b"
+    summary_model: str = "qwen2.5:3b"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     enable_rag_embeddings: bool = False
     timeout_seconds: float = 25.0
@@ -143,21 +143,21 @@ class ModelRoutingConfig(BaseModel):
 
         triage_model = (
             environ.get("MERIDIAN_OLLAMA_TRIAGE_MODEL")
-            or str(yaml_llm.get("triage_model") or "llama3.2:latest")
+            or str(yaml_llm.get("triage_model") or "llama3.2:3b")
         ).strip()
 
         # Support MERIDIAN_OLLAMA_ANALYSIS_MODEL with fallback to legacy MERIDIAN_OLLAMA_MODEL
         analysis_model = (
             environ.get("MERIDIAN_OLLAMA_ANALYSIS_MODEL")
             or environ.get("MERIDIAN_OLLAMA_MODEL")
-            or str(yaml_llm.get("analysis_model") or yaml_llm.get("model_name") or "mistral:latest")
+            or str(yaml_llm.get("analysis_model") or yaml_llm.get("model_name") or "qwen2.5:3b")
         ).strip()
 
         summary_model = (
             environ.get("MERIDIAN_OLLAMA_SUMMARY_MODEL")
             or environ.get("MERIDIAN_OLLAMA_ANALYSIS_MODEL")
             or environ.get("MERIDIAN_OLLAMA_MODEL")
-            or str(yaml_llm.get("summary_model") or analysis_model or "mistral:latest")
+            or str(yaml_llm.get("summary_model") or analysis_model or "qwen2.5:3b")
         ).strip()
 
         embedding_model = (

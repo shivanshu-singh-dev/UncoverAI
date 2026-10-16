@@ -42,3 +42,7 @@ data/state/
 # OS Artifacts
 .DS_Store
 Thumbs.db
+
+
+
+outputs/

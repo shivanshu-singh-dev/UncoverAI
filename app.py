@@ -617,6 +617,8 @@ def _save_job_state_to_disk(snapshot: dict[str, Any]) -> None:
         serializable = {
             k: v for k, v in snapshot.items() if k not in ("latest_report", "latest_vendor")
         }
+        if not serializable.get("updated_at"):
+            serializable["updated_at"] = datetime.now(timezone.utc).isoformat()
         _DEFAULT_ACTIVE_STATUS_PATH.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -666,6 +668,7 @@ def _update_global_job_progress(
         _GLOBAL_JOB_STATE["remaining"] = rem
         _GLOBAL_JOB_STATE["level_pct"] = lvl_pct
         _GLOBAL_JOB_STATE["overall_pct"] = ov_pct
+        _GLOBAL_JOB_STATE["updated_at"] = datetime.now(timezone.utc).isoformat()
         if status == "RUNNING":
             _GLOBAL_JOB_STATE["error"] = None
             if report_id is None:
@@ -694,27 +697,75 @@ def _get_global_job_snapshot() -> dict[str, Any]:
             disk_data = json.loads(_DEFAULT_ACTIVE_STATUS_PATH.read_text(encoding="utf-8"))
             if isinstance(disk_data, dict):
                 st_val = disk_data.get("status")
-                # Auto-heal stale jobs if no update for > 3 minutes (e.g. process was killed)
-                if st_val == "RUNNING" and disk_data.get("updated_at"):
-                    try:
-                        last_t = datetime.fromisoformat(disk_data["updated_at"])
-                        if (datetime.now(timezone.utc) - last_t).total_seconds() > 180:
-                            disk_data["status"] = "CANCELLED"
-                            disk_data["error"] = "Previous run was interrupted or timed out."
-                    except Exception:
-                        pass
-                if disk_data.get("status") in ("RUNNING", "COMPLETED", "FAILED", "CANCELLED"):
+                # Auto-heal stale jobs if worker thread is not alive or no update for > 2 minutes
+                has_active_worker = any(
+                    t.name.startswith("UncoverAI_Assess_") and t.is_alive()
+                    for t in threading.enumerate()
+                )
+                if st_val == "RUNNING":
+                    is_stale = False
+                    if disk_data.get("updated_at"):
+                        try:
+                            last_t = datetime.fromisoformat(disk_data["updated_at"])
+                            if (datetime.now(timezone.utc) - last_t).total_seconds() > 120:
+                                is_stale = True
+                        except Exception:
+                            is_stale = True
+                    elif not has_active_worker:
+                        is_stale = True
+
+                    if is_stale and not has_active_worker:
+                        disk_data["status"] = "CANCELLED"
+                        disk_data["stage_title"] = "Assessment Interrupted"
+                        disk_data["detail"] = "Previous run was interrupted or timed out."
+                        disk_data["error"] = "Previous run was interrupted or timed out."
+                        disk_data["cancel_requested"] = False
+                        _save_job_state_to_disk(disk_data)
+
+                if disk_data.get("status") in ("RUNNING", "COMPLETED", "FAILED", "CANCELLED", "IDLE"):
                     for k, v in disk_data.items():
                         if k in snap:
+                            if k == "cancel_requested" and snap.get("cancel_requested"):
+                                continue
                             snap[k] = v
         except Exception:
             pass
     return snap
 
 
-def _request_cancel_active_job() -> None:
+def _request_cancel_active_job(*, force: bool = True) -> None:
     with _GLOBAL_JOB_LOCK:
         _GLOBAL_JOB_STATE["cancel_requested"] = True
+        if force:
+            _GLOBAL_JOB_STATE["status"] = "CANCELLED"
+            _GLOBAL_JOB_STATE["stage_title"] = "Assessment Cancelled"
+            _GLOBAL_JOB_STATE["detail"] = "Assessment was stopped by user request."
+            _GLOBAL_JOB_STATE["error"] = "Assessment cancelled by analyst."
+        _GLOBAL_JOB_STATE["updated_at"] = datetime.now(timezone.utc).isoformat()
+        snap = dict(_GLOBAL_JOB_STATE)
+    _save_job_state_to_disk(snap)
+
+
+def _clear_job_state() -> None:
+    with _GLOBAL_JOB_LOCK:
+        _GLOBAL_JOB_STATE["status"] = "IDLE"
+        _GLOBAL_JOB_STATE["vendor_id"] = None
+        _GLOBAL_JOB_STATE["vendor_name"] = None
+        _GLOBAL_JOB_STATE["mode"] = None
+        _GLOBAL_JOB_STATE["level_num"] = 0
+        _GLOBAL_JOB_STATE["stage_title"] = ""
+        _GLOBAL_JOB_STATE["detail"] = ""
+        _GLOBAL_JOB_STATE["completed"] = 0
+        _GLOBAL_JOB_STATE["total"] = 1
+        _GLOBAL_JOB_STATE["remaining"] = 0
+        _GLOBAL_JOB_STATE["level_pct"] = 0
+        _GLOBAL_JOB_STATE["overall_pct"] = 0
+        _GLOBAL_JOB_STATE["report_id"] = None
+        _GLOBAL_JOB_STATE["error"] = None
+        _GLOBAL_JOB_STATE["cancel_requested"] = False
+        _GLOBAL_JOB_STATE["updated_at"] = datetime.now(timezone.utc).isoformat()
+        snap = dict(_GLOBAL_JOB_STATE)
+    _save_job_state_to_disk(snap)
 
 
 def _init_session_state() -> None:
@@ -799,20 +850,20 @@ def _get_vendor_assessment_status(
             return "Running (Live OSINT)", "purple", False
 
     if report is None:
-        if crit.requires_review:
-            return "Awaiting Tier Review", "high", False
         return "Not Started", "neutral", False
 
     if report.is_synthetic_evidence_run:
-        return "Sample Walkthrough", "purple", False
+        return "Sample Walkthrough", "purple", True
 
-    verdict_val = report.ai_use_verdict.verdict.value
-    if verdict_val == "INCOMPLETE_ASSESSMENT" or not report.ai_use_verdict.depth_completed:
-        return "Incomplete (Blocked)", "high", False
+    verdict_val = (
+        report.ai_use_verdict.verdict.value
+        if (report.ai_use_verdict and report.ai_use_verdict.verdict)
+        else "INCOMPLETE_ASSESSMENT"
+    )
+    if verdict_val == "INCOMPLETE_ASSESSMENT":
+        return "Incomplete (Blocked)", "critical", False
 
-    if report.human_review_required:
-        return "Awaiting Analyst Review", "high", True
-
+    # Completed pipeline assessment (human review is optional and does not block completion)
     return "Completed", "success", True
 
 
@@ -1083,6 +1134,17 @@ def _render_app_shell(readiness: SystemReadinessReport) -> str:
     llm_dot = "uc-dot-green" if readiness.local_analysis_ready else "uc-dot-blue"
     llm_txt = "Local AI Models Ready" if readiness.local_analysis_ready else "Deterministic Rule Engine"
 
+    job_snap = _get_global_job_snapshot()
+    running_pill = ""
+    if job_snap.get("status") == "RUNNING":
+        j_vid = job_snap.get("vendor_id") or "Vendor"
+        j_lvl = job_snap.get("level_num", 1)
+        j_pct = job_snap.get("overall_pct", 0)
+        running_pill = (
+            f'<span class="uc-header-pill" style="background:#1E3A8A;color:#93C5FD;border:1px solid #3B82F6;">'
+            f'<span class="uc-dot uc-dot-blue"></span>Assessment Running: <strong>{html.escape(str(j_vid))}</strong> (L{j_lvl} · {j_pct}%)</span>'
+        )
+
     st.markdown(
         f"""
         <div class="uc-shell-header">
@@ -1094,6 +1156,7 @@ def _render_app_shell(readiness: SystemReadinessReport) -> str:
                 </div>
             </div>
             <div class="uc-header-pills">
+                {running_pill}
                 <span class="uc-header-pill"><span class="uc-dot {ext_dot}"></span>{html.escape(ext_txt)}</span>
                 <span class="uc-header-pill"><span class="uc-dot {llm_dot}"></span>{html.escape(llm_txt)}</span>
                 <span class="uc-header-pill">Active Vendor: <strong>{html.escape(active_vendor_str)}</strong></span>
@@ -1161,7 +1224,8 @@ def _render_portfolio_page(readiness: SystemReadinessReport) -> None:
             critical_vendors += 1
         elif final_tier == "High":
             high_risk_vendors += 1
-        if crit.requires_review or (rpt is not None and rpt.human_Review_required):
+        # Completed assessments awaiting optional analyst governance sign-off
+        if rpt is not None and not rpt.human_validations:
             awaiting_review += 1
 
     st.markdown(
@@ -1190,7 +1254,7 @@ def _render_portfolio_page(readiness: SystemReadinessReport) -> None:
             <div class="uc-kpi-card uc-kpi-slate">
                 <div class="uc-kpi-label">Assessments Awaiting Review</div>
                 <div class="uc-kpi-value">{awaiting_review}</div>
-                <div class="uc-kpi-sub">Pending analyst governance sign-off</div>
+                <div class="uc-kpi-sub">Optional analyst governance sign-off</div>
             </div>
         </div>
         """,
@@ -1270,8 +1334,15 @@ def _render_portfolio_page(readiness: SystemReadinessReport) -> None:
 
         if tier_filter != "All Tiers" and str(crit.final_criticality or "") != tier_filter:
             continue
-        if status_filter != "All Statuses" and status_lbl != status_filter:
-            continue
+        if status_filter != "All Statuses":
+            if status_filter == "Awaiting Tier Review":
+                if not (rpt is None and crit.requires_review):
+                    continue
+            elif status_filter == "Awaiting Analyst Review":
+                if not (rpt is not None and not rpt.human_validations and status_lbl == "Completed"):
+                    continue
+            elif status_lbl != status_filter:
+                continue
         if q_low:
             haystack = " ".join([
                 v.vendor_id,
@@ -1333,10 +1404,16 @@ def _render_portfolio_page(readiness: SystemReadinessReport) -> None:
             last_date = _format_short_date(rpt.generated_at) if rpt else "—"
             verdict_sub = ""
             if rpt:
+                signoff_note = " · Signed Off" if rpt.human_validations else ""
                 verdict_sub = (
                     f'<div style="font-size:0.74rem;color:#475569;margin-top:3px;">'
                     f'Verdict: <strong>{html.escape(format_plain_status(rpt.ai_use_verdict.verdict))}</strong> '
-                    f'({len(rpt.risk_findings)} finding(s))</div>'
+                    f'({len(rpt.risk_findings)} finding(s)){html.escape(signoff_note)}</div>'
+                )
+            elif crit.requires_review:
+                verdict_sub = (
+                    '<div style="font-size:0.73rem;color:#64748B;margin-top:2px;">'
+                    'Tier review pending (optional)</div>'
                 )
 
             table_rows_html.append(
@@ -1858,13 +1935,25 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
     cancel_clicked = False
     if is_job_running:
         cancel_clicked = exec_col3.button(
-            f"Stop Active Run ({job_snap.get('vendor_id')})",
+            f"🛑 Cancel / Stop Run ({job_snap.get('vendor_id') or 'Active'})",
             key="btn_cancel_active_assessment",
             type="secondary",
             use_container_width=True,
+            help="Immediately halts the active assessment and resets status.",
         )
         if cancel_clicked:
-            _request_cancel_active_job()
+            _request_cancel_active_job(force=True)
+            st.rerun()
+    elif job_snap.get("status") in ("CANCELLED", "FAILED"):
+        if exec_col3.button(
+            "Clear Status / Reset",
+            key="btn_clear_stuck_assessment",
+            type="secondary",
+            use_container_width=True,
+            help="Clears the cancelled or failed assessment status.",
+        ):
+            _clear_job_state()
+            st.rerun()
 
     overall_progress_container = st.empty()
     level_progress_container = st.empty()
@@ -1873,68 +1962,133 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
     if (run_clicked or alt_sample_clicked) and validated_vendor is not None:
         target_mode = "SAMPLE" if (is_sample_mode or alt_sample_clicked) else "LIVE"
 
-        prog_overall = overall_progress_container.progress(
-            0,
-            text=f"Overall Pipeline (Level 1 of 9 — 0%): Initializing 9-level assessment pipeline for {validated_vendor.vendor_name}...",
-        )
-        prog_level = level_progress_container.progress(
-            0,
-            text="Current Level Progress: 0 / 1 completed (1 left — 0%) — Starting Level 1...",
-        )
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            prog_overall = overall_progress_container.progress(
+                0,
+                text=f"Overall Pipeline (Level 1 of 9 — 0%): Initializing 9-level assessment pipeline for {validated_vendor.vendor_name}...",
+            )
+            prog_level = level_progress_container.progress(
+                0,
+                text="Current Level Progress: 0 / 1 completed (1 left — 0%) — Starting Level 1...",
+            )
 
-        with _GLOBAL_JOB_LOCK:
-            _GLOBAL_JOB_STATE["cancel_requested"] = False
-
-        def _on_stage(
-            lvl_num: int,
-            stage_title: str,
-            detail: str,
-            completed: int = 0,
-            total: int = 1,
-        ) -> None:
             with _GLOBAL_JOB_LOCK:
-                if _GLOBAL_JOB_STATE.get("cancel_requested"):
-                    raise _AssessmentCancelledError("Assessment cancelled by analyst.")
-            safe_tot = max(1, int(total))
-            safe_comp = max(0, min(int(completed), safe_tot))
-            rem = max(0, safe_tot - safe_comp)
-            lvl_pct = int(round((safe_comp / float(safe_tot)) * 100))
-            ov_pct = min(99, max(1, int(round(((lvl_num - 1 + (safe_comp / float(safe_tot))) / 9.0) * 100))))
-            prog_overall.progress(
-                ov_pct,
-                text=f"Overall Pipeline (Level {lvl_num} of 9 — {ov_pct}%): {stage_title}",
-            )
-            prog_level.progress(
-                lvl_pct,
-                text=f"Current Level Progress: {safe_comp} / {safe_tot} completed ({rem} left — {lvl_pct}%) — {detail}",
-            )
+                _GLOBAL_JOB_STATE["cancel_requested"] = False
+
+            def _on_stage(
+                lvl_num: int,
+                stage_title: str,
+                detail: str,
+                completed: int = 0,
+                total: int = 1,
+            ) -> None:
+                with _GLOBAL_JOB_LOCK:
+                    if _GLOBAL_JOB_STATE.get("cancel_requested"):
+                        raise _AssessmentCancelledError("Assessment cancelled by analyst.")
+                safe_tot = max(1, int(total))
+                safe_comp = max(0, min(int(completed), safe_tot))
+                rem = max(0, safe_tot - safe_comp)
+                lvl_pct = int(round((safe_comp / float(safe_tot)) * 100))
+                ov_pct = min(99, max(1, int(round(((lvl_num - 1 + (safe_comp / float(safe_tot))) / 9.0) * 100))))
+                prog_overall.progress(
+                    ov_pct,
+                    text=f"Overall Pipeline (Level {lvl_num} of 9 — {ov_pct}%): {stage_title}",
+                )
+                prog_level.progress(
+                    lvl_pct,
+                    text=f"Current Level Progress: {safe_comp} / {safe_tot} completed ({rem} left — {lvl_pct}%) — {detail}",
+                )
+                _update_global_job_progress(
+                    status="RUNNING",
+                    vendor_id=validated_vendor.vendor_id,
+                    vendor_name=validated_vendor.vendor_name,
+                    mode=target_mode,
+                    level_num=lvl_num,
+                    stage_title=stage_title,
+                    detail=detail,
+                    completed=safe_comp,
+                    total=safe_tot,
+                )
+
             _update_global_job_progress(
                 status="RUNNING",
                 vendor_id=validated_vendor.vendor_id,
                 vendor_name=validated_vendor.vendor_name,
                 mode=target_mode,
-                level_num=lvl_num,
-                stage_title=stage_title,
-                detail=detail,
-                completed=safe_comp,
-                total=safe_tot,
+                level_num=1,
+                stage_title="Level 1: Criticality Tiering",
+                detail=f"Initializing 9-level assessment pipeline for {validated_vendor.vendor_name}...",
+                completed=0,
+                total=1,
+                latest_vendor=validated_vendor,
             )
 
-        _update_global_job_progress(
-            status="RUNNING",
-            vendor_id=validated_vendor.vendor_id,
-            vendor_name=validated_vendor.vendor_name,
-            mode=target_mode,
-            level_num=1,
-            stage_title="Level 1: Criticality Tiering",
-            detail=f"Initializing 9-level assessment pipeline for {validated_vendor.vendor_name}...",
-            completed=0,
-            total=1,
-            latest_vendor=validated_vendor,
-        )
-
-        try:
-            report = _execute_vendor_assessment(
+            try:
+                report = _execute_vendor_assessment(
+                    validated_vendor,
+                    mode=target_mode,
+                    enable_local_llm=use_local_ai,
+                    enable_triage_llm=use_ai_l3b,
+                    enable_rag_embeddings=use_ai_l5,
+                    enable_classification_llm=use_ai_l6,
+                    enable_summary_llm=use_ai_l8,
+                    human_crit_override=st.session_state["human_crit_overrides"].get(validated_vendor.vendor_id),
+                    progress_callback=_on_stage,
+                )
+                prog_overall.progress(100, text=f"Overall Pipeline (9 of 9 Levels — 100%): Assessment {report.report_id} completed.")
+                prog_level.progress(100, text="Current Level Progress: 1 / 1 completed (0 left — 100%) — All stages finished.")
+                status_container.markdown(
+                    f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
+                    f'Report <code>{html.escape(report.report_id)}</code> generated for <strong>{html.escape(report.legal_entity)}</strong>.</div>',
+                    unsafe_allow_html=True,
+                )
+                _update_global_job_progress(
+                    status="COMPLETED",
+                    vendor_id=validated_vendor.vendor_id,
+                    vendor_name=validated_vendor.vendor_name,
+                    mode=target_mode,
+                    level_num=9,
+                    stage_title="Assessment Completed",
+                    detail=f"Report {report.report_id} generated and persisted for {report.legal_entity}.",
+                    completed=1,
+                    total=1,
+                    report_id=report.report_id,
+                    latest_report=report,
+                    latest_vendor=validated_vendor,
+                )
+            except _AssessmentCancelledError as exc:
+                _update_global_job_progress(
+                    status="CANCELLED",
+                    vendor_id=validated_vendor.vendor_id,
+                    vendor_name=validated_vendor.vendor_name,
+                    mode=target_mode,
+                    level_num=1,
+                    stage_title="Assessment Cancelled",
+                    detail=str(exc),
+                    error=str(exc),
+                )
+                status_container.markdown(
+                    f'<div class="uc-callout uc-callout-warn"><strong>Assessment Cancelled:</strong> {html.escape(str(exc))}</div>',
+                    unsafe_allow_html=True,
+                )
+            except Exception as exc:
+                _update_global_job_progress(
+                    status="FAILED",
+                    vendor_id=validated_vendor.vendor_id,
+                    vendor_name=validated_vendor.vendor_name,
+                    mode=target_mode,
+                    level_num=1,
+                    stage_title="Assessment Failed",
+                    detail=str(exc),
+                    error=str(exc),
+                )
+                status_container.markdown(
+                    f'<div class="uc-callout uc-callout-danger"><strong>Assessment Failed:</strong> {html.escape(str(exc))}</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            # Persistent daemon worker thread survives tab switching & browser backgrounding
+            _start_background_vendor_assessment(
                 validated_vendor,
                 mode=target_mode,
                 enable_local_llm=use_local_ai,
@@ -1943,59 +2097,8 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
                 enable_classification_llm=use_ai_l6,
                 enable_summary_llm=use_ai_l8,
                 human_crit_override=st.session_state["human_crit_overrides"].get(validated_vendor.vendor_id),
-                progress_callback=_on_stage,
             )
-            prog_overall.progress(100, text=f"Overall Pipeline (9 of 9 Levels — 100%): Assessment {report.report_id} completed.")
-            prog_level.progress(100, text="Current Level Progress: 1 / 1 completed (0 left — 100%) — All stages finished.")
-            status_container.markdown(
-                f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
-                f'Report <code>{html.escape(report.report_id)}</code> generated for <strong>{html.escape(report.legal_entity)}</strong>.</div>',
-                unsafe_allow_html=True,
-            )
-            _update_global_job_progress(
-                status="COMPLETED",
-                vendor_id=validated_vendor.vendor_id,
-                vendor_name=validated_vendor.vendor_name,
-                mode=target_mode,
-                level_num=9,
-                stage_title="Assessment Completed",
-                detail=f"Report {report.report_id} generated and persisted for {report.legal_entity}.",
-                completed=1,
-                total=1,
-                report_id=report.report_id,
-                latest_report=report,
-                latest_vendor=validated_vendor,
-            )
-        except _AssessmentCancelledError as exc:
-            _update_global_job_progress(
-                status="CANCELLED",
-                vendor_id=validated_vendor.vendor_id,
-                vendor_name=validated_vendor.vendor_name,
-                mode=target_mode,
-                level_num=1,
-                stage_title="Assessment Cancelled",
-                detail=str(exc),
-                error=str(exc),
-            )
-            status_container.markdown(
-                f'<div class="uc-callout uc-callout-warn"><strong>Assessment Cancelled:</strong> {html.escape(str(exc))}</div>',
-                unsafe_allow_html=True,
-            )
-        except Exception as exc:
-            _update_global_job_progress(
-                status="FAILED",
-                vendor_id=validated_vendor.vendor_id,
-                vendor_name=validated_vendor.vendor_name,
-                mode=target_mode,
-                level_num=1,
-                stage_title="Assessment Failed",
-                detail=str(exc),
-                error=str(exc),
-            )
-            status_container.markdown(
-                f'<div class="uc-callout uc-callout-danger"><strong>Assessment Failed:</strong> {html.escape(str(exc))}</div>',
-                unsafe_allow_html=True,
-            )
+            st.rerun()
     elif "PYTEST_CURRENT_TEST" not in os.environ:
         job_snap = _get_global_job_snapshot()
         j_status = job_snap.get("status")
@@ -2026,26 +2129,37 @@ def _render_assessments_page(readiness: SystemReadinessReport) -> None:
             )
             time.sleep(0.75)
             st.rerun()
-        elif j_status == "COMPLETED" and j_vid == (validated_vendor.vendor_id if validated_vendor else cur_vid):
-            overall_progress_container.progress(
-                100,
-                text=f"Overall Pipeline [{j_vid} · {j_vname}] (9 of 9 Levels — 100%): Assessment {job_snap.get('report_id') or ''} completed.",
-            )
-            level_progress_container.progress(
-                100,
-                text=f"Current Level Progress: {j_tot} / {j_tot} completed (0 left — 100%) — {j_detail}",
-            )
-            status_container.markdown(
-                f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
-                f'{html.escape(j_detail)}</div>',
-                unsafe_allow_html=True,
-            )
+        elif j_status == "COMPLETED":
+            latest_rpt = job_snap.get("latest_report")
+            if isinstance(latest_rpt, VendorEndToEndAssessmentReport):
+                st.session_state["reports_by_vendor"][latest_rpt.vendor_id] = latest_rpt
+                reports_by_id[latest_rpt.vendor_id] = latest_rpt
+                if j_vid == (validated_vendor.vendor_id if validated_vendor else cur_vid):
+                    st.session_state["e2e_report"] = latest_rpt
+                    active_report = latest_rpt
+            if j_vid == (validated_vendor.vendor_id if validated_vendor else cur_vid):
+                overall_progress_container.progress(
+                    100,
+                    text=f"Overall Pipeline [{j_vid} · {j_vname}] (9 of 9 Levels — 100%): Assessment {job_snap.get('report_id') or ''} completed.",
+                )
+                level_progress_container.progress(
+                    100,
+                    text=f"Current Level Progress: {j_tot} / {j_tot} completed (0 left — 100%) — {j_detail}",
+                )
+                status_container.markdown(
+                    f'<div class="uc-callout uc-callout-success"><strong>Assessment Execution Finished:</strong> '
+                    f'{html.escape(j_detail)}</div>',
+                    unsafe_allow_html=True,
+                )
         elif j_status in ("CANCELLED", "FAILED") and j_vid == (validated_vendor.vendor_id if validated_vendor else cur_vid):
             status_container.markdown(
                 f'<div class="uc-callout uc-callout-warn"><strong>Assessment {html.escape(str(j_status))}:</strong> '
                 f'{html.escape(str(job_snap.get("error") or j_detail))}</div>',
                 unsafe_allow_html=True,
             )
+            if st.button("Dismiss & Clear Status", key="btn_dismiss_cancelled_inline", type="secondary"):
+                _clear_job_state()
+                st.rerun()
 
     # ── AREA C: RESULTS ──
     active_vid = validated_vendor.vendor_id if validated_vendor else st.session_state.get("selected_vendor_id", "V-002")

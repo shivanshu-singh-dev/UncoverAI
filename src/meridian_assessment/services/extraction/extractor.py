@@ -784,7 +784,9 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
             headers={"User-Agent": "MeridianRiskAssessmentPOC/1.0"},
             method="GET",
         )
+        old_socket_timeout = socket.getdefaulttimeout()
         try:
+            socket.setdefaulttimeout(timeout_seconds)
             with opener.open(req, timeout=timeout_seconds) as resp:
                 final_url = resp.geturl()
                 ok_final, reason_final = validate_safe_public_url(final_url)
@@ -915,6 +917,8 @@ class UrllibPublicFetchAdapter(ContentFetchAdapter):
                 error_status=ExtractionStatus.FETCH_FAILED,
                 error_message=f"Unhandled fetch error: {exc}",
             )
+        finally:
+            socket.setdefaulttimeout(old_socket_timeout)
 
 
 class ScraperAPIFetchAdapter(ContentFetchAdapter):

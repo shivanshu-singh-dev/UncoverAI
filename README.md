@@ -56,7 +56,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph UI["User Interfaces"]
-        ST["Streamlit App (app.py)\nTabs 1-5"]
+        ST["Streamlit Portal (app.py)\nPortfolio · Assessments · Evidence · Reports · Settings"]
         CLI["CLI & Diagnostic Scripts\n(main.py, scripts/)"]
     end
 
@@ -189,15 +189,15 @@ Implemented in [`src/meridian_assessment/services/llm/model_router.py`](src/meri
 
 | Model Tier | Assigned Model | Pipeline Stage & Service | Responsibility & Guardrails |
 | :--- | :--- | :--- | :--- |
-| **Model A (Lightweight)** | **`llama3.2:latest`** (~2.0 GB) | **Level 3B**: `OSINTURLTriageService` $\rightarrow$ `OllamaURLTriageProvider` (`LLMTaskType.URL_TRIAGE`) | Categorizes candidate URLs by relevance (`FETCH`, `DEFER`, `REJECT`, `MANUAL_REVIEW`), canonical source class (`S1–S12`), and target gates (`G1–G4`). Pre-screens snippets for prompt injection before LLM invocation and validates output against strict enums. |
-| **Model B (Deep Analysis)** | **`mistral:latest`** (~4.4 GB) | **Level 6**: `SignalClassificationService` $\rightarrow$ `OllamaClassificationAdapter` (`LLMTaskType.EVIDENCE_CLASSIFICATION`) | Performs deeper semantic signal classification on extracted evidence excerpts after deterministic `E14` prompt-injection isolation. Cannot override deterministic `E1–E14` rules or `G1–G4` gates. |
-| **Model B (Grounded Summary)** | **`mistral:latest`** (~4.4 GB) | **Level 8**: `AIRiskAnalyzer` $\rightarrow$ `OllamaRiskSummaryAdapter` (`LLMTaskType.RISK_SUMMARIZATION`) | Drafts analyst-facing explanations (`AIRiskFinding.analyst_explanation`) grounded strictly in verbatim `EvidenceRecord` excerpts. Rejects any summary that fails to cite valid `supporting_evidence_ids` or introduces ungrounded claims. Never alters deterministic `FindingSeverity` or `ExposureDetermination`. |
+| **Model A (Lightweight)** | **`llama3.2:3b` / `llama3.2:latest`** (~2.0 GB) | **Level 3B**: `OSINTURLTriageService` $\rightarrow$ `OllamaURLTriageProvider` (`LLMTaskType.URL_TRIAGE`) | Categorizes candidate URLs by relevance (`FETCH`, `DEFER`, `REJECT`, `MANUAL_REVIEW`), canonical source class (`S1–S12`), and target gates (`G1–G4`). Pre-screens snippets for prompt injection before LLM invocation and validates output against strict enums. |
+| **Model B (Deep Analysis)** | **`mistral:latest` / `qwen2.5:3b`** (~2.0–4.4 GB) | **Level 6**: `SignalClassificationService` $\rightarrow$ `OllamaClassificationAdapter` (`LLMTaskType.EVIDENCE_CLASSIFICATION`) | Performs deeper semantic signal classification on extracted evidence excerpts after deterministic `E14` prompt-injection isolation. Cannot override deterministic `E1–E14` rules or `G1–G4` gates. |
+| **Model B (Grounded Summary)** | **`mistral:latest` / `qwen2.5:3b`** (~2.0–4.4 GB) | **Level 8**: `AIRiskAnalyzer` $\rightarrow$ `OllamaRiskSummaryAdapter` (`LLMTaskType.RISK_SUMMARIZATION`) | Drafts analyst-facing explanations (`AIRiskFinding.analyst_explanation`) grounded strictly in verbatim `EvidenceRecord` excerpts. Rejects any summary that fails to cite valid `supporting_evidence_ids` or introduces ungrounded claims. Never alters deterministic `FindingSeverity` or `ExposureDetermination`. |
 | **Separate Embedding Path** | **`sentence-transformers/all-MiniLM-L6-v2`** | **Level 5**: `RAGChunkerAndRetriever` (`LLMTaskType.RAG_EMBEDDING`) | Runs via the dedicated `EmbeddingProvider` interface. `OllamaModelRouter` explicitly raises `ValueError` if any code attempts to route `RAG_EMBEDDING` to a generative Ollama model. |
 
 ### 6 GB VRAM Switching & Unloading Strategy
-Because `llama3.2:latest` (~2.0 GB) and `mistral:latest` (~4.4 GB) total ~6.4 GB combined, holding both models in a 6 GB GPU simultaneously would cause VRAM exhaustion or CPU thrashing:
-1. **Batched Stage Execution**: All Level 3B candidate URLs for a vendor are triaged together on `llama3.2:latest` before extraction and deeper analysis begin.
-2. **Explicit Stage-Boundary & Switch Unloading**: When `MERIDIAN_OLLAMA_UNLOAD_ON_SWITCH=true` (default), `OSINTURLTriageService.triage_plan_candidates()` and `OllamaModelRouter.generate_json()` send an explicit `POST /api/generate` with `"keep_alive": 0` to unload `llama3.2:latest` from VRAM before loading `mistral:latest` for Level 6 and Level 8, and unload `mistral:latest` upon stage completion. Every unload event is recorded in `report.model_routing_telemetry["vram_management"]["vram_unload_events"]`.
+When operating within a standard 6 GB VRAM budget with larger model configurations (e.g., `llama3.2:latest` at ~2.0 GB and `mistral:latest` at ~4.4 GB totaling ~6.4 GB), holding both models simultaneously would risk VRAM exhaustion or CPU offload thrashing:
+1. **Batched Stage Execution**: All Level 3B candidate URLs for a vendor are triaged together on Model A before extraction and deeper analysis begin.
+2. **Explicit Stage-Boundary & Switch Unloading**: When `MERIDIAN_OLLAMA_UNLOAD_ON_SWITCH=true` (default), `OSINTURLTriageService.triage_plan_candidates()` and `OllamaModelRouter.generate_json()` send an explicit `POST /api/generate` with `"keep_alive": 0` to unload Model A from VRAM before loading Model B for Level 6 and Level 8, and unload Model B upon stage completion. Every unload event is recorded in `report.model_routing_telemetry["vram_management"]["vram_unload_events"]`.
 
 ---
 
@@ -207,9 +207,9 @@ UncoverAI automatically loads a root `.env` file via [`src/meridian_assessment/c
 
 | Integration | Environment Variables | Default in `.env` | Notes & Fallback Behavior |
 | :--- | :--- | :--- | :--- |
-| **OSINT Search Provider** | `MERIDIAN_SEARCH_PROVIDER`<br>`MERIDIAN_SERPAPI_KEY`<br>`MERIDIAN_GOOGLE_API_KEY`<br>`MERIDIAN_GOOGLE_CSE_ID`<br>`MERIDIAN_BRAVE_API_KEY`<br>`MERIDIAN_BING_API_KEY` | `MERIDIAN_SEARCH_PROVIDER=serpapi`<br>API keys left blank (`""`) | When `MERIDIAN_SERPAPI_KEY` is blank, `build_search_backend_from_env()` returns `UnconfiguredSearchBackend(provider_name="serpapi")` with an explicit configuration message and marks planned queries `UNAVAILABLE` without faking search execution. |
-| **Dual-Model Local Ollama** | `MERIDIAN_OLLAMA_ENABLED`<br>`MERIDIAN_OLLAMA_ENDPOINT`<br>`MERIDIAN_OLLAMA_TRIAGE_MODEL`<br>`MERIDIAN_OLLAMA_ANALYSIS_MODEL`<br>`MERIDIAN_OLLAMA_SUMMARY_MODEL`<br>`MERIDIAN_OLLAMA_TIMEOUT_SECONDS`<br>`MERIDIAN_OLLAMA_KEEP_ALIVE`<br>`MERIDIAN_OLLAMA_UNLOAD_ON_SWITCH` | `true` in `.env` (`false` in `.env.example`)<br>`http://localhost:11434`<br>`llama3.2:latest`<br>`mistral:latest`<br>`mistral:latest`<br>`25.0`<br>`2m`<br>`true` | If Ollama is unreachable, a model is not installed, a request times out, or JSON output fails schema/grounding validation, the router records the exact fault status (`UNAVAILABLE`, `MODEL_NOT_INSTALLED`, `TIMEOUT`, `INVALID_OUTPUT`) and falls back transparently to deterministic rules. |
-| **RAG Embeddings** | `MERIDIAN_ENABLE_RAG_EMBEDDINGS`<br>`MERIDIAN_EMBEDDING_MODEL` | `false`<br>`sentence-transformers/all-MiniLM-L6-v2` | Chunks deterministically and reports `MODEL_UNAVAILABLE_NOT_CONFIGURED` until enabled. |
+| **OSINT Search & Web Scraping** | `MERIDIAN_SEARCH_PROVIDER`<br>`MERIDIAN_SERPER_API_KEY`<br>`MERIDIAN_SCRAPERAPI_KEY`<br>`MERIDIAN_GOOGLE_API_KEY`<br>`MERIDIAN_GOOGLE_CSE_ID`<br>`MERIDIAN_BRAVE_API_KEY`<br>`MERIDIAN_BING_API_KEY`<br>`MERIDIAN_SERPAPI_KEY` | `MERIDIAN_SEARCH_PROVIDER=serper`<br>API keys left blank (`""`) | `serper` is the primary search backend. ScraperAPI (`MERIDIAN_SCRAPERAPI_KEY`) is automatically used as a resilient fallback for anti-bot blocked webpages. Secondary search adapters (`google_cse`, `brave`, `bing`, `serpapi`) are fully supported. When API keys are blank, `build_search_backend_from_env()` returns `UnconfiguredSearchBackend` with an explicit status message and marks planned queries `UNAVAILABLE` without faking search execution. |
+| **Dual-Model Local Ollama** | `MERIDIAN_OLLAMA_ENABLED`<br>`MERIDIAN_OLLAMA_ENDPOINT`<br>`MERIDIAN_OLLAMA_TRIAGE_MODEL`<br>`MERIDIAN_OLLAMA_ANALYSIS_MODEL`<br>`MERIDIAN_OLLAMA_SUMMARY_MODEL`<br>`MERIDIAN_OLLAMA_TIMEOUT_SECONDS`<br>`MERIDIAN_OLLAMA_KEEP_ALIVE`<br>`MERIDIAN_OLLAMA_UNLOAD_ON_SWITCH` | `true` in `.env` (`false` in `.env.example`)<br>`http://localhost:11434`<br>`llama3.2:3b` (or `llama3.2:latest`)<br>`qwen2.5:3b` (or `mistral:latest`)<br>`qwen2.5:3b` (or `mistral:latest`)<br>`25.0`<br>`2m`<br>`true` | If Ollama is unreachable, a model is not installed, a request times out, or JSON output fails schema/grounding validation, the router records the exact fault status (`UNAVAILABLE`, `MODEL_NOT_INSTALLED`, `TIMEOUT`, `INVALID_OUTPUT`) and falls back transparently to deterministic rules. |
+| **RAG Embeddings** | `MERIDIAN_ENABLE_RAG_EMBEDDINGS`<br>`MERIDIAN_EMBEDDING_MODEL` | `true` in `.env` (`false` in `.env.example`)<br>`sentence-transformers/all-MiniLM-L6-v2` | Chunks deterministically and reports `MODEL_UNAVAILABLE_NOT_CONFIGURED` if disabled or uninstalled. |
 | **SQLite Evidence Repository** | `MERIDIAN_EVIDENCE_DB_PATH` | `data/output/evidence_store/meridian_evidence.sqlite3` | Persists locally to SQLite and `data/output/evidence_store/artifacts/`. |
 | **Level 9 Scoring Policy** | `MERIDIAN_AI_RISK_POLICY_PATH` | `config/ai_risk_scoring.yaml` | Reports `SCORING_POLICY_UNCONFIGURED` (`final_risk_score = None`) until production parameters are approved. |
 
@@ -218,12 +218,12 @@ UncoverAI automatically loads a root `.env` file via [`src/meridian_assessment/c
 ## 7. How to Start Ollama, Run the Application & Execute Tests
 
 ### 1. Verify Local Ollama Models
-Ensure Ollama is running (`ollama serve`) and both models are installed:
+Ensure Ollama is running (`ollama serve`) and the configured models are installed:
 ```powershell
 ollama list
-# Expected:
-# llama3.2:latest (~2.0 GB)
-# mistral:latest  (~4.4 GB)
+# Expected (or your configured models in .env):
+# llama3.2:3b (or llama3.2:latest)
+# qwen2.5:3b  (or mistral:latest)
 ```
 
 ### 2. Install Python Dependencies
@@ -233,15 +233,27 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 3. Launch the Streamlit UI (All 9 Levels + Dual-Model Telemetry)
+### 3. Launch the Streamlit Portal
 ```powershell
 .venv\Scripts\streamlit.exe run app.py
 ```
-In **Tab 5 (End-to-End AI Risk & Governance)**, select between:
-- **Default Offline (Deterministic Rules Only)**
-- **Dual-Model Local Ollama (`llama3.2:latest` + `mistral:latest`)**
-- **Synthetic Fixture Walkthrough (`TEST_FIXTURE_ONLY` Scoring)**
-- **Synthetic Fixtures + Dual-Model Local Ollama (`llama3.2:latest` + `mistral:latest`)**
+The Streamlit application provides a comprehensive TPRM governance portal across 5 workspaces:
+- **Portfolio**: 5-KPI executive summary, vendor criticality tiering breakdown, and filterable vendor inventory table.
+- **Assessments (Three-Stage Assessment Workspace)**:
+  - **A. Assessment Setup & Scope Configuration**: Select a portfolio vendor (e.g. `V-002: Fiserv, Inc.`) or enter a custom vendor. Choose an **Execution Mode**:
+    - `Live OSINT Assessment (Serper Search + Direct HTTP / ScraperAPI)`
+    - `Sample Assessment (Pre-Collected Demonstration Fixtures)`
+    - Configure stage-by-stage local AI routing checkboxes (`Level 3B URL Triage`, `Level 5 RAG Embeddings`, `Level 6 Signal Classification`, `Level 8 Risk Summaries`).
+  - **B. Assessment Execution & Pipeline Status**: Click **Run Live OSINT Assessment** or **Run Sample Assessment**. Runs execute asynchronously via a background daemon worker thread with a persistent status pill in the header, allowing seamless navigation across tabs without freezing. Use the `🛑 Cancel / Stop Run` button to immediately halt an active run, or `Clear Status / Reset` to reset.
+  - **C. Assessment Results & Analyst Governance**: Review detailed assessment outputs across 5 sub-tabs:
+    1. *Executive Summary & Gates (G1–G4)*: AI-use verdict, gate determinations, and supporting evidence IDs.
+    2. *Criticality Result (D/P/R/O/V)*: Base score $C$, factor breakdowns, and O1–O5 override evaluations.
+    3. *Evidence Register*: Point-of-capture SHA-256 evidence records with verbatim excerpts and S1–S12 classes.
+    4. *Risk Findings & Open Questions*: Surfaced R1–R8 risk findings with severity and grounded explanations.
+    5. *Human Review & Exports*: Analyst sign-off, override controls, and multi-format reports.
+- **Evidence**: Point-of-capture evidence workbench with multi-dimensional filtering across vendors, source classes, and verification statuses.
+- **Reports**: Executive vendor assessment dossier and export center (HTML, Markdown, Evidence CSV, JSON).
+- **Settings**: System readiness diagnostics for search APIs, ScraperAPI, Ollama models, and SQLite persistence.
 
 ### 4. Run the Diagnostic Script (Meridian 6-Vendor Dataset)
 ```powershell
